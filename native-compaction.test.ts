@@ -1,7 +1,47 @@
 import { describe, expect, test } from "bun:test";
-import { buildLegacyCompactionRequestBody, buildReplacementHistory, filterLegacyCompactionHistory, parseNativeCompactionDetails, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { buildLegacyCompactionRequestBody, buildReplacementHistory, filterLegacyCompactionHistory, fullInputForBranch, parseNativeCompactionDetails, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
+	test("matches Pi message indexes across empty user entries", () => {
+		const model = { provider: "openai-codex", api: "openai-codex-responses", id: "current", reasoning: true } as never;
+		const branch = [
+			{
+				id: "tool-call",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					model: "previous",
+					content: [{ type: "toolCall", id: "call|fc_old", name: "bash", arguments: {} }],
+				},
+			} as never,
+			{
+				id: "empty-user",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: { role: "user", content: [] },
+			} as never,
+			{
+				id: "visible",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					model: "previous",
+					content: [{ type: "text", text: "visible" }],
+				},
+			} as never,
+		];
+		const result = fullInputForBranch({ branch, model, tools: [] });
+		expect(result.at(-1)).toMatchObject({ id: "msg_pi_2" });
+	});
 	test("keeps recent message items and drops tool history", () => {
 		const result = retainRecentMessages([
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },

@@ -75,13 +75,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function requestTail(
 	requestInput: ResponseItem[] | undefined,
-	historyInput: ResponseItem[],
-	rawHistoryInput: ResponseItem[],
-	piContextInput: ResponseItem[],
+	prefixes: ResponseItem[][],
 	systemPromptInput: ResponseItem[],
 ): ResponseItem[] {
 	if (!requestInput) return [];
-	const prefixes = [historyInput, piContextInput, rawHistoryInput];
 	for (const prefix of prefixes.flatMap((value) => systemPromptInput.length > 0 ? [value, [...systemPromptInput, ...value]] : [value])) {
 		if (requestInput.length < prefix.length) continue;
 		if (prefix.every((item, index) => sameItem(item, requestInput[index]!))) {
@@ -279,10 +276,22 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		});
 		const rawHistoryInput = fullInputForBranch({ branch: branchBefore, model: historyModel, tools });
 		const piContextInput = piContextInputForBranch({ branch: branchBefore, model: historyModel, tools });
+		const currentHistoryInput = effectiveInputForBranch({
+			branch: branchBefore,
+			model,
+			tools,
+			allowCheckpointModelMismatch: true,
+		});
+		const currentRawHistoryInput = fullInputForBranch({ branch: branchBefore, model, tools });
+		const currentPiContextInput = piContextInputForBranch({ branch: branchBefore, model, tools });
 		const systemPromptInput = systemPromptInputForModel(model, ctx.getSystemPrompt());
 		let tail: ResponseItem[];
 		try {
-			tail = requestTail(requestInput, historyInput, rawHistoryInput, piContextInput, systemPromptInput);
+			tail = requestTail(
+				requestInput,
+				[historyInput, piContextInput, rawHistoryInput, currentHistoryInput, currentPiContextInput, currentRawHistoryInput],
+				systemPromptInput,
+			);
 		} catch (error) {
 			if (!pending && checkpoint.status === "none") return undefined;
 			throw error;

@@ -147,6 +147,20 @@ function shortHash(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
+/** Matches Pi AI's deterministic shortHash for cross-provider Responses item IDs. */
+function piShortHash(value: string): string {
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		h1 = Math.imul(h1 ^ code, 2654435761);
+		h2 = Math.imul(h2 ^ code, 1597334677);
+	}
+	h1 = (Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)) | 0;
+	h2 = (Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)) | 0;
+	return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
+}
+
 function normalizedItemId(value: string | undefined): string | undefined {
 	if (!value) return undefined;
 	const sanitized = value.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64).replace(/_+$/, "");
@@ -218,34 +232,52 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 	const flushOrphanedToolCalls = () => {
 		for (const callId of pendingToolCalls.values()) {
 			items.push({ type: "function_call_output", call_id: callId, output: "No result provided" });
+			messageIndex++;
 		}
 		pendingToolCalls.clear();
 	};
 	let messageIndex = 0;
 
 	for (const message of messages as unknown as JsonObject[]) {
+		const itemCountBefore = items.length;
 		if (message.role === "user") {
 			flushOrphanedToolCalls();
 			const content = contentToUserParts(message.content);
-			if (content.length > 0) items.push({ role: "user", content });
+			if (content.length === 0) continue;
+			items.push({ role: "user", content });
 		} else if (message.role === "assistant" && Array.isArray(message.content)) {
 			flushOrphanedToolCalls();
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				messageIndex++;
-				continue;
-			}
+			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+			const sameModel = message.provider === model.provider
+				&& message.api === model.api
+				&& message.model === model.id;
+			const sameProviderApi = message.provider === model.provider && message.api === model.api;
 			let textIndex = 0;
 			for (const block of message.content) {
 				if (!isJsonObject(block)) continue;
-				if (block.type === "thinking" && typeof block.thinkingSignature === "string") {
-					try {
-						const reasoning = JSON.parse(block.thinkingSignature);
-						if (isJsonObject(reasoning) && reasoning.type === "reasoning") items.push(cloneItem(reasoning));
-					} catch {}
+				if (block.type === "thinking") {
+					if (!sameModel && block.redacted === true) continue;
+					if (sameModel && typeof block.thinkingSignature === "string") {
+						try {
+							const reasoning = JSON.parse(block.thinkingSignature);
+							if (isJsonObject(reasoning) && reasoning.type === "reasoning") items.push(cloneItem(reasoning));
+						} catch {}
+					} else if (!sameModel && typeof block.thinking === "string" && block.thinking.trim()) {
+						const id = textIndex === 0 ? `msg_pi_${messageIndex}` : `msg_pi_${messageIndex}_${textIndex}`;
+						textIndex++;
+						items.push({
+							type: "message",
+							role: "assistant",
+							id,
+							status: "completed",
+							phase: undefined,
+							content: [{ type: "output_text", text: block.thinking, annotations: [] }],
+						});
+					}
 					continue;
 				}
 				if (block.type === "text" && typeof block.text === "string") {
-					const signature = textSignature(block.textSignature);
+					const signature = sameModel ? textSignature(block.textSignature) : {};
 					const fallbackId = textIndex === 0 ? `msg_pi_${messageIndex}` : `msg_pi_${messageIndex}_${textIndex}`;
 					textIndex++;
 					const rawId = signature.id || fallbackId;
@@ -256,17 +288,22 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 						id,
 						status: "completed",
 						content: [{ type: "output_text", text: block.text, annotations: [] }],
-						...(signature.phase ? { phase: signature.phase } : {}),
+						phase: signature.phase,
 					});
 					continue;
 				}
 				if (block.type === "toolCall" && typeof block.id === "string") {
 					const [callId, rawItemId] = block.id.split("|");
 					pendingToolCalls.set(block.id, callId);
+					const itemId = sameProviderApi && !sameModel
+						? undefined
+						: message.provider !== model.provider || message.api !== model.api
+							? (rawItemId ? `fc_${piShortHash(rawItemId)}` : undefined)
+							: normalizedItemId(rawItemId);
 					items.push({
 						type: "function_call",
 						call_id: callId,
-						...(normalizedItemId(rawItemId) ? { id: normalizedItemId(rawItemId) } : {}),
+						id: itemId,
 						name: String(block.name ?? ""),
 						arguments: JSON.stringify(block.arguments ?? {}),
 					});
@@ -281,7 +318,7 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 				? message.addedToolNames.flatMap((name) => typeof name === "string" && toolsByName.has(name) ? [toolsByName.get(name)!] : [])
 				: [];
 			if (addedTools.length > 0) {
-				const searchCallId = `pi_tool_load_${shortHash(`${message.toolCallId}:${addedTools.map((tool) => tool.name).join(",")}`)}`;
+				const searchCallId = `pi_tool_load_${piShortHash(`${message.toolCallId}:${addedTools.map((tool) => tool.name).join(",")}`)}`;
 				items.push({
 					type: "tool_search_call",
 					call_id: searchCallId,
@@ -298,6 +335,7 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 				});
 			}
 		}
+		if (message.role === "assistant" && items.length === itemCountBefore) continue;
 		messageIndex++;
 	}
 	flushOrphanedToolCalls();

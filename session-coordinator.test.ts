@@ -244,6 +244,125 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([...details(modelKey(currentModel)).replacementHistory, userInput("new")]);
 	});
 
+	test("matches cross-model tool history after target-model normalization", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const assistantEntry = {
+			id: "assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "toolCall", id: "call|fc_old", name: "bash", arguments: { command: "echo" } }],
+			},
+		} as unknown as SessionEntry;
+		const branch = [assistantEntry];
+		const coordinator = createCoordinator(branch);
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "function_call", id: undefined, call_id: "call", name: "bash", arguments: JSON.stringify({ command: "echo" }) },
+			{ type: "function_call_output", call_id: "call", output: "No result provided" },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("matches cross-model visible thinking after signature removal", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const assistantEntry = {
+			id: "assistant-thinking",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{
+					type: "thinking",
+					thinking: "plan",
+					thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_old", summary: [] }),
+				}],
+			},
+		} as unknown as SessionEntry;
+		const coordinator = createCoordinator([assistantEntry]);
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "message", role: "assistant", id: "msg_pi_0", status: "completed", phase: undefined, content: [{ type: "output_text", text: "plan", annotations: [] }] },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("normalizes foreign cross-model tool IDs like Pi", async () => {
+		const previousModel = model("anthropic", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const branch = [{
+			id: "foreign-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "toolCall", id: "call|foreign_item", name: "bash", arguments: {} }],
+			},
+		} as unknown as SessionEntry];
+		const coordinator = createCoordinator(branch);
+		await coordinator.selectModel({ model: currentModel, previousModel: model("openai-codex", "previous", "hash-a") }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "function_call", id: "fc_iso4ur1iqd9fs", call_id: "call", name: "bash", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call", output: "No result provided" },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("drops redacted thinking across models", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const branch = [{
+			id: "redacted-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "thinking", thinking: "[Reasoning redacted]", redacted: true, thinkingSignature: "opaque" }],
+			},
+		} as unknown as SessionEntry, {
+			id: "visible-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "text", text: "visible" }],
+			},
+		} as unknown as SessionEntry];
+		const coordinator = createCoordinator(branch);
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "message", role: "assistant", id: "msg_pi_0", status: "completed", phase: undefined, content: [{ type: "output_text", text: "visible", annotations: [] }] },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
 	test("compacts on the first request after a model selection", async () => {
 		let compactedWith: string | undefined;
 		let appended: NativeCompactionDetails | undefined;
