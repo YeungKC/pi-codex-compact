@@ -109,7 +109,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 	const pendingBySession = new Map<string, PendingTransition>();
 	const transitionBySession = new Map<string, Promise<void>>();
 	const failureBySession = new Map<string, { modelKey: string; message: string }>();
-	const scheduledSessions = new Set<string>();
 	let generation = 0;
 
 	const clear = (): void => {
@@ -117,7 +116,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		pendingBySession.clear();
 		transitionBySession.clear();
 		failureBySession.clear();
-		scheduledSessions.clear();
 	};
 
 	const runTransition = async (
@@ -148,7 +146,10 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					signal: ctx.signal,
 				}));
 			} catch (firstError) {
-				if (modelKey(currentModel) === modelKey(previousModel) || !shouldRetryWithCurrentModel(firstError)) throw firstError;
+				if (
+					(modelKey(currentModel) === modelKey(previousModel) && compactionHash(currentModel) === compactionHash(previousModel))
+					|| !shouldRetryWithCurrentModel(firstError)
+				) throw firstError;
 				try {
 					native = await deps.withStatus(ctx, () => deps.createCheckpoint({
 						ctx,
@@ -382,15 +383,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		transitionFailure: (sessionId: string, model: Model<any>) => {
 			const failure = failureBySession.get(sessionId);
 			return failure?.modelKey === modelKey(model) ? failure.message : undefined;
-		},
-		schedule: (sessionId: string): boolean => {
-			if (scheduledSessions.has(sessionId)) return false;
-			scheduledSessions.add(sessionId);
-			return true;
-		},
-		consumeScheduled: (sessionId: string): boolean => {
-			if (!scheduledSessions.delete(sessionId)) return false;
-			return true;
 		},
 	};
 }

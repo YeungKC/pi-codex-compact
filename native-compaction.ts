@@ -769,7 +769,7 @@ function isRetryableStatus(status: number): boolean {
 }
 
 function canFallbackForStatus(status: number, body: string): boolean {
-	if (![400, 408, 409, 429].includes(status) && status < 500) return false;
+	if (![400, 403, 408, 409, 429].includes(status) && status < 500) return false;
 	if (status === 403 && !/(?:model|invalid request|not found|overloaded)/i.test(body)) return false;
 	return !/(?:misalignment_policy_violation|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key)/i.test(body);
 }

@@ -17,6 +17,22 @@ describe("Codex compaction history", () => {
 		})).rejects.toThrow("context_length_exceeded");
 		expect(calls).toBe(1);
 	});
+	test("keeps generic HTTP 403 out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("", { status: 403 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
 	test("matches Pi message indexes across empty user entries", () => {
 		const model = { provider: "openai-codex", api: "openai-codex-responses", id: "current", reasoning: true } as never;
 		const branch = [

@@ -85,22 +85,6 @@ const userInput = (text: string): ResponseItem => ({
 });
 
 describe("Codex session coordinator", () => {
-	test("schedules one compaction until it is consumed", () => {
-		const coordinator = createCoordinator();
-		expect(coordinator.schedule("session")).toBe(true);
-		expect(coordinator.schedule("session")).toBe(false);
-		expect(coordinator.consumeScheduled("session")).toBe(true);
-		expect(coordinator.consumeScheduled("session")).toBe(false);
-	});
-
-	test("clear removes pending lifecycle state", () => {
-		const coordinator = createCoordinator();
-		coordinator.schedule("session");
-		coordinator.clear();
-		expect(coordinator.consumeScheduled("session")).toBe(false);
-		expect(coordinator.schedule("session")).toBe(true);
-	});
-
 	test("does not compact when the model is selected", async () => {
 		let calls = 0;
 		const coordinator = createCoordinator([], async () => {
@@ -420,6 +404,20 @@ describe("Codex session coordinator", () => {
 		await coordinator.selectModel({ model: secondA, previousModel: b }, context());
 		await coordinator.prepareRequest(secondA, context(), [userInput("hello")]);
 		expect(compactedWith).toBe(modelKey(firstA));
+	});
+
+	test("falls back when a same-ID hash transition fails on the previous model", async () => {
+		const previous = model("openai-codex", "same", "hash-a");
+		const current = model("openai-codex", "same", "hash-b");
+		const compactedWith: string[] = [];
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			if (selectedModel === previous) throw new Error("OpenAI Codex compaction failed (400): old hash");
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.selectModel({ model: current, previousModel: previous }, context());
+		await coordinator.prepareRequest(current, context(), [userInput("hello")]);
+		expect(compactedWith).toEqual([modelKey(previous), modelKey(current)]);
 	});
 
 	test("coalesces A to B to C before the first request", async () => {
