@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import type { CodexCompactionConfig } from "./config.ts";
+import { compactionHash } from "./capabilities.ts";
 import {
 	buildCodexHeaders,
 	buildCompactionRequestBody,
@@ -77,6 +78,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 				version: NATIVE_COMPACTION_VERSION,
 				strategy: "v1",
 				modelKey: modelKey(params.model),
+				...(compactionHash(params.model) ? { compHash: compactionHash(params.model) } : {}),
 				replacementHistory: filterLegacyCompactionHistory(remote.replacementHistory),
 			},
 			usage: remote.usage,
@@ -104,6 +106,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 			version: NATIVE_COMPACTION_VERSION,
 			strategy: "v2",
 			modelKey: modelKey(params.model),
+			...(compactionHash(params.model) ? { compHash: compactionHash(params.model) } : {}),
 			replacementHistory: buildReplacementHistory(input, remote.compactionItem),
 		},
 		usage: remote.usage,

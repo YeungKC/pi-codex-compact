@@ -1,5 +1,6 @@
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
+import { compactionHash } from "./capabilities.ts";
 import {
 	effectiveInputForBranch,
 	findNativeCheckpoint,
@@ -39,17 +40,10 @@ type PendingTransition = {
 	targetModelKey: string;
 };
 
-function compactionHash(model: Model<any>): string | undefined {
-	const value = model as Model<any> & { compHash?: unknown; comp_hash?: unknown };
-	return typeof value.compHash === "string" ? value.compHash : typeof value.comp_hash === "string" ? value.comp_hash : undefined;
-}
-
 function needsTransitionCompaction(previousModel: Model<any>, currentModel: Model<any>): boolean {
-	const sameModel = modelKey(previousModel) === modelKey(currentModel);
 	const previousHash = compactionHash(previousModel);
 	const currentHash = compactionHash(currentModel);
-	if (sameModel) return previousHash !== undefined && currentHash !== undefined && previousHash !== currentHash;
-	return previousHash === undefined || currentHash === undefined || previousHash !== currentHash;
+	return previousHash !== undefined && currentHash !== undefined && previousHash !== currentHash;
 }
 
 function conversationLeafId(branch: SessionEntry[]): string | undefined {
@@ -159,27 +153,57 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				}
 			}
 			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) continue;
-			deps.appendCheckpoint({ ...native.details, modelKey: targetModelKey });
+			deps.appendCheckpoint({
+				...native.details,
+				modelKey: targetModelKey,
+				compHash: compactionHash(currentModel),
+			});
 			pendingBySession.delete(sessionId);
 			return;
 		}
 		throw new Error("The session changed while Codex model-transition compaction was running.");
 	};
 
-	const recoverCurrentModel = async (model: Model<any>, ctx: ExtensionContext): Promise<void> => {
+	const recoverCurrentModel = async (model: Model<any>, ctx: ExtensionContext, basePayload?: JsonObject): Promise<void> => {
 		if (!isOpenAICodexModel(model)) return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const checkpoint = findNativeCheckpoint(deps.getBranch(ctx));
-		if (checkpoint.status !== "valid" || checkpoint.checkpoint.details.modelKey === modelKey(model)) return;
+		if (checkpoint.status !== "valid") return;
 		const pending = transitionBySession.get(sessionId);
 		if (pending) {
 			await pending.catch(() => undefined);
 			return;
 		}
 		const previousModel = resolveModel(ctx, checkpoint.checkpoint.details.modelKey);
-		if (!previousModel) throw new Error(`The previous Codex model is unavailable: ${checkpoint.checkpoint.details.modelKey}`);
+		const previousHash = checkpoint.checkpoint.details.compHash ?? (previousModel ? compactionHash(previousModel) : undefined);
+		const currentHash = compactionHash(model);
+		if (previousHash === undefined || currentHash === undefined || previousHash === currentHash) return;
 		const startGeneration = generation;
-		const transition = runTransition(sessionId, ctx, previousModel, modelKey(model), model, undefined, startGeneration);
+		const transition = previousModel
+			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration)
+			: (async () => {
+					const branch = deps.getBranch(ctx);
+					const leafId = conversationLeafId(branch);
+					const native = await deps.withStatus(ctx, () => deps.createCheckpoint({
+						ctx,
+						model,
+						input: effectiveInputForBranch({
+							branch,
+							model,
+							tools: deps.getAllTools(),
+							allowCheckpointModelMismatch: true,
+						}),
+						basePayload,
+					}));
+					if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
+						throw new Error("The session changed while Codex model-transition compaction was running.");
+					}
+					deps.appendCheckpoint({
+						...native.details,
+						modelKey: modelKey(model),
+						...(currentHash ? { compHash: currentHash } : {}),
+					});
+				})();
 		transitionBySession.set(sessionId, transition);
 		try {
 			await transition;
@@ -205,11 +229,12 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			pendingBySession.delete(sessionId);
 			return;
 		}
-		if (!needsTransitionCompaction(previousModel, event.model)) {
+		const pending = pendingBySession.get(sessionId);
+		const transitionPreviousModel = pending?.previousModel ?? previousModel;
+		if (!needsTransitionCompaction(transitionPreviousModel, event.model)) {
 			pendingBySession.delete(sessionId);
 			return;
 		}
-		const pending = pendingBySession.get(sessionId);
 		if (pending && modelKey(event.model) === modelKey(pending.previousModel)) {
 			pendingBySession.delete(sessionId);
 			return;
@@ -245,9 +270,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const historyModel = pending?.previousModel
 			?? (checkpointModelKey && checkpointModelKey !== modelKey(model) ? resolveModel(ctx, checkpointModelKey) : undefined)
 			?? model;
-		if (checkpointModelKey && checkpointModelKey !== modelKey(model) && !pending && historyModel === model) {
-			throw new Error(`The previous Codex model is unavailable: ${checkpointModelKey}`);
-		}
 		const tools = deps.getAllTools();
 		const historyInput = effectiveInputForBranch({
 			branch: branchBefore,
@@ -284,7 +306,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			}
 		}
 
-		await recoverCurrentModel(model, ctx);
+		await recoverCurrentModel(model, ctx, basePayload);
 		let branch = deps.getBranch(ctx);
 		if (!transitioned) {
 			const currentHistory = effectiveInputForBranch({
@@ -312,7 +334,12 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const currentCheckpoint = findNativeCheckpoint(branch);
 		if (currentCheckpoint.status === "none") return undefined;
 		return [
-			...effectiveInputForBranch({ branch, model, tools: deps.getAllTools() }),
+			...effectiveInputForBranch({
+				branch,
+				model,
+				tools: deps.getAllTools(),
+				allowCheckpointModelMismatch: true,
+			}),
 			...tail,
 		];
 	};

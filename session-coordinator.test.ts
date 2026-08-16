@@ -4,8 +4,12 @@ import type { Model } from "@earendil-works/pi-ai";
 import { createSessionCoordinator } from "./session-coordinator.ts";
 import { modelKey, NATIVE_COMPACTION_KIND, type NativeCompactionDetails, type ResponseItem } from "./native-compaction.ts";
 
-function model(provider: string, id: string, compHash?: string): Model<any> {
-	return { provider, api: "openai-codex-responses", id, reasoning: true, ...(compHash ? { compHash } : {}) } as Model<any>;
+function model(provider: string, id: string, compHash: string | undefined = `test-${id}`): Model<any> {
+	return { provider, api: "openai-codex-responses", id, reasoning: true, ...(compHash !== undefined ? { compHash } : {}) } as Model<any>;
+}
+
+function modelWithoutHash(provider: string, id: string): Model<any> {
+	return { ...model(provider, id), compHash: undefined } as Model<any>;
 }
 
 function context(models: Model<any>[] = [], systemPrompt = "instructions"): ExtensionContext {
@@ -103,8 +107,8 @@ describe("Codex session coordinator", () => {
 			calls++;
 			return details("source");
 		});
-		const oldModel = model("openai-codex", "old");
-		await coordinator.selectModel({ model: model("openai-codex", "new"), previousModel: oldModel }, context());
+		const oldModel = model("openai-codex", "old", "shared");
+		await coordinator.selectModel({ model: model("openai-codex", "new", "shared"), previousModel: oldModel }, context());
 		expect(calls).toBe(0);
 	});
 
@@ -175,6 +179,19 @@ describe("Codex session coordinator", () => {
 		expect(await first).toEqual(secondInput);
 		expect(await second).toEqual(secondInput);
 		expect(secondFinished).toBe(true);
+	});
+
+	test("does not transition when either model hash is unavailable", async () => {
+		let calls = 0;
+		const coordinator = createCoordinator([], async () => {
+			calls++;
+			return details("unexpected");
+		});
+		const previous = modelWithoutHash("openai-codex", "previous");
+		const current = model("openai-codex", "current", "hash-b");
+		await coordinator.selectModel({ model: current, previousModel: previous }, context());
+		await coordinator.prepareRequest(current, context(), [userInput("hello")]);
+		expect(calls).toBe(0);
 	});
 
 	test("compacts when a thinking-level change exposes a different compaction hash", async () => {
@@ -367,14 +384,84 @@ describe("Codex session coordinator", () => {
 		const newModel = model("openai-codex", "new");
 		const branch = [checkpointEntry(details(modelKey(oldModel)))];
 		let createdFor: string | undefined;
+		let receivedPayload: Record<string, unknown> | undefined;
 		let appended: NativeCompactionDetails | undefined;
-		const coordinator = createCoordinator(branch, async (selectedModel) => {
+		const coordinator = createCoordinator(branch, async (selectedModel, basePayload) => {
 			createdFor = modelKey(selectedModel);
+			receivedPayload = basePayload;
 			return details(modelKey(selectedModel), "new");
 		}, (value) => { appended = value; });
-		await coordinator.recoverCurrentModel(newModel, context([oldModel, newModel]));
+		await coordinator.recoverCurrentModel(newModel, context([oldModel, newModel]), { reasoning: { effort: "high" } });
 		expect(createdFor).toBe(modelKey(oldModel));
+		expect(receivedPayload).toEqual({ reasoning: { effort: "high" } });
 		expect(appended?.modelKey).toBe(modelKey(newModel));
+	});
+
+	test("skips recovery when checkpoint and current model share a compaction hash", async () => {
+		let calls = 0;
+		const oldModel = model("openai-codex", "old", "shared");
+		const newModel = model("openai-codex", "new", "shared");
+		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "shared" })];
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		await coordinator.recoverCurrentModel(newModel, context([oldModel, newModel]));
+		expect(calls).toBe(0);
+	});
+
+	test("recovers when the same model ID has a different persisted hash", async () => {
+		let calls = 0;
+		const previous = model("openai-codex", "same", "hash-a");
+		const current = model("openai-codex", "same", "hash-b");
+		const branch = [checkpointEntry({ ...details(modelKey(previous)), compHash: "hash-a" })];
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details(modelKey(current));
+		});
+		await coordinator.recoverCurrentModel(current, context([current]));
+		expect(calls).toBe(1);
+	});
+
+	test("replays a same-hash checkpoint through prepareRequest", async () => {
+		const previous = model("openai-codex", "previous", "shared");
+		const current = model("openai-codex", "current", "shared");
+		const branch = [checkpointEntry({ ...details(modelKey(previous)), compHash: "shared" })];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		const input = [...details(modelKey(previous)).replacementHistory, userInput("hello")];
+		await expect(coordinator.prepareRequest(current, context([previous, current]), input)).resolves.toEqual(input);
+		expect(calls).toBe(0);
+	});
+
+	test("falls back to the current model when the checkpoint model is unavailable", async () => {
+		let createdFor: string | undefined;
+		const oldModel = model("openai-codex", "retired", "hash-old");
+		const newModel = model("openai-codex", "current", "hash-new");
+		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "hash-old" })];
+		const coordinator = createCoordinator(branch, async (selectedModel) => {
+			createdFor = modelKey(selectedModel);
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.recoverCurrentModel(newModel, context([newModel]));
+		expect(createdFor).toBe(modelKey(newModel));
+	});
+
+	test("uses current-model recovery fallback through prepareRequest", async () => {
+		let createdFor: string | undefined;
+		const oldModel = model("openai-codex", "retired", "hash-old");
+		const newModel = model("openai-codex", "current", "hash-new");
+		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "hash-old" })];
+		const coordinator = createCoordinator(branch, async (selectedModel) => {
+			createdFor = modelKey(selectedModel);
+			return details(modelKey(selectedModel));
+		});
+		const input = [...details(modelKey(oldModel)).replacementHistory, userInput("hello")];
+		await coordinator.prepareRequest(newModel, context([newModel]), input);
+		expect(createdFor).toBe(modelKey(newModel));
 	});
 
 	test("recovers a pending transition after reload with the checkpoint model", async () => {

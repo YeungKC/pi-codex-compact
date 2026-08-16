@@ -24,6 +24,7 @@ export interface NativeCompactionDetails {
 	version: typeof NATIVE_COMPACTION_VERSION;
 	strategy: "v1" | "v2" | "token-budget";
 	modelKey: string;
+	compHash?: string;
 	replacementHistory: ResponseItem[];
 }
 
@@ -78,6 +79,7 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	if (!isJsonObject(value)) return undefined;
 	if (value.kind !== NATIVE_COMPACTION_KIND || value.version !== NATIVE_COMPACTION_VERSION) return undefined;
 	if (typeof value.modelKey !== "string" || !Array.isArray(value.replacementHistory)) return undefined;
+	if (value.compHash !== undefined && typeof value.compHash !== "string") return undefined;
 
 	const replacementHistory = value.replacementHistory.filter(isResponseItem);
 	if (replacementHistory.length !== value.replacementHistory.length) return undefined;
@@ -109,6 +111,7 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 		version: NATIVE_COMPACTION_VERSION,
 		strategy,
 		modelKey: value.modelKey,
+		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
 		replacementHistory: replacementHistory.map(cloneItem),
 	};
 }

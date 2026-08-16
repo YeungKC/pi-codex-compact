@@ -167,6 +167,16 @@ describe("Codex compaction history", () => {
 		expect(() => buildReplacementHistory([], { type: "message", role: "assistant", content: [] })).toThrow();
 	});
 
+	test("accepts a persisted compaction hash", () => {
+		expect(parseNativeCompactionDetails({
+			kind: "openai-codex-native-compaction",
+			version: 1,
+			modelKey: "openai-codex:openai-codex-responses:test",
+			compHash: "3000",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+		})?.compHash).toBe("3000");
+	});
+
 	test("accepts a legacy checkpoint without strategy", () => {
 		expect(parseNativeCompactionDetails({
 			kind: "openai-codex-native-compaction",
