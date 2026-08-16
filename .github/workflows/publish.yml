@@ -17,20 +17,27 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Check npm version
+      - name: Check package version
         id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          package_name="$(node -p "require('./package.json').name")"
-          package_version="$(node -p "require('./package.json').version")"
-          echo "Package: $package_name@$package_version"
-
-          if npm view "$package_name@$package_version" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "Version is already published."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          current_version="$(node -p "require('./package.json').version")"
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            previous_version=""
           else
-            echo "Version is not published yet."
+            previous_version="$(git show "$BEFORE_SHA:package.json" | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).version)')"
+          fi
+
+          echo "Current package version: $current_version"
+          echo "Previous package version: ${previous_version:-<none>}"
+          if [ "$current_version" != "$previous_version" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
   publish:
