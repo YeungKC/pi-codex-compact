@@ -1,0 +1,57 @@
+{
+  "name": "@yeungkc/pi-codex-compact",
+  "version": "0.0.1",
+  "description": "Pi extension implementing Codex CLI-compatible remote V1/V2 compaction for OpenAI Codex models.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "openai",
+    "codex",
+    "compaction"
+  ],
+  "author": "YeungKC",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YeungKC/pi-codex-compact.git"
+  },
+  "homepage": "https://github.com/YeungKC/pi-codex-compact#readme",
+  "bugs": {
+    "url": "https://github.com/YeungKC/pi-codex-compact/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.10",
+    "@earendil-works/pi-coding-agent": ">=0.80.10",
+    "@earendil-works/pi-tui": ">=0.80.10"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "config.ts",
+    "capabilities.ts",
+    "scheduler.ts",
+    "native-compaction.ts",
+    "remote-compaction.ts",
+    "session-coordinator.ts",
+    "native-compaction.test.ts",
+    "session-coordinator.test.ts",
+    "capabilities.test.ts",
+    "scheduler.test.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}
