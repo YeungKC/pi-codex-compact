@@ -2,15 +2,45 @@ name: Publish package
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Check package version
+        id: version
+        run: |
+          current_version="$(node -p "require('./package.json').version")"
+          if git cat-file -e HEAD^:package.json 2>/dev/null; then
+            previous_version="$(git show HEAD^:package.json | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).version)')"
+          else
+            previous_version=""
+          fi
+
+          echo "Current package version: $current_version"
+          echo "Previous package version: ${previous_version:-<none>}"
+          if [ "$current_version" != "$previous_version" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   publish:
+    needs: version-check
+    if: needs.version-check.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -31,14 +61,6 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-
-      - name: Verify tag matches package version
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          package_version="$(node -p "require('./package.json').version")"
-          tag_version="${TAG_NAME#v}"
-          test "$package_version" = "$tag_version"
 
       - name: Publish to npm with provenance
         run: npm publish --provenance --access public
