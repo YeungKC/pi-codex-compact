@@ -24,6 +24,7 @@ export type CheckpointFactory = (params: {
 	model: Model<any>;
 	input: ReturnType<typeof effectiveInputForBranch>;
 	basePayload?: JsonObject;
+	signal?: AbortSignal;
 }) => Promise<{ details: NativeCompactionDetails }>;
 
 export type SessionCoordinatorDeps = {
@@ -44,6 +45,15 @@ function needsTransitionCompaction(previousModel: Model<any>, currentModel: Mode
 	const previousHash = compactionHash(previousModel);
 	const currentHash = compactionHash(currentModel);
 	return previousHash !== undefined && currentHash !== undefined && previousHash !== currentHash;
+}
+
+function shouldRetryWithCurrentModel(error: unknown): boolean {
+	if (typeof error === "object" && error !== null && "retryWithCurrentModel" in error) {
+		return (error as { retryWithCurrentModel?: unknown }).retryWithCurrentModel === true;
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	if (/(?:abort|cancel|auth|token|account|malformed|invalid compaction|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key)/i.test(message)) return false;
+	return /(?:\b(?:400|403|408|409|429|5\d\d)\b|invalid request|unexpected status|context window|context_length_exceeded|invalid_prompt|usage limit|server overloaded|internal server|retry limit)/i.test(message);
 }
 
 function conversationLeafId(branch: SessionEntry[]): string | undefined {
@@ -135,18 +145,25 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					model: previousModel,
 					input,
 					basePayload,
+					signal: ctx.signal,
 				}));
 			} catch (firstError) {
-				if (modelKey(currentModel) === modelKey(previousModel)) throw firstError;
+				if (modelKey(currentModel) === modelKey(previousModel) || !shouldRetryWithCurrentModel(firstError)) throw firstError;
 				try {
 					native = await deps.withStatus(ctx, () => deps.createCheckpoint({
 						ctx,
 						model: currentModel,
-						input,
+						input: effectiveInputForBranch({
+							branch,
+							model: currentModel,
+							tools: deps.getAllTools(),
+							allowCheckpointModelMismatch: true,
+						}),
 						basePayload,
+						signal: ctx.signal,
 					}));
-				} catch (fallbackError) {
-					throw new Error(`${firstError instanceof Error ? firstError.message : String(firstError)}; current-model fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`);
+				} catch {
+					throw firstError;
 				}
 			}
 			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) continue;
@@ -191,6 +208,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 							allowCheckpointModelMismatch: true,
 						}),
 						basePayload,
+						signal: ctx.signal,
 					}));
 					if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 						throw new Error("The session changed while Codex model-transition compaction was running.");
@@ -317,7 +335,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 
 		await recoverCurrentModel(model, ctx, basePayload);
 		let branch = deps.getBranch(ctx);
-		if (!transitioned) {
+		{
 			const currentHistory = effectiveInputForBranch({
 				branch,
 				model,
@@ -332,6 +350,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					model,
 					input: currentHistory,
 					basePayload,
+					signal: ctx.signal,
 				}));
 				if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 					throw new Error("The session changed while Codex automatic compaction was running.");

@@ -1,7 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { buildLegacyCompactionRequestBody, buildReplacementHistory, filterLegacyCompactionHistory, fullInputForBranch, parseNativeCompactionDetails, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, parseNativeCompactionDetails, approximateResponseItemTokens, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
+	test("preserves eligible response.failed details for model fallback", async () => {
+		let calls = 0;
+		const body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too large\"}}}\n\ndata: [DONE]\n\n";
+		await expect(callRemoteCompaction({
+			url: "https://example.test/compact",
+			headers: new Headers(),
+			body: {},
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			fetchImpl: async () => {
+				calls++;
+				return new Response(body, { headers: { "content-type": "text/event-stream" } });
+			},
+		})).rejects.toThrow("context_length_exceeded");
+		expect(calls).toBe(1);
+	});
 	test("matches Pi message indexes across empty user entries", () => {
 		const model = { provider: "openai-codex", api: "openai-codex-responses", id: "current", reasoning: true } as never;
 		const branch = [
@@ -81,6 +96,12 @@ describe("Codex compaction history", () => {
 			{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] },
 		]);
 		expect(result).toHaveLength(1);
+	});
+
+	test("counts images in best-effort token accounting", () => {
+		expect(approximateResponseItemTokens([{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] }])).toBeGreaterThanOrEqual(1_200);
+		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image" }, { type: "input_image" }] }])).toBeGreaterThanOrEqual(2_400);
+		expect(retainRecentMessages([{ type: "message", role: "user", content: [{ type: "input_image" }] }], 1_199)).toEqual([]);
 	});
 
 	test("truncates an oversized message without throwing", () => {

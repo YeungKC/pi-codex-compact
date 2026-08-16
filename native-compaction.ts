@@ -450,7 +450,24 @@ function responseItemText(item: ResponseItem): string {
 	return "";
 }
 
+export function approximateTokenCount(value: unknown): number {
+	const encoded = JSON.stringify(value);
+	return Math.max(1, Math.ceil((encoded?.length ?? 0) / 4));
+}
+
+function imagePartCount(value: unknown): number {
+	if (Array.isArray(value)) return value.reduce((total, part) => total + imagePartCount(part), 0);
+	if (!isJsonObject(value)) return 0;
+	if (value.type === "input_image" || value.type === "image_url") return 1;
+	return Object.values(value).reduce((total, part) => total + imagePartCount(part), 0);
+}
+
 function approximateTokens(item: ResponseItem): number {
+	const imageTokens = imagePartCount(item) * 1_200;
+	if (imageTokens > 0) return imageTokens + Math.max(0, Math.ceil(responseItemText(item).length / 4));
+	if (typeof item.type === "string" && item.type.includes("tool") && item.type !== "function_call_output") {
+		return Math.max(1, Math.ceil(JSON.stringify(item).length / 4));
+	}
 	return Math.max(1, Math.ceil(responseItemText(item).length / 4));
 }
 
@@ -499,6 +516,12 @@ function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | 
 	if (!Array.isArray(copy.content)) return copy;
 
 	const truncatedContent = copy.content.flatMap((part) => {
+		const imageTokens = imagePartCount(part) * 1_200;
+		if (imageTokens > 0) {
+			if (remainingCharacters < imageTokens * 4) return [];
+			remainingCharacters -= imageTokens * 4;
+			return [part];
+		}
 		if (!isJsonObject(part) || typeof part.text !== "string") return [part];
 		if (remainingCharacters <= 0) return [];
 		const text = truncateTextPrefix(part.text, remainingCharacters);
@@ -745,6 +768,16 @@ function isRetryableStatus(status: number): boolean {
 	return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+function canFallbackForStatus(status: number, body: string): boolean {
+	if (![400, 403, 408, 409, 429].includes(status) && status < 500) return false;
+	return !/(?:misalignment_policy_violation|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key)/i.test(body);
+}
+
+function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
+	Object.defineProperty(error, "retryWithCurrentModel", { value: eligible, enumerable: false });
+	return error as Error & { retryWithCurrentModel: boolean };
+}
+
 class NonRetryableCompactionError extends Error {}
 class RetryableCompactionStreamError extends Error {}
 
@@ -796,7 +829,12 @@ async function parseSseResponse(response: Response): Promise<{ item: ResponseIte
 			throw new NonRetryableCompactionError(event.message);
 		}
 		if (event.type === "response.failed") {
-			throw new NonRetryableCompactionError("OpenAI Codex compaction ended with response.failed.");
+			const response = isJsonObject(event.response) ? event.response : {};
+			const failure = isJsonObject(response.error) ? response.error : {};
+			const code = typeof failure.code === "string" ? failure.code : "response.failed";
+			const message = typeof failure.message === "string" ? failure.message : "OpenAI Codex compaction ended with response.failed.";
+			const eligible = code === "context_length_exceeded" || code === "invalid_prompt";
+			throw markFallbackEligibility(new NonRetryableCompactionError(`OpenAI Codex compaction failed (${code}): ${message}`), eligible);
 		}
 		if (event.type === "response.incomplete") {
 			throw new RetryableCompactionStreamError("OpenAI Codex compaction ended with response.incomplete.");
@@ -882,8 +920,8 @@ export async function callRemoteCompaction(params: {
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
 				const message = `OpenAI Codex compaction failed (${response.status}): ${body || response.statusText}`;
-				if (!isRetryableStatus(response.status)) throw new NonRetryableCompactionError(message);
-				const error = new Error(message);
+				if (!isRetryableStatus(response.status)) throw markFallbackEligibility(new NonRetryableCompactionError(message), canFallbackForStatus(response.status, body));
+				const error = markFallbackEligibility(new Error(message), canFallbackForStatus(response.status, body));
 				if (attempt === MAX_REMOTE_RETRIES) throw error;
 				lastError = error;
 				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
@@ -953,7 +991,7 @@ export async function callLegacyRemoteCompaction(params: {
 			});
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
-				const error = new Error(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`);
+				const error = markFallbackEligibility(new Error(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`), canFallbackForStatus(response.status, body));
 				if (!isRetryableStatus(response.status) || attempt === MAX_REMOTE_RETRIES) throw error;
 				lastError = error;
 				await delay(1000 * 2 ** attempt, params.signal);

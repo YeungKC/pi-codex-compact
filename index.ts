@@ -13,6 +13,8 @@ import {
 	mergeFeatureHeader,
 	modelKey,
 	approximateResponseItemTokens,
+	approximateTokenCount,
+	buildToolPayload,
 	stripInputFromPayload,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
@@ -76,11 +78,12 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	const coordinator = createSessionCoordinator({
 		getBranch: (ctx) => ctx.sessionManager.getBranch() as SessionEntry[],
 		getAllTools: () => pi.getAllTools(),
-		createCheckpoint: ({ ctx, model, input, basePayload }) => createNativeCheckpoint({
+		createCheckpoint: ({ ctx, model, input, basePayload, signal }) => createNativeCheckpoint({
 			ctx,
 			model,
 			input,
 			basePayload,
+			signal,
 			config: loadConfig(ctx.cwd, ctx.isProjectTrusted()),
 			allTools: pi.getAllTools(),
 			activeToolNames: pi.getActiveTools(),
@@ -90,10 +93,16 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		shouldAutoCompact: ({ ctx, model, input }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			if (config.tokenBudget) return false;
+			// Pi does not expose Codex's exact usage/prefill split; count the stable prefix approximately.
+			const prefillTokens = approximateTokenCount({
+				instructions: ctx.getSystemPrompt(),
+				tools: buildToolPayload(pi.getAllTools(), pi.getActiveTools()),
+			});
 			return shouldAutoCompact({
 				status: {
-					activeContextTokens: approximateResponseItemTokens(input),
+					activeContextTokens: approximateResponseItemTokens(input) + prefillTokens,
 					contextWindow: model.contextWindow,
+					prefillTokens,
 				},
 				limit: autoCompactTokenLimit(config, model.contextWindow),
 				scope: config.autoCompactScope,

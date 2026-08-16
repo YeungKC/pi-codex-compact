@@ -60,15 +60,15 @@ function nativeCompactionEntry(data: NativeCompactionDetails, firstKeptEntryId: 
 
 function createCoordinator(
 	branch: SessionEntry[] = [],
-	createCheckpoint?: (model: Model<any>, basePayload?: Record<string, unknown>) => Promise<NativeCompactionDetails>,
+	createCheckpoint?: (model: Model<any>, basePayload?: Record<string, unknown>, input?: ResponseItem[]) => Promise<NativeCompactionDetails>,
 	appendCheckpoint?: (details: NativeCompactionDetails) => void,
 	shouldAutoCompact?: (input: ResponseItem[]) => boolean,
 ) {
 	return createSessionCoordinator({
 		getBranch: () => branch,
 		getAllTools: () => [],
-		createCheckpoint: async ({ model: selectedModel, basePayload }) => ({
-			details: createCheckpoint ? await createCheckpoint(selectedModel, basePayload) : details(modelKey(selectedModel)),
+		createCheckpoint: async ({ model: selectedModel, basePayload, input }) => ({
+			details: createCheckpoint ? await createCheckpoint(selectedModel, basePayload, input) : details(modelKey(selectedModel)),
 		}),
 		withStatus: async (_ctx, operation) => operation(),
 		appendCheckpoint: (value) => {
@@ -380,6 +380,20 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, userInput("hello")]);
 	});
 
+	test("checks the automatic limit again after transition compaction", async () => {
+		const compactedWith: string[] = [];
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			return details(modelKey(selectedModel));
+		}, undefined, () => true);
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		const input = await coordinator.prepareRequest(newModel, context(), [userInput("hello")]);
+		expect(compactedWith).toEqual([modelKey(oldModel), modelKey(newModel)]);
+		expect(input?.at(-1)).toEqual(userInput("hello"));
+	});
+
 	test("passes the current request parameters to transition compaction", async () => {
 		let receivedPayload: Record<string, unknown> | undefined;
 		const coordinator = createCoordinator([], async (_selectedModel, basePayload) => {
@@ -606,7 +620,7 @@ describe("Codex session coordinator", () => {
 		const newModel = model("openai-codex", "new");
 		const coordinator = createCoordinator([], async (selectedModel) => {
 			compactedWith.push(modelKey(selectedModel));
-			if (selectedModel.id === oldModel.id) throw new Error("old model unavailable");
+			if (selectedModel.id === oldModel.id) throw new Error("OpenAI Codex compaction failed (400): invalid request");
 			return details(modelKey(selectedModel), "fallback");
 		});
 		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
@@ -615,15 +629,73 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "fallback" }, userInput("hello")]);
 	});
 
+	test("rebuilds fallback input for the current model", async () => {
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const branch = [{
+			id: "assistant-thinking",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: oldModel.provider,
+				api: oldModel.api,
+				model: oldModel.id,
+				content: [{ type: "thinking", thinking: "plan", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_old", summary: [] }) }],
+			},
+		} as unknown as SessionEntry];
+		const inputs: ResponseItem[][] = [];
+		const coordinator = createCoordinator(branch, async (selectedModel, _basePayload, input) => {
+			inputs.push(input ?? []);
+			if (selectedModel.id === oldModel.id) throw new Error("OpenAI Codex compaction failed (400): invalid request");
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await coordinator.prepareRequest(newModel, context(), [
+			{ type: "message", role: "assistant", id: "msg_pi_0", status: "completed", phase: undefined, content: [{ type: "output_text", text: "plan", annotations: [] }] },
+			userInput("hello"),
+		]);
+		expect(inputs).toHaveLength(2);
+		expect(inputs[0]?.[0]?.type).toBe("reasoning");
+		expect(inputs[1]?.[0]?.type).toBe("message");
+	});
+
 	test("records a failed transition only when the first request runs", async () => {
-		const failing = createCoordinator([], async () => { throw new Error("remote unavailable"); });
+		let calls = 0;
+		const failing = createCoordinator([], async () => { calls++; throw new Error("remote unavailable"); });
 		const oldModel = model("openai-codex", "old");
 		const newModel = model("openai-codex", "new");
 		await failing.selectModel({ model: newModel, previousModel: oldModel }, context());
 		expect(failing.transitionFailure("session", newModel)).toBeUndefined();
 		await failing.prepareRequest(newModel, context(), [userInput("hello")]).catch(() => {});
-		expect(failing.transitionFailure("session", newModel)).toBe("remote unavailable; current-model fallback failed: remote unavailable");
+		expect(calls).toBe(1);
+		expect(failing.transitionFailure("session", newModel)).toBe("remote unavailable");
 		await failing.selectModel({ model: model("anthropic", "claude"), previousModel: newModel }, context());
 		expect(failing.transitionFailure("session", newModel)).toBeUndefined();
+	});
+
+	test("does not fallback for policy errors despite an HTTP 400", async () => {
+		let calls = 0;
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const coordinator = createCoordinator([], async () => {
+			calls++;
+			throw new Error("OpenAI Codex compaction failed (400): cyber_policy");
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await expect(coordinator.prepareRequest(newModel, context(), [userInput("hello")])).rejects.toThrow("cyber_policy");
+		expect(calls).toBe(1);
+	});
+
+	test("preserves the previous-model error when fallback also fails", async () => {
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			if (selectedModel.id === oldModel.id) throw new Error("OpenAI Codex compaction failed (400): retired model");
+			throw new Error("current model failed");
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await expect(coordinator.prepareRequest(newModel, context(), [userInput("hello")])).rejects.toThrow("OpenAI Codex compaction failed (400): retired model");
 	});
 });
