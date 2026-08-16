@@ -54,7 +54,7 @@ pi install .
 After publication:
 
 ```bash
-pi install npm:pi-codex-compact
+pi install npm:@yeungkc/pi-codex-compact
 /reload
 ```
 
