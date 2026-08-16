@@ -319,14 +319,12 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			throw error;
 		}
 
-		let transitioned = false;
 		if (pending && pending.targetModelKey === modelKey(model)) {
 			const startGeneration = generation;
 			const transition = runTransition(sessionId, ctx, pending.previousModel, pending.targetModelKey, model, basePayload, startGeneration);
 			transitionBySession.set(sessionId, transition);
 			try {
 				await transition;
-				transitioned = true;
 			} catch (error) {
 				if (generation === startGeneration) {
 					failureBySession.set(sessionId, { modelKey: modelKey(model), message: error instanceof Error ? error.message : String(error) });

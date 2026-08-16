@@ -24,5 +24,6 @@ describe("Codex compaction capability routing", () => {
 		expect(compactionHash({ id: "gpt-5.6-luna" } as never)).toBe("3000");
 		expect(compactionHash({ id: "gpt-5.2" } as never)).toBeUndefined();
 		expect(compactionHash({ id: "custom", compHash: "from-model" } as never)).toBe("from-model");
+		expect(compactionHash({ id: "gpt-5.4", compHash: "runtime" } as never)).toBe("runtime");
 	});
 });

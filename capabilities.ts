@@ -13,10 +13,10 @@ const CODEX_COMPACTION_HASHES: Record<string, string> = {
 };
 
 export function compactionHash(model: Model<any>): string | undefined {
-	const known = CODEX_COMPACTION_HASHES[model.id];
-	if (known) return known;
 	const value = model as Model<any> & { compHash?: unknown; comp_hash?: unknown };
-	return typeof value.compHash === "string" ? value.compHash : typeof value.comp_hash === "string" ? value.comp_hash : undefined;
+	if (typeof value.compHash === "string") return value.compHash;
+	if (typeof value.comp_hash === "string") return value.comp_hash;
+	return CODEX_COMPACTION_HASHES[model.id];
 }
 
 /** Mirrors Codex's local provider routing: OpenAI supports remote compaction; other providers do not. */
