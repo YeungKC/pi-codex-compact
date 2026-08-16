@@ -227,11 +227,21 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		basePayload?: JsonObject,
 	): Promise<ResponseItem[] | undefined> => {
 		const sessionId = ctx.sessionManager.getSessionId();
+		const activeTransition = transitionBySession.get(sessionId);
+		if (activeTransition) {
+			await activeTransition;
+			return prepareRequest(model, ctx, requestInput, basePayload);
+		}
 		const branchBefore = deps.getBranch(ctx);
 		const pending = pendingBySession.get(sessionId);
 		const checkpoint = findNativeCheckpoint(branchBefore);
 		const checkpointModelKey = checkpoint.status === "valid" ? checkpoint.checkpoint.details.modelKey : undefined;
-		if (pending && !requestInput) throw new Error("The Codex request input is unavailable for model-transition compaction.");
+		if (pending && pending.targetModelKey !== modelKey(model)) {
+			throw new Error("The pending Codex model transition targets a different model.");
+		}
+		if (!requestInput && (pending || checkpoint.status !== "none")) {
+			throw new Error("The Codex request input is unavailable while replaying compaction state.");
+		}
 		const historyModel = pending?.previousModel
 			?? (checkpointModelKey && checkpointModelKey !== modelKey(model) ? resolveModel(ctx, checkpointModelKey) : undefined)
 			?? model;
@@ -248,7 +258,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const rawHistoryInput = fullInputForBranch({ branch: branchBefore, model: historyModel, tools });
 		const piContextInput = piContextInputForBranch({ branch: branchBefore, model: historyModel, tools });
 		const systemPromptInput = systemPromptInputForModel(model, ctx.getSystemPrompt());
-		const tail = requestTail(requestInput, historyInput, rawHistoryInput, piContextInput, systemPromptInput);
+		let tail: ResponseItem[];
+		try {
+			tail = requestTail(requestInput, historyInput, rawHistoryInput, piContextInput, systemPromptInput);
+		} catch (error) {
+			if (!pending && checkpoint.status === "none") return undefined;
+			throw error;
+		}
 
 		let transitioned = false;
 		if (pending && pending.targetModelKey === modelKey(model)) {
