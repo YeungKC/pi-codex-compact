@@ -250,7 +250,11 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			pendingBySession.delete(sessionId);
 			return;
 		}
-		if (pending && modelKey(event.model) === modelKey(pending.previousModel)) {
+		if (
+			pending
+			&& modelKey(event.model) === modelKey(pending.previousModel)
+			&& compactionHash(event.model) === compactionHash(pending.previousModel)
+		) {
 			pendingBySession.delete(sessionId);
 			return;
 		}

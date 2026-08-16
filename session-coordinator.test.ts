@@ -407,6 +407,21 @@ describe("Codex session coordinator", () => {
 		expect(receivedPayload).toEqual({ reasoning: { effort: "high" } });
 	});
 
+	test("keeps a same-ID transition when its compaction hash changes", async () => {
+		const firstA = model("openai-codex", "a", "hash-a");
+		const b = model("openai-codex", "b", "hash-b");
+		const secondA = model("openai-codex", "a", "hash-c");
+		let compactedWith: string | undefined;
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			compactedWith = modelKey(selectedModel);
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.selectModel({ model: b, previousModel: firstA }, context());
+		await coordinator.selectModel({ model: secondA, previousModel: b }, context());
+		await coordinator.prepareRequest(secondA, context(), [userInput("hello")]);
+		expect(compactedWith).toBe(modelKey(firstA));
+	});
+
 	test("coalesces A to B to C before the first request", async () => {
 		let compactedWith: string | undefined;
 		const coordinator = createCoordinator([], async (selectedModel) => {
