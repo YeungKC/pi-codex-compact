@@ -385,15 +385,22 @@ export function effectiveInputForBranch(params: {
 	return fullInputForBranch({ branch, model: params.model, tools: params.tools });
 }
 
+function contentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.flatMap((part) => {
+			if (!isJsonObject(part)) return [];
+			if (typeof part.text === "string") return [part.text];
+			if (typeof part.encrypted_content === "string") return [part.encrypted_content];
+			return [];
+		})
+		.join("");
+}
+
 function responseItemText(item: ResponseItem): string {
-	if (item.type === "message" || item.type === undefined) {
-		if (typeof item.content === "string") return item.content;
-		if (!Array.isArray(item.content)) return "";
-		return item.content
-			.flatMap((part) =>
-				isJsonObject(part) && typeof part.text === "string" ? [part.text] : [],
-			)
-			.join("");
+	if (item.type === "message" || item.type === "agent_message" || item.type === undefined) {
+		return contentText(item.content);
 	}
 	if (item.type === "function_call_output") {
 		return typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
@@ -461,33 +468,111 @@ function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | 
 	return truncatedContent.length > 0 ? copy : undefined;
 }
 
-function retainedByCodex(item: ResponseItem): boolean {
-	if (item.type === "agent_message") return true;
-	if (item.type !== "message" && item.type !== undefined) return false;
-	return item.role === "user" || item.role === "developer" || item.role === "system" || item.role === "assistant";
+const CONTEXTUAL_USER_WRAPPERS: Array<[string, string]> = [
+	["<environment_context>", "</environment_context>"],
+	["<environments_instructions>", "</environments_instructions>"],
+	["<context_window>", "</context_window>"],
+	["<context_window_guidance>", "</context_window_guidance>"],
+	["<skills_instructions>", "</skills_instructions>"],
+	["<tools>", "</tools>"],
+	["<permissions instructions>", "</permissions instructions>"],
+	["<model_switch>", "</model_switch>"],
+	["<git_attribution>", "</git_attribution>"],
+	["<plugins_instructions>", "</plugins_instructions>"],
+	["<realtime_conversation>", "</realtime_conversation>"],
+	["<personality_spec>", "</personality_spec>"],
+	["<rollout_budget>", "</rollout_budget>"],
+	["<turn_aborted>", "</turn_aborted>"],
+	["<subagent_notification>", "</subagent_notification>"],
+	["<user_instructions>", "</user_instructions>"],
+	["<user_shell_command>", "</user_shell_command>"],
+	["<additional_context>", "</additional_context>"],
+];
+
+function isContextualUserText(value: string): boolean {
+	const text = value.trimStart();
+	const lower = text.toLowerCase();
+	if (lower.startsWith("# agents.md instructions")) return lower.trimEnd().endsWith("</instructions>");
+	if (lower.startsWith("<codex_internal_context")) {
+		return /^<codex_internal_context source="[a-z][a-z0-9_]*">[\s\S]*<\/codex_internal_context>\s*$/.test(text);
+	}
+	if (lower.startsWith("<goal_context>")) return lower.trimEnd().endsWith("</goal_context>");
+	if (lower.startsWith("<skill>")) return lower.trimEnd().endsWith("</skill>");
+	if (lower.startsWith("<recommended_plugins>")) return lower.trimEnd().endsWith("</recommended_plugins>");
+	if (lower.startsWith("<external_") && lower.includes(">")) {
+		const opening = lower.match(/^<(external_[a-z0-9_-]+)>/);
+		return opening !== null && lower.trimEnd().endsWith(`</${opening[1]}>`);
+	}
+	if (lower.startsWith("warning: the maximum number of unified exec processes you can keep open is")) return true;
+	if (lower.startsWith("warning: your account was flagged for potentially high-risk cyber activity")) return true;
+	if (lower.startsWith("warning: apply_patch was requested via ")) {
+		return lower.trimEnd().endsWith("use the apply_patch tool instead of exec_command.");
+	}
+	return CONTEXTUAL_USER_WRAPPERS.some(([open, close]) =>
+		lower.startsWith(open) && lower.trimEnd().endsWith(close),
+	);
 }
 
-/** Mirrors Codex V2: retain recent messages, with a separate 10k agent-message cap. */
+function isHookPromptText(value: string): boolean {
+	return /^<hook_prompt\b[^>]*hook_run_id=(?:"[^"]+"|'[^']+')\s*>[\s\S]*<\/hook_prompt>\s*$/i.test(value.trim());
+}
+
+function isRetainedUserMessage(item: ResponseItem): boolean {
+	if (typeof item.content === "string") return !isContextualUserText(item.content);
+	if (!Array.isArray(item.content)) return true;
+	let hookPrompt = false;
+	let onlyContextOrHook = true;
+	for (const part of item.content) {
+		if (!isJsonObject(part) || typeof part.text !== "string") {
+			onlyContextOrHook = false;
+			continue;
+		}
+		if (isHookPromptText(part.text)) {
+			hookPrompt = true;
+			continue;
+		}
+		if (isContextualUserText(part.text)) continue;
+		onlyContextOrHook = false;
+	}
+	return hookPrompt ? onlyContextOrHook : !item.content.some(
+		(part) => isJsonObject(part) && typeof part.text === "string" && isContextualUserText(part.text),
+	);
+}
+
+function isFinalAnswerAgentMessage(item: ResponseItem): boolean {
+	if (item.type !== "agent_message" || !Array.isArray(item.content)) return false;
+	const first = item.content[0];
+	return isJsonObject(first)
+		&& first.type === "input_text"
+		&& typeof first.text === "string"
+		&& first.text.startsWith("Message Type: FINAL_ANSWER\n");
+}
+
+function retainedByCodex(item: ResponseItem): boolean {
+	if (item.type === "agent_message") {
+		return !isFinalAnswerAgentMessage(item) && approximateTokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
+	}
+	if (item.type !== "message" && item.type !== undefined) return false;
+	return item.role === "user" && isRetainedUserMessage(item);
+}
+
+/** Mirrors current Codex V2's retained message whitelist and 64k newest-first budget. */
 export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED_MESSAGE_TOKEN_BUDGET): ResponseItem[] {
 	let remaining = maxTokens;
-	let agentMessageRemaining = MAX_RETAINED_AGENT_MESSAGE_TOKENS;
 	const retained: ResponseItem[] = [];
 	for (const item of [...items].reverse()) {
 		if (remaining <= 0 || !retainedByCodex(item)) continue;
-		const isAgentMessage = item.type === "agent_message" || item.role === "assistant";
-		const available = isAgentMessage ? Math.min(remaining, agentMessageRemaining) : remaining;
-		if (available <= 0) continue;
 		const tokens = approximateTokens(item);
-		if (tokens <= available) {
+		if (tokens <= remaining) {
 			retained.push(cloneItem(item));
 			remaining -= tokens;
-			if (isAgentMessage) agentMessageRemaining -= tokens;
-		} else {
-			const truncated = truncateMessage(item, available);
-			if (truncated) retained.push(truncated);
-			remaining -= available;
-			if (isAgentMessage) agentMessageRemaining -= available;
+			continue;
 		}
+		const truncated = (item.type === "message" || item.type === undefined)
+			? truncateMessage(item, remaining)
+			: undefined;
+		if (truncated) remaining = 0;
+		if (truncated) retained.push(truncated);
 	}
 	return retained.reverse();
 }
@@ -495,7 +580,8 @@ export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED
 export function filterLegacyCompactionHistory(items: ResponseItem[]): ResponseItem[] {
 	return items.filter((item) => {
 		if (item.type === "message" || item.type === undefined) {
-			return item.role === "user" || item.role === "assistant";
+			if (item.role === "assistant") return true;
+			return item.role === "user" && isRetainedUserMessage(item);
 		}
 		return item.type === "compaction" || item.type === "context_compaction" || item.type === "agent_message";
 	});

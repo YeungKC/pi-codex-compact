@@ -10,7 +10,30 @@ describe("Codex compaction history", () => {
 			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] },
 		]);
 
-		expect(result.map((item) => item.role ?? item.type)).toEqual(["user", "assistant"]);
+		expect(result.map((item) => item.role ?? item.type)).toEqual(["user"]);
+	});
+
+	test("retains eligible agent messages within the per-item limit", () => {
+		const result = retainRecentMessages([
+			{ type: "agent_message", content: [{ type: "input_text", text: "Message Type: COMMENTARY\nsmall" }] },
+		]);
+		expect(result).toHaveLength(1);
+	});
+
+	test("drops oversized and final-answer agent messages", () => {
+		const result = retainRecentMessages([
+			{ type: "agent_message", content: [{ type: "input_text", text: `Message Type: COMMENTARY\n${"x".repeat(40_000)}` }] },
+			{ type: "agent_message", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\ndone" }] },
+		]);
+		expect(result).toEqual([]);
+	});
+
+	test("does not share the agent-message limit across items", () => {
+		const result = retainRecentMessages([
+			{ type: "agent_message", content: [{ type: "input_text", text: "x".repeat(24_000) }] },
+			{ type: "agent_message", content: [{ type: "input_text", text: "y".repeat(24_000) }] },
+		]);
+		expect(result).toHaveLength(2);
 	});
 
 	test("retains image-only user messages", () => {
@@ -42,6 +65,59 @@ describe("Codex compaction history", () => {
 			{ type: "message", role: "assistant", content: [] },
 		]);
 		expect(result).toHaveLength(2);
+	});
+
+	test("drops contextual V1 user wrappers but keeps real user messages", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>old</environment_context>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "keep this" }] },
+			{ type: "message", role: "developer", content: [{ type: "input_text", text: "stale instructions" }] },
+		]);
+		expect(result).toHaveLength(1);
+		expect(result[0]?.content).toEqual([{ type: "input_text", text: "keep this" }]);
+	});
+
+	test("keeps valid V1 hook prompts", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: '<hook_prompt hook_run_id="run">retry</hook_prompt>' }] },
+		]);
+		expect(result).toHaveLength(1);
+	});
+
+	test("keeps hook prompts mixed with contextual fragments", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [
+				{ type: "input_text", text: "<environment_context>old</environment_context>" },
+				{ type: "input_text", text: '<hook_prompt hook_run_id="run">retry</hook_prompt>' },
+			] },
+		]);
+		expect(result).toHaveLength(1);
+	});
+
+	test("drops hook prompts mixed with ordinary user text", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [
+				{ type: "input_text", text: '<hook_prompt hook_run_id="run">retry</hook_prompt>' },
+				{ type: "input_text", text: "ordinary text" },
+			] },
+		]);
+		expect(result).toHaveLength(0);
+	});
+
+	test("recognizes common Codex wrappers without hiding literal user text", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>old</INSTRUCTIONS>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<skill>old</skill>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>literal" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<external_a>literal</external_b>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: '<codex_internal_context source="Bad!">literal</codex_internal_context>' }] },
+		]);
+		expect(result).toHaveLength(3);
+		expect(result.map((item) => item.content)).toEqual([
+			[{ type: "input_text", text: "<environment_context>literal" }],
+			[{ type: "input_text", text: "<external_a>literal</external_b>" }],
+			[{ type: "input_text", text: '<codex_internal_context source="Bad!">literal</codex_internal_context>' }],
+		]);
 	});
 
 	test("always appends exactly one valid compaction checkpoint", () => {
