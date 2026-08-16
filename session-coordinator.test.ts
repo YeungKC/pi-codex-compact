@@ -108,6 +108,75 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(0);
 	});
 
+	test("passes through an ordinary request when Pi sends a changed input shape", async () => {
+		const currentModel = model("openai-codex", "current");
+		const branch = [{
+			id: "history",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "history" }] },
+		} as unknown as SessionEntry];
+		let compactions = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			compactions++;
+			return details(modelKey(currentModel));
+		});
+
+		await expect(coordinator.prepareRequest(currentModel, context(), [userInput("new")])).resolves.toBeUndefined();
+		expect(compactions).toBe(0);
+	});
+
+	test("blocks a request for the wrong model while a transition is pending", async () => {
+		const coordinator = createCoordinator();
+		const previousModel = model("openai-codex", "previous");
+		const targetModel = model("openai-codex", "target");
+		await coordinator.selectModel({ model: targetModel, previousModel }, context());
+
+		await expect(coordinator.prepareRequest(previousModel, context(), [userInput("hello")])).rejects.toThrow(
+			"pending Codex model transition targets a different model",
+		);
+	});
+
+	test("requires provider input when replaying a native checkpoint", async () => {
+		const currentModel = model("openai-codex", "current");
+		const coordinator = createCoordinator([checkpointEntry(details(modelKey(currentModel)))]);
+
+		await expect(coordinator.prepareRequest(currentModel, context(), undefined)).rejects.toThrow(
+			"Codex request input is unavailable while replaying compaction state",
+		);
+	});
+
+	test("waits for an active transition instead of passing through", async () => {
+		let signalStarted!: () => void;
+		let release!: (value: NativeCompactionDetails) => void;
+		const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+		const blocked = new Promise<NativeCompactionDetails>((resolve) => { release = resolve; });
+		const previousModel = model("openai-codex", "previous");
+		const targetModel = model("openai-codex", "target");
+		const compacted = details(modelKey(targetModel));
+		const coordinator = createCoordinator([], async () => {
+			signalStarted();
+			return blocked;
+		});
+		await coordinator.selectModel({ model: targetModel, previousModel }, context());
+		const first = coordinator.prepareRequest(targetModel, context(), [userInput("hello")]);
+		await started;
+		await coordinator.selectModel({ model: model("anthropic", "other"), previousModel: targetModel }, context());
+		const secondInput = [...compacted.replacementHistory, userInput("hello")];
+		let secondFinished = false;
+		const second = coordinator.prepareRequest(targetModel, context(), secondInput).then((input) => {
+			secondFinished = true;
+			return input;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(secondFinished).toBe(false);
+		release(compacted);
+		expect(await first).toEqual(secondInput);
+		expect(await second).toEqual(secondInput);
+		expect(secondFinished).toBe(true);
+	});
+
 	test("compacts when a thinking-level change exposes a different compaction hash", async () => {
 		let calls = 0;
 		const coordinator = createCoordinator([], async () => {
