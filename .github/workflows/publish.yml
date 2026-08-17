@@ -7,13 +7,17 @@ on:
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   version-check:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.version.outputs.changed }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -34,6 +38,7 @@ jobs:
 
           echo "Current package version: $current_version"
           echo "Previous package version: ${previous_version:-<none>}"
+          echo "version=$current_version" >> "$GITHUB_OUTPUT"
           if [ "$current_version" != "$previous_version" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -44,25 +49,86 @@ jobs:
     needs: version-check
     if: needs.version-check.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Check out source
         uses: actions/checkout@v6
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install test dependencies
-        run: bun install --no-progress
-
-      - name: Run tests
-        run: bun test
+      - uses: pnpm/action-setup@v6
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-          package-manager-cache: false
+          cache: pnpm
+
+      - name: Install test dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
 
       - name: Publish to npm with provenance
-        run: npm publish --provenance --access public
+        env:
+          PACKAGE_NAME: '@yeungkc/pi-codex-compact'
+          PACKAGE_VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          if npm view "$PACKAGE_NAME@$PACKAGE_VERSION" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "Already published: $PACKAGE_NAME@$PACKAGE_VERSION"
+          else
+            npm publish --provenance --access public
+          fi
+
+  publish-github:
+    needs: [version-check, publish]
+    if: needs.version-check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: '@yeungkc'
+          package-manager-cache: false
+
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: '@yeungkc/pi-codex-compact'
+          PACKAGE_VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          if npm view "$PACKAGE_NAME@$PACKAGE_VERSION" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "Already published: $PACKAGE_NAME@$PACKAGE_VERSION"
+          else
+            npm publish --registry=https://npm.pkg.github.com
+          fi
+
+  create-release:
+    needs: [version-check, publish-github]
+    if: needs.version-check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.version-check.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $TAG"
+          elif gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Refusing to create a release for an existing tag: $TAG" >&2
+            exit 1
+          else
+            gh release create "$TAG" --generate-notes --target "$GITHUB_SHA"
+          fi

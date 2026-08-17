@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { compactionCapability, compactionHash } from "./capabilities.ts";
 
 const model = (provider: string) => ({ provider }) as never;
