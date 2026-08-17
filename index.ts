@@ -11,13 +11,11 @@ import {
 	isJsonObject,
 	isOpenAICodexModel,
 	mergeFeatureHeader,
-	modelKey,
 	approximateResponseItemTokens,
 	approximateTokenCount,
 	buildToolPayload,
 	stripInputFromPayload,
 	NATIVE_COMPACTION_KIND,
-	NATIVE_COMPACTION_VERSION,
 	type JsonObject,
 } from "./native-compaction.ts";
 
@@ -92,7 +90,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
 		shouldAutoCompact: ({ ctx, model, input }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
-			if (config.tokenBudget) return false;
 			// Pi does not expose Codex's exact usage/prefill split; count the stable prefix approximately.
 			const prefillTokens = approximateTokenCount({
 				instructions: ctx.getSystemPrompt(),
@@ -106,7 +103,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				},
 				limit: autoCompactTokenLimit(config, model.contextWindow),
 				scope: config.autoCompactScope,
-				fallbackBufferTokens: config.fallbackBufferTokens,
 			});
 		},
 	});
@@ -117,17 +113,12 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		coordinator.clear();
 	});
-	pi.on("model_select", (event, ctx) => {
-		if (loadConfig(ctx.cwd, ctx.isProjectTrusted()).tokenBudget) coordinator.clear();
-		else return coordinator.selectModel(event, ctx);
-	});
-
+	pi.on("model_select", (event, ctx) => coordinator.selectModel(event, ctx));
 
 	pi.on("context", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
-		if (loadConfig(ctx.cwd, ctx.isProjectTrusted()).tokenBudget) return undefined;
 		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
-		if (checkpoint.status !== "valid" || checkpoint.checkpoint.details.strategy === "token-budget") return undefined;
+		if (checkpoint.status !== "valid") return undefined;
 		return {
 			messages: event.messages.filter((message) => message.role !== "compactionSummary"),
 		};
@@ -144,10 +135,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
-		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
-		if (config.tokenBudget) return undefined;
 		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
-		if (checkpoint.status === "valid" && checkpoint.checkpoint.details.strategy === "token-budget") return undefined;
 		try {
 			const transitionFailure = coordinator.transitionFailure(sessionId, model);
 			if (transitionFailure) throw new Error(transitionFailure);
@@ -180,22 +168,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		if (!model) return undefined;
 		const capability = compactionCapability(model, loadConfig(ctx.cwd, ctx.isProjectTrusted()));
 		if (capability === "local") return undefined;
-		if (capability === "token-budget") {
-			return {
-				compaction: {
-					summary: LOCAL_MARKER,
-					firstKeptEntryId: event.preparation.firstKeptEntryId,
-					tokensBefore: event.preparation.tokensBefore,
-					details: {
-						kind: NATIVE_COMPACTION_KIND,
-						version: NATIVE_COMPACTION_VERSION,
-						strategy: "token-budget",
-						modelKey: modelKey(model),
-						replacementHistory: [],
-					},
-				},
-			};
-		}
 		if (!isOpenAICodexModel(model)) return undefined;
 
 		try {

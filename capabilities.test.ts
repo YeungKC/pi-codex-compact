@@ -5,20 +5,15 @@ const model = (provider: string) => ({ provider }) as never;
 
 describe("Codex compaction capability routing", () => {
 	test("routes the built-in OpenAI provider to V2 by default", () => {
-		expect(compactionCapability(model("openai-codex"), { remoteCompactionV2: true, tokenBudget: false })).toBe("v2");
+		expect(compactionCapability(model("openai-codex"), { remoteCompactionV2: true, autoCompactScope: "total" })).toBe("v2");
 	});
 
 	test("uses V1 when the V2 feature is disabled", () => {
-		expect(compactionCapability(model("openai-codex"), { remoteCompactionV2: false, tokenBudget: false })).toBe("v1");
-	});
-
-	test("gives token budget precedence", () => {
-		expect(compactionCapability(model("openai-codex"), { remoteCompactionV2: true, tokenBudget: true })).toBe("token-budget");
+		expect(compactionCapability(model("openai-codex"), { remoteCompactionV2: false, autoCompactScope: "total" })).toBe("v1");
 	});
 
 	test("routes other providers to local compaction", () => {
-		expect(compactionCapability(model("anthropic"), { remoteCompactionV2: true, tokenBudget: false })).toBe("local");
-		expect(compactionCapability(model("anthropic"), { remoteCompactionV2: true, tokenBudget: true })).toBe("local");
+		expect(compactionCapability(model("anthropic"), { remoteCompactionV2: true, autoCompactScope: "total" })).toBe("local");
 	});
 
 	test("uses Codex static compaction hashes and leaves unknown models unset", () => {

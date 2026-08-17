@@ -376,7 +376,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		if (
 			pending
 			&& checkpoint.status === "valid"
-			&& checkpoint.checkpoint.details.strategy !== "token-budget"
 			&& checkpoint.checkpoint.details.modelKey === modelKey(model)
 		) {
 			pendingBySession.delete(sessionId);
@@ -475,7 +474,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 
 		await recoverCurrentModel(model, ctx, basePayload, requestInput);
 		const recoveredCheckpoint = findNativeCheckpoint(deps.getBranch(ctx));
-		if (recoveredCheckpoint.status === "valid" && recoveredCheckpoint.checkpoint.details.strategy !== "token-budget") {
+		if (recoveredCheckpoint.status === "valid") {
 			const checkpointDetails = recoveredCheckpoint.checkpoint.details;
 			if (checkpointDetails.modelKey !== modelKey(model)) {
 				const checkpointModel = resolveModel(ctx, checkpointDetails.modelKey);

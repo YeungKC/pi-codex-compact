@@ -43,20 +43,16 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`, or in a t
 ```json
 {
   "remoteCompactionV2": false,
-  "tokenBudget": false,
   "autoCompactTokenLimit": 128000,
-  "autoCompactScope": "total",
-  "fallbackBufferTokens": 0
+  "autoCompactScope": "total"
 }
 ```
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `remoteCompactionV2` | `true` | Use Codex V2; set `false` only for the legacy V1 endpoint. |
-| `tokenBudget` | `false` | Use Pi's nearest token-budget compaction boundary. Pi cannot create Codex's true fresh token window. |
 | `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold. |
 | `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` excludes a reliable prefix baseline when Pi exposes one. |
-| `fallbackBufferTokens` | `0` | Add estimated tokens to the automatic-compaction threshold. |
 
 The extension does not probe endpoints at runtime.
 
@@ -76,13 +72,12 @@ Unsupported providers keep Pi's normal local text summarization.
 
 ## Compatibility limits
 
-Codex CLI internally owns exact `comp_hash` capability metadata, token accounting, mid-turn continuation, and fresh token-budget windows. Pi does not expose those seams to extensions.
+Codex CLI internally owns exact `comp_hash` capability metadata, token accounting, and mid-turn continuation. Pi does not expose those seams to extensions.
 
 The extension therefore:
 
 - fails closed when the persisted and selected models lack comparable compaction hashes;
 - estimates history, stable system/tool prefix, images, and tool output for automatic compaction;
-- uses Pi's closest token-budget boundary rather than inventing a local text summary; and
 - treats the actual pre-provider request as authoritative when a fork has changed Pi's inherited history.
 
 These are deliberate compatibility adaptations, not server probing or local-summary fallbacks.
