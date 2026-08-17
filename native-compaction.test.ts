@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, approximateResponseItemTokens, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, approximateResponseItemTokens, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
 	test("preserves eligible response.failed details for model fallback", async () => {
@@ -17,6 +17,80 @@ describe("Codex compaction history", () => {
 		})).rejects.toThrow("context_length_exceeded");
 		expect(calls).toBe(1);
 	});
+	test("allows a missing-model HTTP 404 to fall back", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response(JSON.stringify({ error: { code: "model_not_found" } }), { status: 404 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+	});
+
+	test("keeps response.failed without a message out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\"}}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("keeps policy response.failed errors out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\",\"message\":\"policy violation\"}}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("counts function-call metadata in approximate token accounting", () => {
+		const tokens = approximateResponseItemTokens([{ type: "function_call", name: "a-very-long-tool-name", call_id: "call-123456789", arguments: "{}" } as never]);
+		expect(tokens).toBeGreaterThan(1);
+	});
+
+	test("does not retry a legacy missing-model HTTP 404", async () => {
+		let calls = 0;
+		let failure: unknown;
+		try {
+			await callLegacyRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response(JSON.stringify({ error: { code: "model_not_found" } }), { status: 404 });
+				},
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(calls).toBe(1);
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+	});
+
 	test("keeps generic HTTP 403 out of model fallback", async () => {
 		let failure: unknown;
 		try {

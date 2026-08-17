@@ -52,7 +52,7 @@ function shouldRetryWithCurrentModel(error: unknown): boolean {
 		return (error as { retryWithCurrentModel?: unknown }).retryWithCurrentModel === true;
 	}
 	const message = error instanceof Error ? error.message : String(error);
-	if (/(?:abort|cancel|auth|token|account|malformed|invalid compaction|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key)/i.test(message)) return false;
+	if (/(?:abort|cancel|auth|account|malformed|invalid compaction|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|safety policy|policy violation|unauthorized|forbidden|permission|api key|(?:invalid|expired|bearer|refresh)[ _-]?token)/i.test(message)) return false;
 	return /(?:\b(?:400|403|408|409|429|5\d\d)\b|invalid request|unexpected status|context window|context_length_exceeded|invalid_prompt|usage limit|server overloaded|internal server|retry limit)/i.test(message);
 }
 
@@ -64,6 +64,14 @@ function textContent(value: unknown): string {
 	if (typeof value === "string") return value;
 	if (Array.isArray(value)) return value.map(textContent).join("");
 	if (!isRecord(value)) return "";
+	if (value.type === "image") {
+		return `[image:${typeof value.mimeType === "string" ? value.mimeType : ""}:${typeof value.data === "string" ? value.data : ""}]`;
+	}
+	if (value.type === "input_image" || value.type === "image_url") {
+		const url = typeof value.image_url === "string" ? value.image_url : "";
+		const match = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+		return match ? `[image:${match[1]}:${match[2]}]` : `[image-url:${url}]`;
+	}
 	if (typeof value.text === "string") return value.text;
 	return Object.values(value).map(textContent).join("");
 }
@@ -292,12 +300,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		ctx: ExtensionContext,
 		requestInput: ResponseItem[] | undefined,
 		basePayload?: JsonObject,
+		skipAutomaticCompaction = false,
 	): Promise<ResponseItem[] | undefined> => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const activeTransition = transitionBySession.get(sessionId);
 		if (activeTransition) {
 			await activeTransition;
-			return prepareRequest(model, ctx, requestInput, basePayload);
+			return prepareRequest(model, ctx, requestInput, basePayload, false);
 		}
 		const branchBefore = deps.getBranch(ctx);
 		let pending = pendingBySession.get(sessionId);
@@ -352,6 +361,11 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			throw error;
 		}
 
+		const activeAutomaticCompaction = automaticCompactionBySession.get(sessionId);
+		if (activeAutomaticCompaction) {
+			await activeAutomaticCompaction;
+			return prepareRequest(model, ctx, requestInput, basePayload, true);
+		}
 		if (pending && pending.targetModelKey === modelKey(model)) {
 			const startGeneration = generation;
 			const transition = runTransition(sessionId, ctx, pending.previousModel, pending.targetModelKey, model, basePayload, startGeneration, requestInput);
@@ -366,6 +380,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			} finally {
 				if (transitionBySession.get(sessionId) === transition) transitionBySession.delete(sessionId);
 			}
+			skipAutomaticCompaction = false;
 		}
 
 		await recoverCurrentModel(model, ctx, basePayload, requestInput);
@@ -383,10 +398,15 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		}
 		let branch = deps.getBranch(ctx);
 		{
+			const activeTransition = transitionBySession.get(sessionId);
+			if (activeTransition) {
+				await activeTransition;
+				return prepareRequest(model, ctx, requestInput, basePayload, false);
+			}
 			const activeAutomaticCompaction = automaticCompactionBySession.get(sessionId);
 			if (activeAutomaticCompaction) {
 				await activeAutomaticCompaction;
-			} else {
+			} else if (!skipAutomaticCompaction) {
 				const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
 				const currentHistory = effectiveInputForBranch({
 					branch: compactionBranch,

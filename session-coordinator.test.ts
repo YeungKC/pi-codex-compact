@@ -385,6 +385,28 @@ describe("Codex session coordinator", () => {
 		expect(input?.at(-1)).toEqual(userInput("new"));
 	});
 
+	test("matches persisted image users across Pi and provider shapes", async () => {
+		const currentUser = {
+			id: "current-image",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "image", data: "bytes", mimeType: "image/png" }] },
+		} as unknown as SessionEntry;
+		let compactInput: ResponseItem[] | undefined;
+		const coordinator = createCoordinator([currentUser], async (_model, _payload, input) => {
+			compactInput = input;
+			return details("openai-codex:openai-codex-responses:old");
+		});
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const imageUser = { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,bytes" }] };
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		const input = await coordinator.prepareRequest(newModel, context(), [imageUser]);
+		expect(compactInput).toEqual([]);
+		expect(input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, imageUser]);
+	});
+
 	test("does not repeat a transition already satisfied by Pi compaction", async () => {
 		const oldModel = model("openai-codex", "old", "hash-a");
 		const newModel = model("openai-codex", "new", "hash-b");
@@ -402,13 +424,19 @@ describe("Codex session coordinator", () => {
 	test("coalesces concurrent automatic compaction", async () => {
 		let calls = 0;
 		let release!: () => void;
+		let started!: () => void;
+		const compactionStarted = new Promise<void>((resolve) => { started = resolve; });
 		const coordinator = createCoordinator([], async (selectedModel) => {
 			calls++;
-			await new Promise<void>((resolve) => { release = resolve; });
+			await new Promise<void>((resolve) => {
+				release = resolve;
+				started();
+			});
 			return details(modelKey(selectedModel));
 		}, undefined, () => true);
 		const currentModel = model("openai-codex", "current");
 		const first = coordinator.prepareRequest(currentModel, context(), [userInput("one")]);
+		await compactionStarted;
 		await Promise.resolve();
 		const second = coordinator.prepareRequest(currentModel, context(), [userInput("two")]);
 		await Promise.resolve();

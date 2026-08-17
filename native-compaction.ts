@@ -495,7 +495,7 @@ function imagePartCount(value: unknown): number {
 function approximateTokens(item: ResponseItem): number {
 	const imageTokens = imagePartCount(item) * 1_200;
 	if (imageTokens > 0) return imageTokens + Math.max(0, Math.ceil(responseItemText(item).length / 4));
-	if (typeof item.type === "string" && item.type.includes("tool") && item.type !== "function_call_output") {
+	if (item.type === "function_call" || (typeof item.type === "string" && item.type.includes("tool") && item.type !== "function_call_output")) {
 		return Math.max(1, Math.ceil(JSON.stringify(item).length / 4));
 	}
 	return Math.max(1, Math.ceil(responseItemText(item).length / 4));
@@ -799,9 +799,10 @@ function isRetryableStatus(status: number): boolean {
 }
 
 function canFallbackForStatus(status: number, body: string): boolean {
-	if (![400, 403, 408, 409, 429].includes(status) && status < 500) return false;
+	if (![400, 403, 404, 408, 409, 429].includes(status) && status < 500) return false;
 	if (status === 403 && !/(?:model|invalid request|not found|overloaded)/i.test(body)) return false;
-	return !/(?:malformed|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key|authentication|invalid[_ ]token|cancel(?:led|lation)?|aborted)/i.test(body);
+	if (status === 404 && !/(?:model|invalid request|overloaded)/i.test(body)) return false;
+	return !/(?:malformed|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key|authentication|(?:invalid|expired|bearer|refresh)[ _-]?token|cancel(?:led|lation)?|aborted)/i.test(body);
 }
 
 function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
@@ -863,8 +864,11 @@ async function parseSseResponse(response: Response): Promise<{ item: ResponseIte
 			const response = isJsonObject(event.response) ? event.response : {};
 			const failure = isJsonObject(response.error) ? response.error : {};
 			const code = typeof failure.code === "string" ? failure.code : "response.failed";
-			const message = typeof failure.message === "string" ? failure.message : "OpenAI Codex compaction ended with response.failed.";
-			const eligible = code === "context_length_exceeded" || code === "invalid_prompt";
+			const rawMessage = typeof failure.message === "string" ? failure.message : undefined;
+			const message = rawMessage ?? "OpenAI Codex compaction ended with response.failed.";
+			const eligible = rawMessage !== undefined && rawMessage.trim().length > 0
+				&& (code === "context_length_exceeded" || code === "invalid_prompt")
+				&& !/(?:malformed|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|safety policy|policy violation|unauthorized|forbidden|permission|api key|authentication|(?:invalid|expired|bearer|refresh)[ _-]?token|cancel(?:led|lation)?|aborted)/i.test(message);
 			throw markFallbackEligibility(new NonRetryableCompactionError(`OpenAI Codex compaction failed (${code}): ${message}`), eligible);
 		}
 		if (event.type === "response.incomplete") {
@@ -1022,7 +1026,13 @@ export async function callLegacyRemoteCompaction(params: {
 			});
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
-				const error = markFallbackEligibility(new Error(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`), canFallbackForStatus(response.status, body));
+				const eligible = canFallbackForStatus(response.status, body);
+				const error = markFallbackEligibility(
+					isRetryableStatus(response.status)
+						? new Error(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`)
+						: new NonRetryableCompactionError(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`),
+					eligible,
+				);
 				if (!isRetryableStatus(response.status) || attempt === MAX_REMOTE_RETRIES) throw error;
 				lastError = error;
 				await delay(1000 * 2 ** attempt, params.signal);
@@ -1030,7 +1040,7 @@ export async function callLegacyRemoteCompaction(params: {
 			}
 			const parsed = await response.json() as JsonObject;
 			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {
-				throw new Error("OpenAI Codex legacy compaction returned invalid output.");
+				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid output.");
 			}
 			return {
 				strategy: "v1",
@@ -1038,7 +1048,7 @@ export async function callLegacyRemoteCompaction(params: {
 				usage: usageFromResponse(params.model, parsed.usage),
 			};
 		} catch (error) {
-			if (params.signal?.aborted || attempt === MAX_REMOTE_RETRIES) throw error;
+			if (params.signal?.aborted || error instanceof NonRetryableCompactionError || attempt === MAX_REMOTE_RETRIES) throw error;
 			lastError = error;
 			await delay(1000 * 2 ** attempt, params.signal);
 		}
