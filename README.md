@@ -96,10 +96,6 @@ pi uninstall npm:@yeungkc/pi-codex-compact
 
 Removing the package does not delete existing Pi session JSONL files or their native checkpoints. Remove `~/.pi/agent/pi-codex-compact.json` separately if it is no longer wanted.
 
-## Releases
-
-Changing `package.json`'s version on `main` runs the test suite, publishes the package to npm with provenance, mirrors it to GitHub Packages, and creates a GitHub Release tagged `v<version>`. Existing registry versions and releases are skipped on rerun. An existing tag without a release fails closed rather than attaching a release to an unknown commit.
-
 ## Development
 
 ```bash
