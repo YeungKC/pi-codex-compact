@@ -436,11 +436,11 @@ describe("Codex compaction history", () => {
 		})?.strategy).toBe("v2");
 	});
 
-	test("rejects an unknown persisted strategy", () => {
+	test("rejects the removed token-budget strategy", () => {
 		expect(parseNativeCompactionDetails({
 			kind: "openai-codex-native-compaction",
 			version: 1,
-			strategy: "future",
+			strategy: "token-budget",
 			modelKey: "openai-codex:openai-codex-responses:test",
 			replacementHistory: [],
 		})).toBeUndefined();

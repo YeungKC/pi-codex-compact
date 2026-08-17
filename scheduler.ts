@@ -10,13 +10,12 @@ export function shouldAutoCompact(params: {
 	status: TokenStatus;
 	limit?: number;
 	scope: AutoCompactScope;
-	fallbackBufferTokens: number;
 }): boolean {
-	const { status, limit, scope, fallbackBufferTokens } = params;
+	const { status, limit, scope } = params;
 	if (status.activeContextTokens === null) return false;
 	const scoped = scope === "bodyAfterPrefix" && status.prefillTokens !== undefined
 		? Math.max(0, status.activeContextTokens - status.prefillTokens)
 		: status.activeContextTokens;
-	const configuredLimit = limit === undefined ? Math.floor(status.contextWindow * 0.9) + fallbackBufferTokens : limit + fallbackBufferTokens;
+	const configuredLimit = limit ?? Math.floor(status.contextWindow * 0.9);
 	return scoped >= configuredLimit || status.activeContextTokens >= status.contextWindow;
 }

@@ -28,7 +28,7 @@ export type ResponseItem = JsonObject & { type?: string };
 export interface NativeCompactionDetails {
 	kind: typeof NATIVE_COMPACTION_KIND;
 	version: typeof NATIVE_COMPACTION_VERSION;
-	strategy: "v1" | "v2" | "token-budget";
+	strategy: "v1" | "v2";
 	modelKey: string;
 	compHash?: string;
 	preservedInput?: ResponseItem[];
@@ -94,17 +94,11 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	if (value.preservedInput !== undefined && (preservedInput === undefined || preservedInput.length !== value.preservedInput.length)) return undefined;
 	const strategy = value.strategy === undefined
 		? "v2"
-		: value.strategy === "v1"
-			? "v1"
-			: value.strategy === "token-budget"
-				? "token-budget"
-				: value.strategy === "v2"
-					? "v2"
-					: undefined;
+		: value.strategy === "v1" || value.strategy === "v2"
+			? value.strategy
+			: undefined;
 	if (!strategy) return undefined;
-	if (strategy === "token-budget") {
-		if (replacementHistory.length !== 0) return undefined;
-	} else if (strategy === "v2") {
+	if (strategy === "v2") {
 		const compactionItems = replacementHistory.filter((item) => item.type === "compaction");
 		if (
 			compactionItems.length !== 1 ||
@@ -385,7 +379,7 @@ export function piContextInputForBranch(params: {
 	tools: ToolInfo[];
 }): ResponseItem[] {
 	const checkpoint = findNativeCheckpoint(params.branch);
-	const remoteCheckpoint = checkpoint.status === "valid" && checkpoint.checkpoint.details.strategy !== "token-budget";
+	const remoteCheckpoint = checkpoint.status === "valid";
 	const boundaryEnd = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : params.branch.length;
 	let firstKeptEntryId: string | undefined;
 	let compactionIndex = -1;

@@ -1,7 +1,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { CodexCompactionConfig } from "./config.ts";
 
-export type CodexCompactionCapability = "v2" | "v1" | "local" | "token-budget";
+export type CodexCompactionCapability = "v2" | "v1" | "local";
 
 const CODEX_COMPACTION_HASHES: Record<string, string> = {
 	"gpt-5.6-sol": "3000",
@@ -25,6 +25,5 @@ export function compactionCapability(
 	config: CodexCompactionConfig,
 ): CodexCompactionCapability {
 	if (model.provider !== "openai-codex") return "local";
-	if (config.tokenBudget) return "token-budget";
 	return config.remoteCompactionV2 ? "v2" : "v1";
 }

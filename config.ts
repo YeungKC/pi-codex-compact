@@ -6,19 +6,14 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 export type CodexCompactionConfig = {
 	/** Mirrors Codex's remote_compaction_v2 feature gate. */
 	remoteCompactionV2: boolean;
-	/** Mirrors Codex's token_budget feature gate. */
-	tokenBudget: boolean;
 	/** Optional Codex-style auto-compaction limit. */
 	autoCompactTokenLimit?: number;
 	autoCompactScope: "total" | "bodyAfterPrefix";
-	fallbackBufferTokens: number;
 };
 
 const DEFAULT_CONFIG: CodexCompactionConfig = {
 	remoteCompactionV2: true,
-	tokenBudget: false,
 	autoCompactScope: "total",
-	fallbackBufferTokens: 0,
 };
 
 function readConfig(path: string): Partial<CodexCompactionConfig> {
@@ -27,15 +22,11 @@ function readConfig(path: string): Partial<CodexCompactionConfig> {
 		const value = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 		return {
 			...(typeof value.remoteCompactionV2 === "boolean" ? { remoteCompactionV2: value.remoteCompactionV2 } : {}),
-			...(typeof value.tokenBudget === "boolean" ? { tokenBudget: value.tokenBudget } : {}),
 			...(typeof value.autoCompactTokenLimit === "number" && value.autoCompactTokenLimit > 0
 				? { autoCompactTokenLimit: value.autoCompactTokenLimit }
 				: {}),
 			...(value.autoCompactScope === "total" || value.autoCompactScope === "bodyAfterPrefix"
 				? { autoCompactScope: value.autoCompactScope }
-				: {}),
-			...(typeof value.fallbackBufferTokens === "number" && value.fallbackBufferTokens >= 0
-				? { fallbackBufferTokens: value.fallbackBufferTokens }
 				: {}),
 		};
 	} catch {

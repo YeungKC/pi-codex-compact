@@ -24,11 +24,8 @@ Codex server-side compaction requested through the Responses API with a `compact
 **Compaction capability**:
 The local Codex-compatible routing value `Unsupported`, `V1`, or `V2` that selects the compression implementation without probing the server.
 
-**Token-budget reset**:
-A compaction path that starts a fresh context while retaining canonical context, rather than asking a model to summarize old history.
-
 **Remote-only scope**:
-This extension targets Codex remote compaction paths; local text summarization is intentionally delegated to Pi and is not part of the parity target.
+This extension targets Codex remote compaction paths; local text summarization and Codex token-budget fresh-context resets are intentionally delegated to Pi or Codex core and are not part of the parity target.
 
 **Model-transition boundary**:
 Pi exposes the selected and previous models, and its `before_provider_request` hook is awaited before the provider request. The extension records a pending Codex-to-Codex transition at selection time, then calls remote compaction with the previous model at the first request and persists a custom native checkpoint whose continuation model is the newly selected model. The current request's new input is appended after that checkpoint. The transition is fail-closed until the checkpoint is ready. The previous model is tried first; for eligible model/request failures, the current model is used as Codex's fallback, while authentication, policy, cancellation, malformed, and unknown protocol failures remain fail-closed. Pi's custom entry is not promised to be identical to a built-in CompactionEntry. The current request's non-input payload fields are reused for the checkpoint request.
