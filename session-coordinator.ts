@@ -60,6 +60,24 @@ function conversationLeafId(branch: SessionEntry[]): string | undefined {
 	return [...branch].reverse().find((entry) => entry.type !== "custom")?.id;
 }
 
+function textContent(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (Array.isArray(value)) return value.map(textContent).join("");
+	if (!isRecord(value)) return "";
+	if (typeof value.text === "string") return value.text;
+	return Object.values(value).map(textContent).join("");
+}
+
+function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): SessionEntry[] {
+	const requestUser = requestInput?.findLast((item) => item.role === "user");
+	const currentUserIndex = branch.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user");
+	const currentUser = currentUserIndex >= 0 ? branch[currentUserIndex] : undefined;
+	if (!requestUser || !currentUser || currentUser.type !== "message") return branch;
+	return textContent(currentUser.message.content) === textContent(requestUser.content)
+		? branch.slice(0, currentUserIndex)
+		: branch;
+}
+
 function sameItem(left: ResponseItem, right: ResponseItem): boolean {
 	return sameValue(left, right);
 }
@@ -126,12 +144,14 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		currentModel: Model<any>,
 		basePayload: JsonObject | undefined,
 		startGeneration: number,
+		requestInput: ResponseItem[] | undefined,
 	): Promise<void> => {
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const branch = deps.getBranch(ctx);
 			const leafId = conversationLeafId(branch);
+			const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
 			const input = effectiveInputForBranch({
-				branch,
+				branch: compactionBranch,
 				model: previousModel,
 				tools: deps.getAllTools(),
 				allowCheckpointModelMismatch: true,
@@ -155,7 +175,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						ctx,
 						model: currentModel,
 						input: effectiveInputForBranch({
-							branch,
+							branch: compactionBranch,
 							model: currentModel,
 							tools: deps.getAllTools(),
 							allowCheckpointModelMismatch: true,
@@ -195,7 +215,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		if (previousHash === undefined || currentHash === undefined || previousHash === currentHash) return;
 		const startGeneration = generation;
 		const transition = previousModel
-			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration)
+			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration, undefined)
 			: (async () => {
 					const branch = deps.getBranch(ctx);
 					const leafId = conversationLeafId(branch);
@@ -278,8 +298,17 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			return prepareRequest(model, ctx, requestInput, basePayload);
 		}
 		const branchBefore = deps.getBranch(ctx);
-		const pending = pendingBySession.get(sessionId);
+		let pending = pendingBySession.get(sessionId);
 		const checkpoint = findNativeCheckpoint(branchBefore);
+		if (
+			pending
+			&& checkpoint.status === "valid"
+			&& checkpoint.checkpoint.details.strategy !== "token-budget"
+			&& checkpoint.checkpoint.details.modelKey === modelKey(model)
+		) {
+			pendingBySession.delete(sessionId);
+			pending = undefined;
+		}
 		const checkpointModelKey = checkpoint.status === "valid" ? checkpoint.checkpoint.details.modelKey : undefined;
 		if (pending && pending.targetModelKey !== modelKey(model)) {
 			throw new Error("The pending Codex model transition targets a different model.");
@@ -291,22 +320,23 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			?? (checkpointModelKey && checkpointModelKey !== modelKey(model) ? resolveModel(ctx, checkpointModelKey) : undefined)
 			?? model;
 		const tools = deps.getAllTools();
+		const historyBranch = branchBeforeCurrentUser(branchBefore, requestInput);
 		const historyInput = effectiveInputForBranch({
-			branch: branchBefore,
+			branch: historyBranch,
 			model: historyModel,
 			tools,
 			allowCheckpointModelMismatch: true,
 		});
-		const rawHistoryInput = fullInputForBranch({ branch: branchBefore, model: historyModel, tools });
-		const piContextInput = piContextInputForBranch({ branch: branchBefore, model: historyModel, tools });
+		const rawHistoryInput = fullInputForBranch({ branch: historyBranch, model: historyModel, tools });
+		const piContextInput = piContextInputForBranch({ branch: historyBranch, model: historyModel, tools });
 		const currentHistoryInput = effectiveInputForBranch({
-			branch: branchBefore,
+			branch: historyBranch,
 			model,
 			tools,
 			allowCheckpointModelMismatch: true,
 		});
-		const currentRawHistoryInput = fullInputForBranch({ branch: branchBefore, model, tools });
-		const currentPiContextInput = piContextInputForBranch({ branch: branchBefore, model, tools });
+		const currentRawHistoryInput = fullInputForBranch({ branch: historyBranch, model, tools });
+		const currentPiContextInput = piContextInputForBranch({ branch: historyBranch, model, tools });
 		const systemPromptInput = systemPromptInputForModel(model, ctx.getSystemPrompt());
 		let tail: ResponseItem[];
 		try {
@@ -322,7 +352,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 
 		if (pending && pending.targetModelKey === modelKey(model)) {
 			const startGeneration = generation;
-			const transition = runTransition(sessionId, ctx, pending.previousModel, pending.targetModelKey, model, basePayload, startGeneration);
+			const transition = runTransition(sessionId, ctx, pending.previousModel, pending.targetModelKey, model, basePayload, startGeneration, requestInput);
 			transitionBySession.set(sessionId, transition);
 			try {
 				await transition;
@@ -339,8 +369,9 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		await recoverCurrentModel(model, ctx, basePayload);
 		let branch = deps.getBranch(ctx);
 		{
+			const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
 			const currentHistory = effectiveInputForBranch({
-				branch,
+				branch: compactionBranch,
 				model,
 				tools: deps.getAllTools(),
 				allowCheckpointModelMismatch: true,

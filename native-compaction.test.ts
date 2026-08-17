@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, parseNativeCompactionDetails, approximateResponseItemTokens, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, approximateResponseItemTokens, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
 	test("preserves eligible response.failed details for model fallback", async () => {
@@ -47,6 +47,46 @@ describe("Codex compaction history", () => {
 			failure = error;
 		}
 		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("uses the preceding real compaction boundary after a custom checkpoint", () => {
+		const branch = [
+			{ id: "old", type: "message", message: { role: "user", content: "old" } },
+			{ id: "kept", type: "message", message: { role: "user", content: "kept" } },
+			{ id: "real-compaction", type: "compaction", firstKeptEntryId: "kept", summary: "summary", details: {} },
+			{ id: "custom", type: "custom", customType: NATIVE_COMPACTION_KIND, data: {
+				kind: NATIVE_COMPACTION_KIND,
+				version: NATIVE_COMPACTION_VERSION,
+				strategy: "v2",
+				modelKey: "openai-codex:openai-codex-responses:gpt",
+				replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			} },
+			{ id: "tail", type: "message", message: { role: "user", content: "tail" } },
+		] as never;
+		const result = piContextInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", reasoning: true } as never,
+			tools: [],
+		});
+		expect(JSON.stringify(result)).toContain("kept");
+		expect(JSON.stringify(result)).toContain("tail");
+		expect(JSON.stringify(result)).not.toContain("old");
+	});
+
+	test("keeps Pi's compaction summary before retained entries", () => {
+		const branch = [
+			{ id: "old", type: "message", message: { role: "user", content: "old" } },
+			{ id: "kept", type: "message", message: { role: "user", content: "kept" } },
+			{ id: "real-compaction", type: "compaction", firstKeptEntryId: "kept", summary: "summary", details: {} },
+			{ id: "tail", type: "message", message: { role: "user", content: "tail" } },
+		] as never;
+		const result = piContextInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", reasoning: true } as never,
+			tools: [],
+		});
+		const encoded = JSON.stringify(result);
+		expect(encoded.indexOf("summary")).toBeLessThan(encoded.indexOf("kept"));
 	});
 
 	test("matches Pi message indexes across empty user entries", () => {

@@ -24,7 +24,7 @@ export function compactionCapability(
 	model: Model<any>,
 	config: CodexCompactionConfig,
 ): CodexCompactionCapability {
-	if (config.tokenBudget) return "token-budget";
 	if (model.provider !== "openai-codex") return "local";
+	if (config.tokenBudget) return "token-budget";
 	return config.remoteCompactionV2 ? "v2" : "v1";
 }

@@ -364,6 +364,41 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, userInput("hello")]);
 	});
 
+	test("excludes the persisted current user from transition compaction input", async () => {
+		const currentUser = {
+			id: "current-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "new" }] },
+		} as unknown as SessionEntry;
+		let compactInput: ResponseItem[] | undefined;
+		const coordinator = createCoordinator([currentUser], async (_selectedModel, _basePayload, input) => {
+			compactInput = input;
+			return details("openai-codex:openai-codex-responses:old");
+		});
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		const input = await coordinator.prepareRequest(newModel, context(), [userInput("new")]);
+		expect(compactInput).toEqual([]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("does not repeat a transition already satisfied by Pi compaction", async () => {
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const branch = [nativeCompactionEntry(details(modelKey(newModel)), "current")];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await coordinator.prepareRequest(newModel, context(), [...details(modelKey(newModel)).replacementHistory, userInput("new")]);
+		expect(calls).toBe(0);
+	});
+
 	test("checks the automatic limit again after transition compaction", async () => {
 		const compactedWith: string[] = [];
 		const oldModel = model("openai-codex", "old", "hash-a");

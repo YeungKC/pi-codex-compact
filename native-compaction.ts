@@ -343,8 +343,10 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 	return items;
 }
 
-function entriesToResponseItems(model: Model<any>, entries: SessionEntry[], tools: ToolInfo[]): ResponseItem[] {
-	const messages = entries.flatMap((entry) => sessionEntryToContextMessages(entry));
+function entriesToResponseItems(model: Model<any>, entries: SessionEntry[], tools: ToolInfo[], includeCompactionSummary = false): ResponseItem[] {
+	const messages = entries
+		.filter((entry) => includeCompactionSummary || entry.type !== "compaction")
+		.flatMap((entry) => sessionEntryToContextMessages(entry));
 	return messagesToResponseItems(model, convertToLlm(messages), tools);
 }
 
@@ -373,19 +375,36 @@ export function piContextInputForBranch(params: {
 	tools: ToolInfo[];
 }): ResponseItem[] {
 	const checkpoint = findNativeCheckpoint(params.branch);
-	if (checkpoint.status !== "valid") return fullInputForBranch(params);
-	const entry = params.branch[checkpoint.checkpoint.entryIndex];
-	const firstKeptEntryId = entry?.type === "compaction" && typeof entry.firstKeptEntryId === "string"
-		? entry.firstKeptEntryId
-		: undefined;
+	const remoteCheckpoint = checkpoint.status === "valid" && checkpoint.checkpoint.details.strategy !== "token-budget";
+	const boundaryEnd = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : params.branch.length;
+	let firstKeptEntryId: string | undefined;
+	let compactionIndex = -1;
+	for (let index = boundaryEnd - 1; index >= 0; index--) {
+		const candidate = params.branch[index];
+		if (candidate?.type === "compaction" && typeof candidate.firstKeptEntryId === "string") {
+			firstKeptEntryId = candidate.firstKeptEntryId;
+			compactionIndex = index;
+			break;
+		}
+	}
+	if (checkpoint.status === "valid") {
+		const entry = params.branch[checkpoint.checkpoint.entryIndex];
+		if (entry?.type === "compaction" && typeof entry.firstKeptEntryId === "string") {
+			firstKeptEntryId = entry.firstKeptEntryId;
+			compactionIndex = checkpoint.checkpoint.entryIndex;
+		}
+	}
 	if (!firstKeptEntryId) return fullInputForBranch(params);
 	const firstKeptIndex = params.branch.findIndex((candidate) => candidate.id === firstKeptEntryId);
 	if (firstKeptIndex < 0) return fullInputForBranch(params);
-	return entriesToResponseItems(
-		params.model,
-		params.branch.slice(firstKeptIndex).filter((candidate) => candidate.type !== "compaction"),
-		params.tools,
-	);
+	const contextEntries = remoteCheckpoint || compactionIndex < 0
+		? params.branch.slice(firstKeptIndex)
+		: [
+			params.branch[compactionIndex]!,
+			...params.branch.slice(firstKeptIndex, compactionIndex),
+			...params.branch.slice(compactionIndex + 1),
+		];
+	return entriesToResponseItems(params.model, contextEntries, params.tools, !remoteCheckpoint);
 }
 
 export function effectiveInputForBranch(params: {
@@ -423,7 +442,7 @@ export function effectiveInputForBranch(params: {
 		];
 	}
 
-	return fullInputForBranch({ branch, model: params.model, tools: params.tools });
+	return piContextInputForBranch({ branch, model: params.model, tools: params.tools });
 }
 
 function contentText(content: unknown): string {

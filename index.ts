@@ -124,8 +124,10 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
 
 	pi.on("context", (event, ctx) => {
+		if (!isOpenAICodexModel(ctx.model)) return undefined;
+		if (loadConfig(ctx.cwd, ctx.isProjectTrusted()).tokenBudget) return undefined;
 		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
-		if (checkpoint.status === "none") return undefined;
+		if (checkpoint.status !== "valid" || checkpoint.checkpoint.details.strategy === "token-budget") return undefined;
 		return {
 			messages: event.messages.filter((message) => message.role !== "compactionSummary"),
 		};
@@ -142,7 +144,10 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
-		if (loadConfig(ctx.cwd, ctx.isProjectTrusted()).tokenBudget) return undefined;
+		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+		if (config.tokenBudget) return undefined;
+		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
+		if (checkpoint.status === "valid" && checkpoint.checkpoint.details.strategy === "token-budget") return undefined;
 		try {
 			const transitionFailure = coordinator.transitionFailure(sessionId, model);
 			if (transitionFailure) throw new Error(transitionFailure);
@@ -176,13 +181,10 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		const capability = compactionCapability(model, loadConfig(ctx.cwd, ctx.isProjectTrusted()));
 		if (capability === "local") return undefined;
 		if (capability === "token-budget") {
-			const lastEntryId = (event.branchEntries as SessionEntry[]).at(-1)?.id;
 			return {
 				compaction: {
 					summary: LOCAL_MARKER,
-					firstKeptEntryId: event.willRetry
-						? event.preparation.firstKeptEntryId
-						: (lastEntryId ?? event.preparation.firstKeptEntryId),
+					firstKeptEntryId: event.preparation.firstKeptEntryId,
 					tokensBefore: event.preparation.tokensBefore,
 					details: {
 						kind: NATIVE_COMPACTION_KIND,

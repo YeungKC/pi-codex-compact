@@ -18,6 +18,7 @@ describe("Codex compaction capability routing", () => {
 
 	test("routes other providers to local compaction", () => {
 		expect(compactionCapability(model("anthropic"), { remoteCompactionV2: true, tokenBudget: false })).toBe("local");
+		expect(compactionCapability(model("anthropic"), { remoteCompactionV2: true, tokenBudget: true })).toBe("local");
 	});
 
 	test("uses Codex static compaction hashes and leaves unknown models unset", () => {
