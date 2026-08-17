@@ -439,12 +439,23 @@ function contentText(content: unknown): string {
 		.join("");
 }
 
+function textOnly(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (Array.isArray(value)) return value.map(textOnly).join("");
+	if (!isJsonObject(value)) return "";
+	if (value.type === "input_image" || value.type === "image_url") return "";
+	if (typeof value.text === "string") return value.text;
+	if (typeof value.encrypted_content === "string") return value.encrypted_content;
+	return Object.values(value).map(textOnly).join("");
+}
+
 function responseItemText(item: ResponseItem): string {
 	if (item.type === "message" || item.type === "agent_message" || item.type === undefined) {
 		return contentText(item.content);
 	}
 	if (item.type === "function_call_output") {
-		return typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
+		if (typeof item.output === "string") return item.output;
+		return imagePartCount(item.output) > 0 ? textOnly(item.output) : JSON.stringify(item.output ?? "");
 	}
 	if (item.type === "function_call") return typeof item.arguments === "string" ? item.arguments : "";
 	return "";
@@ -771,7 +782,7 @@ function isRetryableStatus(status: number): boolean {
 function canFallbackForStatus(status: number, body: string): boolean {
 	if (![400, 403, 408, 409, 429].includes(status) && status < 500) return false;
 	if (status === 403 && !/(?:model|invalid request|not found|overloaded)/i.test(body)) return false;
-	return !/(?:misalignment_policy_violation|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key)/i.test(body);
+	return !/(?:malformed|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key|authentication|invalid[_ ]token|cancel(?:led|lation)?|aborted)/i.test(body);
 }
 
 function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {

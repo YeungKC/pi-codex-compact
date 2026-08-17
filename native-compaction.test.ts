@@ -33,6 +33,22 @@ describe("Codex compaction history", () => {
 		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
 	});
 
+	test("keeps malformed HTTP 400 out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("malformed request", { status: 400 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
 	test("matches Pi message indexes across empty user entries", () => {
 		const model = { provider: "openai-codex", api: "openai-codex-responses", id: "current", reasoning: true } as never;
 		const branch = [
@@ -117,6 +133,7 @@ describe("Codex compaction history", () => {
 	test("counts images in best-effort token accounting", () => {
 		expect(approximateResponseItemTokens([{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] }])).toBeGreaterThanOrEqual(1_200);
 		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image" }, { type: "input_image" }] }])).toBeGreaterThanOrEqual(2_400);
+		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image", image_url: `data:image/png;base64,${"x".repeat(40_000)}` }] }])).toBeLessThan(2_000);
 		expect(retainRecentMessages([{ type: "message", role: "user", content: [{ type: "input_image" }] }], 1_199)).toEqual([]);
 	});
 
