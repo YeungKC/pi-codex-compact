@@ -385,6 +385,49 @@ describe("Codex session coordinator", () => {
 		expect(input?.at(-1)).toEqual(userInput("new"));
 	});
 
+	test("keeps a persisted user when the request is continuing a tool turn", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const branch = [{
+			id: "current-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: "current" },
+		}, {
+			id: "tool-call",
+			parentId: "current-user",
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "toolCall", id: "call|fc_tool", name: "bash", arguments: { command: "echo" } }],
+			},
+		}, {
+			id: "tool-result",
+			parentId: "tool-call",
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "toolResult", toolCallId: "call|fc_tool", content: [{ type: "text", text: "result" }] },
+		}] as unknown as SessionEntry[];
+		let compactInput: ResponseItem[] | undefined;
+		const coordinator = createCoordinator(branch, async (_model, _payload, input) => {
+			compactInput = input;
+			return details(modelKey(currentModel));
+		});
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			userInput("current"),
+			{ type: "function_call", id: undefined, call_id: "call", name: "bash", arguments: JSON.stringify({ command: "echo" }) },
+			{ type: "function_call_output", call_id: "call", output: "result" },
+		]);
+		expect(compactInput?.some((item) => item.role === "user")).toBe(true);
+		expect(input).toBeDefined();
+	});
+
 	test("matches persisted image users across Pi and provider shapes", async () => {
 		const currentUser = {
 			id: "current-image",

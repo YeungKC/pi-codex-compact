@@ -82,6 +82,7 @@ function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseI
 	const currentUserIndex = branch.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user");
 	const currentUser = currentUserIndex >= 0 ? branch[currentUserIndex] : undefined;
 	if (!requestUser || !currentUser || currentUser.type !== "message") return branch;
+	if (branch.slice(currentUserIndex + 1).some((entry) => entry.type === "message")) return branch;
 	return textContent(currentUser.message.content) === textContent(requestUser.content)
 		? branch.filter((_entry, index) => index !== currentUserIndex)
 		: branch;
