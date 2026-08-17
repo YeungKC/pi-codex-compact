@@ -1,7 +1,224 @@
 import { describe, expect, test } from "bun:test";
-import { buildLegacyCompactionRequestBody, buildReplacementHistory, filterLegacyCompactionHistory, parseNativeCompactionDetails, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, approximateResponseItemTokens, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
+	test("preserves eligible response.failed details for model fallback", async () => {
+		let calls = 0;
+		const body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too large\"}}}\n\ndata: [DONE]\n\n";
+		await expect(callRemoteCompaction({
+			url: "https://example.test/compact",
+			headers: new Headers(),
+			body: {},
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			fetchImpl: async () => {
+				calls++;
+				return new Response(body, { headers: { "content-type": "text/event-stream" } });
+			},
+		})).rejects.toThrow("context_length_exceeded");
+		expect(calls).toBe(1);
+	});
+	test("allows a missing-model HTTP 404 to fall back", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response(JSON.stringify({ error: { code: "model_not_found" } }), { status: 404 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+	});
+
+	test("keeps response.failed without a message out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\"}}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("keeps policy response.failed errors out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\",\"message\":\"policy violation\"}}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("keeps machine-readable SSE errors out of model fallback", async () => {
+	let failure: unknown;
+	try {
+		await callRemoteCompaction({
+			url: "https://example.test/compact",
+			headers: new Headers(),
+			body: {},
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			fetchImpl: async () => new Response("data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"invalid request\"}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+		});
+	} catch (error) {
+		failure = error;
+	}
+	expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("counts function-call metadata in approximate token accounting", () => {
+		const tokens = approximateResponseItemTokens([{ type: "function_call", name: "a-very-long-tool-name", call_id: "call-123456789", arguments: "{}" } as never]);
+		expect(tokens).toBeGreaterThan(1);
+	});
+
+	test("does not retry a legacy missing-model HTTP 404", async () => {
+		let calls = 0;
+		let failure: unknown;
+		try {
+			await callLegacyRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response(JSON.stringify({ error: { code: "model_not_found" } }), { status: 404 });
+				},
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(calls).toBe(1);
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+	});
+
+	test("keeps generic HTTP 403 out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("", { status: 403 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("keeps malformed HTTP 400 out of model fallback", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("malformed request", { status: 400 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("uses the preceding real compaction boundary after a custom checkpoint", () => {
+		const branch = [
+			{ id: "old", type: "message", message: { role: "user", content: "old" } },
+			{ id: "kept", type: "message", message: { role: "user", content: "kept" } },
+			{ id: "real-compaction", type: "compaction", firstKeptEntryId: "kept", summary: "summary", details: {} },
+			{ id: "custom", type: "custom", customType: NATIVE_COMPACTION_KIND, data: {
+				kind: NATIVE_COMPACTION_KIND,
+				version: NATIVE_COMPACTION_VERSION,
+				strategy: "v2",
+				modelKey: "openai-codex:openai-codex-responses:gpt",
+				replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			} },
+			{ id: "tail", type: "message", message: { role: "user", content: "tail" } },
+		] as never;
+		const result = piContextInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", reasoning: true } as never,
+			tools: [],
+		});
+		expect(JSON.stringify(result)).toContain("kept");
+		expect(JSON.stringify(result)).toContain("tail");
+		expect(JSON.stringify(result)).not.toContain("old");
+	});
+
+	test("keeps Pi's compaction summary before retained entries", () => {
+		const branch = [
+			{ id: "old", type: "message", message: { role: "user", content: "old" } },
+			{ id: "kept", type: "message", message: { role: "user", content: "kept" } },
+			{ id: "real-compaction", type: "compaction", firstKeptEntryId: "kept", summary: "summary", details: {} },
+			{ id: "tail", type: "message", message: { role: "user", content: "tail" } },
+		] as never;
+		const result = piContextInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", reasoning: true } as never,
+			tools: [],
+		});
+		const encoded = JSON.stringify(result);
+		expect(encoded.indexOf("summary")).toBeLessThan(encoded.indexOf("kept"));
+	});
+
+	test("matches Pi message indexes across empty user entries", () => {
+		const model = { provider: "openai-codex", api: "openai-codex-responses", id: "current", reasoning: true } as never;
+		const branch = [
+			{
+				id: "tool-call",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					model: "previous",
+					content: [{ type: "toolCall", id: "call|fc_old", name: "bash", arguments: {} }],
+				},
+			} as never,
+			{
+				id: "empty-user",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: { role: "user", content: [] },
+			} as never,
+			{
+				id: "visible",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					model: "previous",
+					content: [{ type: "text", text: "visible" }],
+				},
+			} as never,
+		];
+		const result = fullInputForBranch({ branch, model, tools: [] });
+		expect(result.at(-1)).toMatchObject({ id: "msg_pi_2" });
+	});
 	test("keeps recent message items and drops tool history", () => {
 		const result = retainRecentMessages([
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },
@@ -10,7 +227,30 @@ describe("Codex compaction history", () => {
 			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] },
 		]);
 
-		expect(result.map((item) => item.role ?? item.type)).toEqual(["user", "assistant"]);
+		expect(result.map((item) => item.role ?? item.type)).toEqual(["user"]);
+	});
+
+	test("retains eligible agent messages within the per-item limit", () => {
+		const result = retainRecentMessages([
+			{ type: "agent_message", content: [{ type: "input_text", text: "Message Type: COMMENTARY\nsmall" }] },
+		]);
+		expect(result).toHaveLength(1);
+	});
+
+	test("drops oversized and final-answer agent messages", () => {
+		const result = retainRecentMessages([
+			{ type: "agent_message", content: [{ type: "input_text", text: `Message Type: COMMENTARY\n${"x".repeat(40_000)}` }] },
+			{ type: "agent_message", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\ndone" }] },
+		]);
+		expect(result).toEqual([]);
+	});
+
+	test("does not share the agent-message limit across items", () => {
+		const result = retainRecentMessages([
+			{ type: "agent_message", content: [{ type: "input_text", text: "x".repeat(24_000) }] },
+			{ type: "agent_message", content: [{ type: "input_text", text: "y".repeat(24_000) }] },
+		]);
+		expect(result).toHaveLength(2);
 	});
 
 	test("retains image-only user messages", () => {
@@ -18,6 +258,13 @@ describe("Codex compaction history", () => {
 			{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] },
 		]);
 		expect(result).toHaveLength(1);
+	});
+
+	test("counts images in best-effort token accounting", () => {
+		expect(approximateResponseItemTokens([{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] }])).toBeGreaterThanOrEqual(1_200);
+		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image" }, { type: "input_image" }] }])).toBeGreaterThanOrEqual(2_400);
+		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image", image_url: `data:image/png;base64,${"x".repeat(40_000)}` }] }])).toBeLessThan(2_000);
+		expect(retainRecentMessages([{ type: "message", role: "user", content: [{ type: "input_image" }] }], 1_199)).toEqual([]);
 	});
 
 	test("truncates an oversized message without throwing", () => {
@@ -35,6 +282,32 @@ describe("Codex compaction history", () => {
 		expect(result[1]?.output).toBe("1234567890".slice(0, 4));
 	});
 
+	test("trims image-bearing function output below the image estimate", () => {
+		const result = trimFunctionCallHistoryToFitContextWindow([
+			{ type: "function_call_output", output: [{ type: "input_image", image_url: "data:image/png;base64,large" }] },
+		], 100);
+		expect(result[0]?.output).toBe("");
+		expect(approximateResponseItemTokens(result)).toBeLessThanOrEqual(100);
+	});
+
+	test("keeps machine-readable auth and policy errors out of model fallback", async () => {
+		for (const body of ['{"code":"invalid_api_key"}', '{"code":"policy_violation"}']) {
+			let failure: unknown;
+			try {
+				await callRemoteCompaction({
+					url: "https://example.test/compact",
+					headers: new Headers(),
+					body: {},
+					model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+					fetchImpl: async () => new Response(body, { status: 400 }),
+				});
+			} catch (error) {
+				failure = error;
+			}
+			expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+		}
+	});
+
 	test("filters V1 tool history before replay", () => {
 		const result = filterLegacyCompactionHistory([
 			{ type: "message", role: "user", content: [] },
@@ -42,6 +315,59 @@ describe("Codex compaction history", () => {
 			{ type: "message", role: "assistant", content: [] },
 		]);
 		expect(result).toHaveLength(2);
+	});
+
+	test("drops contextual V1 user wrappers but keeps real user messages", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>old</environment_context>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "keep this" }] },
+			{ type: "message", role: "developer", content: [{ type: "input_text", text: "stale instructions" }] },
+		]);
+		expect(result).toHaveLength(1);
+		expect(result[0]?.content).toEqual([{ type: "input_text", text: "keep this" }]);
+	});
+
+	test("keeps valid V1 hook prompts", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: '<hook_prompt hook_run_id="run">retry</hook_prompt>' }] },
+		]);
+		expect(result).toHaveLength(1);
+	});
+
+	test("keeps hook prompts mixed with contextual fragments", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [
+				{ type: "input_text", text: "<environment_context>old</environment_context>" },
+				{ type: "input_text", text: '<hook_prompt hook_run_id="run">retry</hook_prompt>' },
+			] },
+		]);
+		expect(result).toHaveLength(1);
+	});
+
+	test("drops hook prompts mixed with ordinary user text", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [
+				{ type: "input_text", text: '<hook_prompt hook_run_id="run">retry</hook_prompt>' },
+				{ type: "input_text", text: "ordinary text" },
+			] },
+		]);
+		expect(result).toHaveLength(0);
+	});
+
+	test("recognizes common Codex wrappers without hiding literal user text", () => {
+		const result = filterLegacyCompactionHistory([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>old</INSTRUCTIONS>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<skill>old</skill>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>literal" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "<external_a>literal</external_b>" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: '<codex_internal_context source="Bad!">literal</codex_internal_context>' }] },
+		]);
+		expect(result).toHaveLength(3);
+		expect(result.map((item) => item.content)).toEqual([
+			[{ type: "input_text", text: "<environment_context>literal" }],
+			[{ type: "input_text", text: "<external_a>literal</external_b>" }],
+			[{ type: "input_text", text: '<codex_internal_context source="Bad!">literal</codex_internal_context>' }],
+		]);
 	});
 
 	test("always appends exactly one valid compaction checkpoint", () => {
@@ -89,6 +415,16 @@ describe("Codex compaction history", () => {
 
 	test("rejects a non-native checkpoint", () => {
 		expect(() => buildReplacementHistory([], { type: "message", role: "assistant", content: [] })).toThrow();
+	});
+
+	test("accepts a persisted compaction hash", () => {
+		expect(parseNativeCompactionDetails({
+			kind: "openai-codex-native-compaction",
+			version: 1,
+			modelKey: "openai-codex:openai-codex-responses:test",
+			compHash: "3000",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+		})?.compHash).toBe("3000");
 	});
 
 	test("accepts a legacy checkpoint without strategy", () => {

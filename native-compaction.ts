@@ -16,6 +16,12 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const MAX_REMOTE_RETRIES = 2;
 export const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
+const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?policy|safety[ _-]?policy|policy[ _-]?violation|unauthorized|forbidden|permission|api[ _-]?key|invalid[ _-]?api[ _-]?key|authentication[ _-]?error|(?:invalid|expired|bearer|refresh)[ _-]?token|cancel(?:led|lation)?|aborted)/i;
+
+export function isFailClosedCompactionError(message: string): boolean {
+	return FAIL_CLOSED_ERROR_PATTERN.test(message);
+}
+
 export type JsonObject = Record<string, unknown>;
 export type ResponseItem = JsonObject & { type?: string };
 
@@ -24,6 +30,8 @@ export interface NativeCompactionDetails {
 	version: typeof NATIVE_COMPACTION_VERSION;
 	strategy: "v1" | "v2" | "token-budget";
 	modelKey: string;
+	compHash?: string;
+	preservedInput?: ResponseItem[];
 	replacementHistory: ResponseItem[];
 }
 
@@ -78,9 +86,12 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	if (!isJsonObject(value)) return undefined;
 	if (value.kind !== NATIVE_COMPACTION_KIND || value.version !== NATIVE_COMPACTION_VERSION) return undefined;
 	if (typeof value.modelKey !== "string" || !Array.isArray(value.replacementHistory)) return undefined;
+	if (value.compHash !== undefined && typeof value.compHash !== "string") return undefined;
 
 	const replacementHistory = value.replacementHistory.filter(isResponseItem);
 	if (replacementHistory.length !== value.replacementHistory.length) return undefined;
+	const preservedInput = Array.isArray(value.preservedInput) ? value.preservedInput.filter(isResponseItem) : undefined;
+	if (value.preservedInput !== undefined && (preservedInput === undefined || preservedInput.length !== value.preservedInput.length)) return undefined;
 	const strategy = value.strategy === undefined
 		? "v2"
 		: value.strategy === "v1"
@@ -109,6 +120,8 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 		version: NATIVE_COMPACTION_VERSION,
 		strategy,
 		modelKey: value.modelKey,
+		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
+		...(preservedInput ? { preservedInput: preservedInput.map(cloneItem) } : {}),
 		replacementHistory: replacementHistory.map(cloneItem),
 	};
 }
@@ -142,6 +155,20 @@ export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
 
 function shortHash(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+/** Matches Pi AI's deterministic shortHash for cross-provider Responses item IDs. */
+function piShortHash(value: string): string {
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		h1 = Math.imul(h1 ^ code, 2654435761);
+		h2 = Math.imul(h2 ^ code, 1597334677);
+	}
+	h1 = (Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)) | 0;
+	h2 = (Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)) | 0;
+	return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
 }
 
 function normalizedItemId(value: string | undefined): string | undefined {
@@ -215,34 +242,52 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 	const flushOrphanedToolCalls = () => {
 		for (const callId of pendingToolCalls.values()) {
 			items.push({ type: "function_call_output", call_id: callId, output: "No result provided" });
+			messageIndex++;
 		}
 		pendingToolCalls.clear();
 	};
 	let messageIndex = 0;
 
 	for (const message of messages as unknown as JsonObject[]) {
+		const itemCountBefore = items.length;
 		if (message.role === "user") {
 			flushOrphanedToolCalls();
 			const content = contentToUserParts(message.content);
-			if (content.length > 0) items.push({ role: "user", content });
+			if (content.length === 0) continue;
+			items.push({ role: "user", content });
 		} else if (message.role === "assistant" && Array.isArray(message.content)) {
 			flushOrphanedToolCalls();
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				messageIndex++;
-				continue;
-			}
+			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+			const sameModel = message.provider === model.provider
+				&& message.api === model.api
+				&& message.model === model.id;
+			const sameProviderApi = message.provider === model.provider && message.api === model.api;
 			let textIndex = 0;
 			for (const block of message.content) {
 				if (!isJsonObject(block)) continue;
-				if (block.type === "thinking" && typeof block.thinkingSignature === "string") {
-					try {
-						const reasoning = JSON.parse(block.thinkingSignature);
-						if (isJsonObject(reasoning) && reasoning.type === "reasoning") items.push(cloneItem(reasoning));
-					} catch {}
+				if (block.type === "thinking") {
+					if (!sameModel && block.redacted === true) continue;
+					if (sameModel && typeof block.thinkingSignature === "string") {
+						try {
+							const reasoning = JSON.parse(block.thinkingSignature);
+							if (isJsonObject(reasoning) && reasoning.type === "reasoning") items.push(cloneItem(reasoning));
+						} catch {}
+					} else if (!sameModel && typeof block.thinking === "string" && block.thinking.trim()) {
+						const id = textIndex === 0 ? `msg_pi_${messageIndex}` : `msg_pi_${messageIndex}_${textIndex}`;
+						textIndex++;
+						items.push({
+							type: "message",
+							role: "assistant",
+							id,
+							status: "completed",
+							phase: undefined,
+							content: [{ type: "output_text", text: block.thinking, annotations: [] }],
+						});
+					}
 					continue;
 				}
 				if (block.type === "text" && typeof block.text === "string") {
-					const signature = textSignature(block.textSignature);
+					const signature = sameModel ? textSignature(block.textSignature) : {};
 					const fallbackId = textIndex === 0 ? `msg_pi_${messageIndex}` : `msg_pi_${messageIndex}_${textIndex}`;
 					textIndex++;
 					const rawId = signature.id || fallbackId;
@@ -253,17 +298,22 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 						id,
 						status: "completed",
 						content: [{ type: "output_text", text: block.text, annotations: [] }],
-						...(signature.phase ? { phase: signature.phase } : {}),
+						phase: signature.phase,
 					});
 					continue;
 				}
 				if (block.type === "toolCall" && typeof block.id === "string") {
 					const [callId, rawItemId] = block.id.split("|");
 					pendingToolCalls.set(block.id, callId);
+					const itemId = sameProviderApi && !sameModel
+						? undefined
+						: message.provider !== model.provider || message.api !== model.api
+							? (rawItemId ? `fc_${piShortHash(rawItemId)}` : undefined)
+							: normalizedItemId(rawItemId);
 					items.push({
 						type: "function_call",
 						call_id: callId,
-						...(normalizedItemId(rawItemId) ? { id: normalizedItemId(rawItemId) } : {}),
+						id: itemId,
 						name: String(block.name ?? ""),
 						arguments: JSON.stringify(block.arguments ?? {}),
 					});
@@ -278,7 +328,7 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 				? message.addedToolNames.flatMap((name) => typeof name === "string" && toolsByName.has(name) ? [toolsByName.get(name)!] : [])
 				: [];
 			if (addedTools.length > 0) {
-				const searchCallId = `pi_tool_load_${shortHash(`${message.toolCallId}:${addedTools.map((tool) => tool.name).join(",")}`)}`;
+				const searchCallId = `pi_tool_load_${piShortHash(`${message.toolCallId}:${addedTools.map((tool) => tool.name).join(",")}`)}`;
 				items.push({
 					type: "tool_search_call",
 					call_id: searchCallId,
@@ -295,6 +345,7 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 				});
 			}
 		}
+		if (message.role === "assistant" && items.length === itemCountBefore) continue;
 		messageIndex++;
 	}
 	flushOrphanedToolCalls();
@@ -302,8 +353,10 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 	return items;
 }
 
-function entriesToResponseItems(model: Model<any>, entries: SessionEntry[], tools: ToolInfo[]): ResponseItem[] {
-	const messages = entries.flatMap((entry) => sessionEntryToContextMessages(entry));
+function entriesToResponseItems(model: Model<any>, entries: SessionEntry[], tools: ToolInfo[], includeCompactionSummary = false): ResponseItem[] {
+	const messages = entries
+		.filter((entry) => includeCompactionSummary || entry.type !== "compaction")
+		.flatMap((entry) => sessionEntryToContextMessages(entry));
 	return messagesToResponseItems(model, convertToLlm(messages), tools);
 }
 
@@ -332,19 +385,36 @@ export function piContextInputForBranch(params: {
 	tools: ToolInfo[];
 }): ResponseItem[] {
 	const checkpoint = findNativeCheckpoint(params.branch);
-	if (checkpoint.status !== "valid") return fullInputForBranch(params);
-	const entry = params.branch[checkpoint.checkpoint.entryIndex];
-	const firstKeptEntryId = entry?.type === "compaction" && typeof entry.firstKeptEntryId === "string"
-		? entry.firstKeptEntryId
-		: undefined;
+	const remoteCheckpoint = checkpoint.status === "valid" && checkpoint.checkpoint.details.strategy !== "token-budget";
+	const boundaryEnd = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : params.branch.length;
+	let firstKeptEntryId: string | undefined;
+	let compactionIndex = -1;
+	for (let index = boundaryEnd - 1; index >= 0; index--) {
+		const candidate = params.branch[index];
+		if (candidate?.type === "compaction" && typeof candidate.firstKeptEntryId === "string") {
+			firstKeptEntryId = candidate.firstKeptEntryId;
+			compactionIndex = index;
+			break;
+		}
+	}
+	if (checkpoint.status === "valid") {
+		const entry = params.branch[checkpoint.checkpoint.entryIndex];
+		if (entry?.type === "compaction" && typeof entry.firstKeptEntryId === "string") {
+			firstKeptEntryId = entry.firstKeptEntryId;
+			compactionIndex = checkpoint.checkpoint.entryIndex;
+		}
+	}
 	if (!firstKeptEntryId) return fullInputForBranch(params);
 	const firstKeptIndex = params.branch.findIndex((candidate) => candidate.id === firstKeptEntryId);
 	if (firstKeptIndex < 0) return fullInputForBranch(params);
-	return entriesToResponseItems(
-		params.model,
-		params.branch.slice(firstKeptIndex).filter((candidate) => candidate.type !== "compaction"),
-		params.tools,
-	);
+	const contextEntries = remoteCheckpoint || compactionIndex < 0
+		? params.branch.slice(firstKeptIndex)
+		: [
+			params.branch[compactionIndex]!,
+			...params.branch.slice(firstKeptIndex, compactionIndex),
+			...params.branch.slice(compactionIndex + 1),
+		];
+	return entriesToResponseItems(params.model, contextEntries, params.tools, !remoteCheckpoint);
 }
 
 export function effectiveInputForBranch(params: {
@@ -378,31 +448,67 @@ export function effectiveInputForBranch(params: {
 		const tail = branch.slice(checkpoint.checkpoint.entryIndex + 1);
 		return [
 			...checkpoint.checkpoint.details.replacementHistory.map(cloneItem),
+			...(checkpoint.checkpoint.details.preservedInput ?? []).map(cloneItem),
 			...entriesToResponseItems(params.model, tail, params.tools),
 		];
 	}
 
-	return fullInputForBranch({ branch, model: params.model, tools: params.tools });
+	return piContextInputForBranch({ branch, model: params.model, tools: params.tools });
+}
+
+function contentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.flatMap((part) => {
+			if (!isJsonObject(part)) return [];
+			if (typeof part.text === "string") return [part.text];
+			if (typeof part.encrypted_content === "string") return [part.encrypted_content];
+			return [];
+		})
+		.join("");
+}
+
+function textOnly(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (Array.isArray(value)) return value.map(textOnly).join("");
+	if (!isJsonObject(value)) return "";
+	if (value.type === "input_image" || value.type === "image_url") return "";
+	if (typeof value.text === "string") return value.text;
+	if (typeof value.encrypted_content === "string") return value.encrypted_content;
+	return Object.values(value).map(textOnly).join("");
 }
 
 function responseItemText(item: ResponseItem): string {
-	if (item.type === "message" || item.type === undefined) {
-		if (typeof item.content === "string") return item.content;
-		if (!Array.isArray(item.content)) return "";
-		return item.content
-			.flatMap((part) =>
-				isJsonObject(part) && typeof part.text === "string" ? [part.text] : [],
-			)
-			.join("");
+	if (item.type === "message" || item.type === "agent_message" || item.type === undefined) {
+		return contentText(item.content);
 	}
 	if (item.type === "function_call_output") {
-		return typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
+		if (typeof item.output === "string") return item.output;
+		return imagePartCount(item.output) > 0 ? textOnly(item.output) : JSON.stringify(item.output ?? "");
 	}
 	if (item.type === "function_call") return typeof item.arguments === "string" ? item.arguments : "";
 	return "";
 }
 
+export function approximateTokenCount(value: unknown): number {
+	const encoded = JSON.stringify(value);
+	return Math.max(1, Math.ceil((encoded?.length ?? 0) / 4));
+}
+
+function imagePartCount(value: unknown): number {
+	if (Array.isArray(value)) return value.reduce((total, part) => total + imagePartCount(part), 0);
+	if (!isJsonObject(value)) return 0;
+	if (value.type === "input_image" || value.type === "image_url") return 1;
+	return Object.values(value).reduce((total, part) => total + imagePartCount(part), 0);
+}
+
 function approximateTokens(item: ResponseItem): number {
+	const imageTokens = imagePartCount(item) * 1_200;
+	if (imageTokens > 0) return imageTokens + Math.max(0, Math.ceil(responseItemText(item).length / 4));
+	if (item.type === "function_call" || (typeof item.type === "string" && item.type.includes("tool") && item.type !== "function_call_output")) {
+		return Math.max(1, Math.ceil(JSON.stringify(item).length / 4));
+	}
 	return Math.max(1, Math.ceil(responseItemText(item).length / 4));
 }
 
@@ -412,7 +518,11 @@ export function approximateResponseItemTokens(items: ResponseItem[]): number {
 
 function truncateFunctionOutput(item: ResponseItem, maxTokens: number): ResponseItem {
 	const copy = cloneItem(item);
-	if (typeof copy.output === "string") copy.output = truncateTextPrefix(copy.output, maxTokens * 4);
+	if (imagePartCount(copy.output) > 0) {
+		copy.output = truncateTextPrefix(textOnly(copy.output), maxTokens * 4);
+	} else if (typeof copy.output === "string") {
+		copy.output = truncateTextPrefix(copy.output, maxTokens * 4);
+	}
 	return copy;
 }
 
@@ -431,6 +541,12 @@ export function trimFunctionCallHistoryToFitContextWindow(
 		const kept = Math.max(1, current - excess);
 		result[index] = truncateFunctionOutput(item, kept);
 		excess -= current - approximateTokens(result[index]!);
+	}
+	while (excess > 0) {
+		const index = result.findIndex((item) => item.type === "function_call_output" && imagePartCount(item) > 0);
+		if (index < 0) break;
+		result.splice(index, 1);
+		excess = approximateResponseItemTokens(result) - maxTokens;
 	}
 	return result;
 }
@@ -451,6 +567,12 @@ function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | 
 	if (!Array.isArray(copy.content)) return copy;
 
 	const truncatedContent = copy.content.flatMap((part) => {
+		const imageTokens = imagePartCount(part) * 1_200;
+		if (imageTokens > 0) {
+			if (remainingCharacters < imageTokens * 4) return [];
+			remainingCharacters -= imageTokens * 4;
+			return [part];
+		}
 		if (!isJsonObject(part) || typeof part.text !== "string") return [part];
 		if (remainingCharacters <= 0) return [];
 		const text = truncateTextPrefix(part.text, remainingCharacters);
@@ -461,33 +583,111 @@ function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | 
 	return truncatedContent.length > 0 ? copy : undefined;
 }
 
-function retainedByCodex(item: ResponseItem): boolean {
-	if (item.type === "agent_message") return true;
-	if (item.type !== "message" && item.type !== undefined) return false;
-	return item.role === "user" || item.role === "developer" || item.role === "system" || item.role === "assistant";
+const CONTEXTUAL_USER_WRAPPERS: Array<[string, string]> = [
+	["<environment_context>", "</environment_context>"],
+	["<environments_instructions>", "</environments_instructions>"],
+	["<context_window>", "</context_window>"],
+	["<context_window_guidance>", "</context_window_guidance>"],
+	["<skills_instructions>", "</skills_instructions>"],
+	["<tools>", "</tools>"],
+	["<permissions instructions>", "</permissions instructions>"],
+	["<model_switch>", "</model_switch>"],
+	["<git_attribution>", "</git_attribution>"],
+	["<plugins_instructions>", "</plugins_instructions>"],
+	["<realtime_conversation>", "</realtime_conversation>"],
+	["<personality_spec>", "</personality_spec>"],
+	["<rollout_budget>", "</rollout_budget>"],
+	["<turn_aborted>", "</turn_aborted>"],
+	["<subagent_notification>", "</subagent_notification>"],
+	["<user_instructions>", "</user_instructions>"],
+	["<user_shell_command>", "</user_shell_command>"],
+	["<additional_context>", "</additional_context>"],
+];
+
+function isContextualUserText(value: string): boolean {
+	const text = value.trimStart();
+	const lower = text.toLowerCase();
+	if (lower.startsWith("# agents.md instructions")) return lower.trimEnd().endsWith("</instructions>");
+	if (lower.startsWith("<codex_internal_context")) {
+		return /^<codex_internal_context source="[a-z][a-z0-9_]*">[\s\S]*<\/codex_internal_context>\s*$/.test(text);
+	}
+	if (lower.startsWith("<goal_context>")) return lower.trimEnd().endsWith("</goal_context>");
+	if (lower.startsWith("<skill>")) return lower.trimEnd().endsWith("</skill>");
+	if (lower.startsWith("<recommended_plugins>")) return lower.trimEnd().endsWith("</recommended_plugins>");
+	if (lower.startsWith("<external_") && lower.includes(">")) {
+		const opening = lower.match(/^<(external_[a-z0-9_-]+)>/);
+		return opening !== null && lower.trimEnd().endsWith(`</${opening[1]}>`);
+	}
+	if (lower.startsWith("warning: the maximum number of unified exec processes you can keep open is")) return true;
+	if (lower.startsWith("warning: your account was flagged for potentially high-risk cyber activity")) return true;
+	if (lower.startsWith("warning: apply_patch was requested via ")) {
+		return lower.trimEnd().endsWith("use the apply_patch tool instead of exec_command.");
+	}
+	return CONTEXTUAL_USER_WRAPPERS.some(([open, close]) =>
+		lower.startsWith(open) && lower.trimEnd().endsWith(close),
+	);
 }
 
-/** Mirrors Codex V2: retain recent messages, with a separate 10k agent-message cap. */
+function isHookPromptText(value: string): boolean {
+	return /^<hook_prompt\b[^>]*hook_run_id=(?:"[^"]+"|'[^']+')\s*>[\s\S]*<\/hook_prompt>\s*$/i.test(value.trim());
+}
+
+function isRetainedUserMessage(item: ResponseItem): boolean {
+	if (typeof item.content === "string") return !isContextualUserText(item.content);
+	if (!Array.isArray(item.content)) return true;
+	let hookPrompt = false;
+	let onlyContextOrHook = true;
+	for (const part of item.content) {
+		if (!isJsonObject(part) || typeof part.text !== "string") {
+			onlyContextOrHook = false;
+			continue;
+		}
+		if (isHookPromptText(part.text)) {
+			hookPrompt = true;
+			continue;
+		}
+		if (isContextualUserText(part.text)) continue;
+		onlyContextOrHook = false;
+	}
+	return hookPrompt ? onlyContextOrHook : !item.content.some(
+		(part) => isJsonObject(part) && typeof part.text === "string" && isContextualUserText(part.text),
+	);
+}
+
+function isFinalAnswerAgentMessage(item: ResponseItem): boolean {
+	if (item.type !== "agent_message" || !Array.isArray(item.content)) return false;
+	const first = item.content[0];
+	return isJsonObject(first)
+		&& first.type === "input_text"
+		&& typeof first.text === "string"
+		&& first.text.startsWith("Message Type: FINAL_ANSWER\n");
+}
+
+function retainedByCodex(item: ResponseItem): boolean {
+	if (item.type === "agent_message") {
+		return !isFinalAnswerAgentMessage(item) && approximateTokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
+	}
+	if (item.type !== "message" && item.type !== undefined) return false;
+	return item.role === "user" && isRetainedUserMessage(item);
+}
+
+/** Mirrors current Codex V2's retained message whitelist and 64k newest-first budget. */
 export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED_MESSAGE_TOKEN_BUDGET): ResponseItem[] {
 	let remaining = maxTokens;
-	let agentMessageRemaining = MAX_RETAINED_AGENT_MESSAGE_TOKENS;
 	const retained: ResponseItem[] = [];
 	for (const item of [...items].reverse()) {
 		if (remaining <= 0 || !retainedByCodex(item)) continue;
-		const isAgentMessage = item.type === "agent_message" || item.role === "assistant";
-		const available = isAgentMessage ? Math.min(remaining, agentMessageRemaining) : remaining;
-		if (available <= 0) continue;
 		const tokens = approximateTokens(item);
-		if (tokens <= available) {
+		if (tokens <= remaining) {
 			retained.push(cloneItem(item));
 			remaining -= tokens;
-			if (isAgentMessage) agentMessageRemaining -= tokens;
-		} else {
-			const truncated = truncateMessage(item, available);
-			if (truncated) retained.push(truncated);
-			remaining -= available;
-			if (isAgentMessage) agentMessageRemaining -= available;
+			continue;
 		}
+		const truncated = (item.type === "message" || item.type === undefined)
+			? truncateMessage(item, remaining)
+			: undefined;
+		if (truncated) remaining = 0;
+		if (truncated) retained.push(truncated);
 	}
 	return retained.reverse();
 }
@@ -495,7 +695,8 @@ export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED
 export function filterLegacyCompactionHistory(items: ResponseItem[]): ResponseItem[] {
 	return items.filter((item) => {
 		if (item.type === "message" || item.type === undefined) {
-			return item.role === "user" || item.role === "assistant";
+			if (item.role === "assistant") return true;
+			return item.role === "user" && isRetainedUserMessage(item);
 		}
 		return item.type === "compaction" || item.type === "context_compaction" || item.type === "agent_message";
 	});
@@ -618,6 +819,18 @@ function isRetryableStatus(status: number): boolean {
 	return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+function canFallbackForStatus(status: number, body: string): boolean {
+	if (![400, 403, 404, 408, 409, 429].includes(status) && status < 500) return false;
+	if (status === 403 && !/(?:model|invalid request|not found|overloaded)/i.test(body)) return false;
+	if (status === 404 && !/(?:model|invalid request|overloaded)/i.test(body)) return false;
+	return !isFailClosedCompactionError(body);
+}
+
+function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
+	Object.defineProperty(error, "retryWithCurrentModel", { value: eligible, enumerable: false });
+	return error as Error & { retryWithCurrentModel: boolean };
+}
+
 class NonRetryableCompactionError extends Error {}
 class RetryableCompactionStreamError extends Error {}
 
@@ -663,13 +876,25 @@ async function parseSseResponse(response: Response): Promise<{ item: ResponseIte
 		}
 		if (!isJsonObject(event)) return;
 		if (event.type === "error") {
+			const code = typeof event.code === "string" ? event.code : "";
 			if (typeof event.message !== "string" || !event.message.trim()) {
 				throw new RetryableCompactionStreamError("OpenAI Codex compaction failed.");
 			}
-			throw new NonRetryableCompactionError(event.message);
+			const error = new NonRetryableCompactionError(event.message);
+			throw code && isFailClosedCompactionError(code)
+				? markFallbackEligibility(error, false)
+				: error;
 		}
 		if (event.type === "response.failed") {
-			throw new NonRetryableCompactionError("OpenAI Codex compaction ended with response.failed.");
+			const response = isJsonObject(event.response) ? event.response : {};
+			const failure = isJsonObject(response.error) ? response.error : {};
+			const code = typeof failure.code === "string" ? failure.code : "response.failed";
+			const rawMessage = typeof failure.message === "string" ? failure.message : undefined;
+			const message = rawMessage ?? "OpenAI Codex compaction ended with response.failed.";
+			const eligible = rawMessage !== undefined && rawMessage.trim().length > 0
+				&& (code === "context_length_exceeded" || code === "invalid_prompt")
+				&& !isFailClosedCompactionError(message);
+			throw markFallbackEligibility(new NonRetryableCompactionError(`OpenAI Codex compaction failed (${code}): ${message}`), eligible);
 		}
 		if (event.type === "response.incomplete") {
 			throw new RetryableCompactionStreamError("OpenAI Codex compaction ended with response.incomplete.");
@@ -755,8 +980,8 @@ export async function callRemoteCompaction(params: {
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
 				const message = `OpenAI Codex compaction failed (${response.status}): ${body || response.statusText}`;
-				if (!isRetryableStatus(response.status)) throw new NonRetryableCompactionError(message);
-				const error = new Error(message);
+				if (!isRetryableStatus(response.status)) throw markFallbackEligibility(new NonRetryableCompactionError(message), canFallbackForStatus(response.status, body));
+				const error = markFallbackEligibility(new Error(message), canFallbackForStatus(response.status, body));
 				if (attempt === MAX_REMOTE_RETRIES) throw error;
 				lastError = error;
 				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
@@ -826,7 +1051,13 @@ export async function callLegacyRemoteCompaction(params: {
 			});
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
-				const error = new Error(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`);
+				const eligible = canFallbackForStatus(response.status, body);
+				const error = markFallbackEligibility(
+					isRetryableStatus(response.status)
+						? new Error(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`)
+						: new NonRetryableCompactionError(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`),
+					eligible,
+				);
 				if (!isRetryableStatus(response.status) || attempt === MAX_REMOTE_RETRIES) throw error;
 				lastError = error;
 				await delay(1000 * 2 ** attempt, params.signal);
@@ -834,7 +1065,7 @@ export async function callLegacyRemoteCompaction(params: {
 			}
 			const parsed = await response.json() as JsonObject;
 			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {
-				throw new Error("OpenAI Codex legacy compaction returned invalid output.");
+				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid output.");
 			}
 			return {
 				strategy: "v1",
@@ -842,7 +1073,7 @@ export async function callLegacyRemoteCompaction(params: {
 				usage: usageFromResponse(params.model, parsed.usage),
 			};
 		} catch (error) {
-			if (params.signal?.aborted || attempt === MAX_REMOTE_RETRIES) throw error;
+			if (params.signal?.aborted || error instanceof NonRetryableCompactionError || attempt === MAX_REMOTE_RETRIES) throw error;
 			lastError = error;
 			await delay(1000 * 2 ** attempt, params.signal);
 		}

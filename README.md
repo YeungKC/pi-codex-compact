@@ -23,7 +23,7 @@ Pi does not expose every Codex CLI internal seam. Token accounting, provider cap
 - Retains recent eligible message items, drops old tool/reasoning items, and caps retained agent messages at 10,000 tokens.
 - Uses Codex V2's 64,000-token retained-message budget and trims old function-call output before remote requests.
 - Runs automatic remote compaction in the awaited `before_provider_request` hook instead of aborting a completed turn.
-- Uses the current request's non-input parameters for compaction and retries transition compaction with the current model if the previous model fails.
+- Uses the current request's non-input parameters for compaction and retries transition compaction with the current model only for eligible model/request failures.
 - Retries transient HTTP and stream failures.
 
 For unsupported providers, Pi keeps ownership of local text summarization. For the explicit `tokenBudget` feature, the extension uses the closest available Pi compaction boundary; Pi extensions cannot create Codex's true fresh context window. The extension does not generate a local text summary and does not add a visible continuation message. Manual and overflow compactions use Pi's `session_before_compact` lifecycle hook; normal automatic compaction runs before the next provider request. If no limit is configured, the extension derives a 90% context-window limit, matching Codex's default. The built-in `openai-codex` provider is routed deterministically like Codex CLI: V2 by default, or V1 when the `remote_compaction_v2` feature is disabled.
@@ -60,6 +60,6 @@ pi install npm:@yeungkc/pi-codex-compact
 
 ## Known boundary
 
-Codex CLI owns exact provider capability metadata (`comp_hash`), token accounting, mid-turn continuation, and fresh token-budget context windows internally. Pi extensions do not expose those seams. This extension uses model metadata when Pi exposes a compaction hash, otherwise it conservatively compacts on a Codex model ID change; it estimates the pre-request history with the same 90% default, and uses Pi's closest token-budget boundary. These are explicit compatibility limits, not server probing or local-summary fallbacks.
+Codex CLI owns exact provider capability metadata (`comp_hash`), token accounting, mid-turn continuation, and fresh token-budget context windows internally. Pi extensions do not expose those seams. This extension transitions only when both persisted/current compaction hashes exist and differ; missing hashes fail closed and do not trigger a guessed transition. It estimates history plus the stable system/tool prefix with a 90% default, including best-effort image/tool weights, and uses Pi's closest token-budget boundary. These are explicit compatibility limits, not server probing or local-summary fallbacks.
 
 Checkpoints are model-specific and are stored in the local Pi session JSONL.

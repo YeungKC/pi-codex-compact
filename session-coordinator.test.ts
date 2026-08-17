@@ -4,8 +4,12 @@ import type { Model } from "@earendil-works/pi-ai";
 import { createSessionCoordinator } from "./session-coordinator.ts";
 import { modelKey, NATIVE_COMPACTION_KIND, type NativeCompactionDetails, type ResponseItem } from "./native-compaction.ts";
 
-function model(provider: string, id: string, compHash?: string): Model<any> {
-	return { provider, api: "openai-codex-responses", id, reasoning: true, ...(compHash ? { compHash } : {}) } as Model<any>;
+function model(provider: string, id: string, compHash: string | undefined = `test-${id}`): Model<any> {
+	return { provider, api: "openai-codex-responses", id, reasoning: true, ...(compHash !== undefined ? { compHash } : {}) } as Model<any>;
+}
+
+function modelWithoutHash(provider: string, id: string): Model<any> {
+	return { ...model(provider, id), compHash: undefined } as Model<any>;
 }
 
 function context(models: Model<any>[] = [], systemPrompt = "instructions"): ExtensionContext {
@@ -56,15 +60,15 @@ function nativeCompactionEntry(data: NativeCompactionDetails, firstKeptEntryId: 
 
 function createCoordinator(
 	branch: SessionEntry[] = [],
-	createCheckpoint?: (model: Model<any>, basePayload?: Record<string, unknown>) => Promise<NativeCompactionDetails>,
+	createCheckpoint?: (model: Model<any>, basePayload?: Record<string, unknown>, input?: ResponseItem[]) => Promise<NativeCompactionDetails>,
 	appendCheckpoint?: (details: NativeCompactionDetails) => void,
 	shouldAutoCompact?: (input: ResponseItem[]) => boolean,
 ) {
 	return createSessionCoordinator({
 		getBranch: () => branch,
 		getAllTools: () => [],
-		createCheckpoint: async ({ model: selectedModel, basePayload }) => ({
-			details: createCheckpoint ? await createCheckpoint(selectedModel, basePayload) : details(modelKey(selectedModel)),
+		createCheckpoint: async ({ model: selectedModel, basePayload, input }) => ({
+			details: createCheckpoint ? await createCheckpoint(selectedModel, basePayload, input) : details(modelKey(selectedModel)),
 		}),
 		withStatus: async (_ctx, operation) => operation(),
 		appendCheckpoint: (value) => {
@@ -81,30 +85,14 @@ const userInput = (text: string): ResponseItem => ({
 });
 
 describe("Codex session coordinator", () => {
-	test("schedules one compaction until it is consumed", () => {
-		const coordinator = createCoordinator();
-		expect(coordinator.schedule("session")).toBe(true);
-		expect(coordinator.schedule("session")).toBe(false);
-		expect(coordinator.consumeScheduled("session")).toBe(true);
-		expect(coordinator.consumeScheduled("session")).toBe(false);
-	});
-
-	test("clear removes pending lifecycle state", () => {
-		const coordinator = createCoordinator();
-		coordinator.schedule("session");
-		coordinator.clear();
-		expect(coordinator.consumeScheduled("session")).toBe(false);
-		expect(coordinator.schedule("session")).toBe(true);
-	});
-
 	test("does not compact when the model is selected", async () => {
 		let calls = 0;
 		const coordinator = createCoordinator([], async () => {
 			calls++;
 			return details("source");
 		});
-		const oldModel = model("openai-codex", "old");
-		await coordinator.selectModel({ model: model("openai-codex", "new"), previousModel: oldModel }, context());
+		const oldModel = model("openai-codex", "old", "shared");
+		await coordinator.selectModel({ model: model("openai-codex", "new", "shared"), previousModel: oldModel }, context());
 		expect(calls).toBe(0);
 	});
 
@@ -177,6 +165,19 @@ describe("Codex session coordinator", () => {
 		expect(secondFinished).toBe(true);
 	});
 
+	test("does not transition when either model hash is unavailable", async () => {
+		let calls = 0;
+		const coordinator = createCoordinator([], async () => {
+			calls++;
+			return details("unexpected");
+		});
+		const previous = modelWithoutHash("openai-codex", "previous");
+		const current = model("openai-codex", "current", "hash-b");
+		await coordinator.selectModel({ model: current, previousModel: previous }, context());
+		await coordinator.prepareRequest(current, context(), [userInput("hello")]);
+		expect(calls).toBe(0);
+	});
+
 	test("compacts when a thinking-level change exposes a different compaction hash", async () => {
 		let calls = 0;
 		const coordinator = createCoordinator([], async () => {
@@ -227,6 +228,125 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([...details(modelKey(currentModel)).replacementHistory, userInput("new")]);
 	});
 
+	test("matches cross-model tool history after target-model normalization", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const assistantEntry = {
+			id: "assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "toolCall", id: "call|fc_old", name: "bash", arguments: { command: "echo" } }],
+			},
+		} as unknown as SessionEntry;
+		const branch = [assistantEntry];
+		const coordinator = createCoordinator(branch);
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "function_call", id: undefined, call_id: "call", name: "bash", arguments: JSON.stringify({ command: "echo" }) },
+			{ type: "function_call_output", call_id: "call", output: "No result provided" },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("matches cross-model visible thinking after signature removal", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const assistantEntry = {
+			id: "assistant-thinking",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{
+					type: "thinking",
+					thinking: "plan",
+					thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_old", summary: [] }),
+				}],
+			},
+		} as unknown as SessionEntry;
+		const coordinator = createCoordinator([assistantEntry]);
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "message", role: "assistant", id: "msg_pi_0", status: "completed", phase: undefined, content: [{ type: "output_text", text: "plan", annotations: [] }] },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("normalizes foreign cross-model tool IDs like Pi", async () => {
+		const previousModel = model("anthropic", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const branch = [{
+			id: "foreign-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "toolCall", id: "call|foreign_item", name: "bash", arguments: {} }],
+			},
+		} as unknown as SessionEntry];
+		const coordinator = createCoordinator(branch);
+		await coordinator.selectModel({ model: currentModel, previousModel: model("openai-codex", "previous", "hash-a") }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "function_call", id: "fc_iso4ur1iqd9fs", call_id: "call", name: "bash", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call", output: "No result provided" },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("drops redacted thinking across models", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const branch = [{
+			id: "redacted-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "thinking", thinking: "[Reasoning redacted]", redacted: true, thinkingSignature: "opaque" }],
+			},
+		} as unknown as SessionEntry, {
+			id: "visible-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "text", text: "visible" }],
+			},
+		} as unknown as SessionEntry];
+		const coordinator = createCoordinator(branch);
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			{ type: "message", role: "assistant", id: "msg_pi_0", status: "completed", phase: undefined, content: [{ type: "output_text", text: "visible", annotations: [] }] },
+			userInput("new"),
+		]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
 	test("compacts on the first request after a model selection", async () => {
 		let compactedWith: string | undefined;
 		let appended: NativeCompactionDetails | undefined;
@@ -244,6 +364,157 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, userInput("hello")]);
 	});
 
+	test("excludes the persisted current user from transition compaction input", async () => {
+		const currentUser = {
+			id: "current-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "new" }] },
+		} as unknown as SessionEntry;
+		let compactInput: ResponseItem[] | undefined;
+		const coordinator = createCoordinator([currentUser], async (_selectedModel, _basePayload, input) => {
+			compactInput = input;
+			return details("openai-codex:openai-codex-responses:old");
+		});
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		const input = await coordinator.prepareRequest(newModel, context(), [userInput("new")]);
+		expect(compactInput).toEqual([]);
+		expect(input?.at(-1)).toEqual(userInput("new"));
+	});
+
+	test("keeps a persisted user when the request is continuing a tool turn", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const branch = [{
+			id: "current-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: "current" },
+		}, {
+			id: "tool-call",
+			parentId: "current-user",
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: previousModel.provider,
+				api: previousModel.api,
+				model: previousModel.id,
+				content: [{ type: "toolCall", id: "call|fc_tool", name: "bash", arguments: { command: "echo" } }],
+			},
+		}, {
+			id: "tool-result",
+			parentId: "tool-call",
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "toolResult", toolCallId: "call|fc_tool", content: [{ type: "text", text: "result" }] },
+		}] as unknown as SessionEntry[];
+		let compactInput: ResponseItem[] | undefined;
+		const coordinator = createCoordinator(branch, async (_model, _payload, input) => {
+			compactInput = input;
+			return details(modelKey(currentModel));
+		});
+		await coordinator.selectModel({ model: currentModel, previousModel }, context());
+		const input = await coordinator.prepareRequest(currentModel, context(), [
+			userInput("current"),
+			{ type: "function_call", id: undefined, call_id: "call", name: "bash", arguments: JSON.stringify({ command: "echo" }) },
+			{ type: "function_call_output", call_id: "call", output: "result" },
+		]);
+		expect(compactInput?.some((item) => item.role === "user")).toBe(true);
+		expect(input).toBeDefined();
+	});
+
+	test("matches persisted image users across Pi and provider shapes", async () => {
+		const currentUser = {
+			id: "current-image",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "image", data: "bytes", mimeType: "image/png" }] },
+		} as unknown as SessionEntry;
+		let compactInput: ResponseItem[] | undefined;
+		const branch = [currentUser];
+		const coordinator = createCoordinator(branch, async (_model, _payload, input) => {
+			compactInput = input;
+			return details("openai-codex:openai-codex-responses:old");
+		});
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const imageUser = { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,bytes" }] };
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		const input = await coordinator.prepareRequest(newModel, context(), [imageUser]);
+		expect(compactInput).toEqual([]);
+		expect(input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, imageUser]);
+		branch.push({ id: "next-user", parentId: "checkpoint", timestamp: new Date().toISOString(), type: "message", message: { role: "user", content: "next" } } as unknown as SessionEntry);
+		const nextInput = await coordinator.prepareRequest(newModel, context(), [
+			{ type: "compaction", encrypted_content: "opaque" },
+			imageUser,
+			userInput("next"),
+		]);
+		expect(nextInput).toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			imageUser,
+			userInput("next"),
+		]);
+	});
+
+	test("does not repeat a transition already satisfied by Pi compaction", async () => {
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const branch = [nativeCompactionEntry(details(modelKey(newModel)), "current")];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await coordinator.prepareRequest(newModel, context(), [...details(modelKey(newModel)).replacementHistory, userInput("new")]);
+		expect(calls).toBe(0);
+	});
+
+	test("coalesces concurrent automatic compaction", async () => {
+		let calls = 0;
+		let release!: () => void;
+		let started!: () => void;
+		const compactionStarted = new Promise<void>((resolve) => { started = resolve; });
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			calls++;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+				started();
+			});
+			return details(modelKey(selectedModel));
+		}, undefined, () => true);
+		const currentModel = model("openai-codex", "current");
+		const first = coordinator.prepareRequest(currentModel, context(), [userInput("one")]);
+		await compactionStarted;
+		await Promise.resolve();
+		const second = coordinator.prepareRequest(currentModel, context(), [userInput("two")]);
+		await Promise.resolve();
+		expect(calls).toBe(1);
+		release();
+		await Promise.all([first, second]);
+		expect(calls).toBe(1);
+	});
+
+	test("checks the automatic limit again after transition compaction", async () => {
+		const compactedWith: string[] = [];
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			return details(modelKey(selectedModel));
+		}, undefined, () => true);
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		const input = await coordinator.prepareRequest(newModel, context(), [userInput("hello")]);
+		expect(compactedWith).toEqual([modelKey(oldModel), modelKey(newModel)]);
+		expect(input?.at(-1)).toEqual(userInput("hello"));
+	});
+
 	test("passes the current request parameters to transition compaction", async () => {
 		let receivedPayload: Record<string, unknown> | undefined;
 		const coordinator = createCoordinator([], async (_selectedModel, basePayload) => {
@@ -255,6 +526,35 @@ describe("Codex session coordinator", () => {
 		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
 		await coordinator.prepareRequest(newModel, context(), [userInput("hello")], { reasoning: { effort: "high" } });
 		expect(receivedPayload).toEqual({ reasoning: { effort: "high" } });
+	});
+
+	test("keeps a same-ID transition when its compaction hash changes", async () => {
+		const firstA = model("openai-codex", "a", "hash-a");
+		const b = model("openai-codex", "b", "hash-b");
+		const secondA = model("openai-codex", "a", "hash-c");
+		let compactedWith: string | undefined;
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			compactedWith = modelKey(selectedModel);
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.selectModel({ model: b, previousModel: firstA }, context());
+		await coordinator.selectModel({ model: secondA, previousModel: b }, context());
+		await coordinator.prepareRequest(secondA, context(), [userInput("hello")]);
+		expect(compactedWith).toBe(modelKey(firstA));
+	});
+
+	test("falls back when a same-ID hash transition fails on the previous model", async () => {
+		const previous = model("openai-codex", "same", "hash-a");
+		const current = model("openai-codex", "same", "hash-b");
+		const compactedWith: string[] = [];
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			if (selectedModel === previous) throw new Error("OpenAI Codex compaction failed (400): old hash");
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.selectModel({ model: current, previousModel: previous }, context());
+		await coordinator.prepareRequest(current, context(), [userInput("hello")]);
+		expect(compactedWith).toEqual([modelKey(previous), modelKey(current)]);
 	});
 
 	test("coalesces A to B to C before the first request", async () => {
@@ -367,14 +667,109 @@ describe("Codex session coordinator", () => {
 		const newModel = model("openai-codex", "new");
 		const branch = [checkpointEntry(details(modelKey(oldModel)))];
 		let createdFor: string | undefined;
+		let receivedPayload: Record<string, unknown> | undefined;
 		let appended: NativeCompactionDetails | undefined;
-		const coordinator = createCoordinator(branch, async (selectedModel) => {
+		const coordinator = createCoordinator(branch, async (selectedModel, basePayload) => {
 			createdFor = modelKey(selectedModel);
+			receivedPayload = basePayload;
 			return details(modelKey(selectedModel), "new");
 		}, (value) => { appended = value; });
-		await coordinator.recoverCurrentModel(newModel, context([oldModel, newModel]));
+		await coordinator.recoverCurrentModel(newModel, context([oldModel, newModel]), { reasoning: { effort: "high" } });
 		expect(createdFor).toBe(modelKey(oldModel));
+		expect(receivedPayload).toEqual({ reasoning: { effort: "high" } });
 		expect(appended?.modelKey).toBe(modelKey(newModel));
+	});
+
+	test("skips recovery when checkpoint and current model share a compaction hash", async () => {
+		let calls = 0;
+		const oldModel = model("openai-codex", "old", "shared");
+		const newModel = model("openai-codex", "new", "shared");
+		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "shared" })];
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		await coordinator.recoverCurrentModel(newModel, context([oldModel, newModel]));
+		expect(calls).toBe(0);
+	});
+
+	test("recovers when the same model ID has a different persisted hash", async () => {
+		let calls = 0;
+		const previous = model("openai-codex", "same", "hash-a");
+		const current = model("openai-codex", "same", "hash-b");
+		const branch = [checkpointEntry({ ...details(modelKey(previous)), compHash: "hash-a" })];
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details(modelKey(current));
+		});
+		await coordinator.recoverCurrentModel(current, context([current]));
+		expect(calls).toBe(1);
+	});
+
+	test("replays a same-hash checkpoint through prepareRequest", async () => {
+		const previous = model("openai-codex", "previous", "shared");
+		const current = model("openai-codex", "current", "shared");
+		const branch = [checkpointEntry({ ...details(modelKey(previous)), compHash: "shared" })];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		const input = [...details(modelKey(previous)).replacementHistory, userInput("hello")];
+		await expect(coordinator.prepareRequest(current, context([previous, current]), input)).resolves.toEqual(input);
+		expect(calls).toBe(0);
+	});
+
+	test("fails closed when a cross-model checkpoint has no hashes", async () => {
+		const oldModel = modelWithoutHash("openai-codex", "old");
+		const newModel = modelWithoutHash("openai-codex", "new");
+		const branch = [checkpointEntry(details(modelKey(oldModel)))];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		await expect(coordinator.prepareRequest(newModel, context([oldModel, newModel]), [
+			...details(modelKey(oldModel)).replacementHistory,
+			userInput("hello"),
+		])).rejects.toThrow("requires model-transition compaction first");
+		expect(calls).toBe(0);
+	});
+
+	test("falls back to the current model when the checkpoint model is unavailable", async () => {
+		let createdFor: string | undefined;
+		const oldModel = model("openai-codex", "retired", "hash-old");
+		const newModel = model("openai-codex", "current", "hash-new");
+		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "hash-old" })];
+		const coordinator = createCoordinator(branch, async (selectedModel) => {
+			createdFor = modelKey(selectedModel);
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.recoverCurrentModel(newModel, context([newModel]));
+		expect(createdFor).toBe(modelKey(newModel));
+	});
+
+	test("uses current-model recovery fallback through prepareRequest", async () => {
+		let createdFor: string | undefined;
+		let compactInput: ResponseItem[] | undefined;
+		const oldModel = model("openai-codex", "retired", "hash-old");
+		const newModel = model("openai-codex", "current", "hash-new");
+		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "hash-old" }), {
+			id: "current-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "hello" }] },
+		} as unknown as SessionEntry];
+		const coordinator = createCoordinator(branch, async (selectedModel, _basePayload, input) => {
+			createdFor = modelKey(selectedModel);
+			compactInput = input;
+			return details(modelKey(selectedModel));
+		});
+		const input = [...details(modelKey(oldModel)).replacementHistory, userInput("hello")];
+		await coordinator.prepareRequest(newModel, context([newModel]), input);
+		expect(createdFor).toBe(modelKey(newModel));
+		expect(compactInput).toEqual(details(modelKey(oldModel)).replacementHistory);
 	});
 
 	test("recovers a pending transition after reload with the checkpoint model", async () => {
@@ -400,7 +795,7 @@ describe("Codex session coordinator", () => {
 		const newModel = model("openai-codex", "new");
 		const coordinator = createCoordinator([], async (selectedModel) => {
 			compactedWith.push(modelKey(selectedModel));
-			if (selectedModel.id === oldModel.id) throw new Error("old model unavailable");
+			if (selectedModel.id === oldModel.id) throw new Error("OpenAI Codex compaction failed (400): invalid request");
 			return details(modelKey(selectedModel), "fallback");
 		});
 		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
@@ -409,15 +804,73 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "fallback" }, userInput("hello")]);
 	});
 
+	test("rebuilds fallback input for the current model", async () => {
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const branch = [{
+			id: "assistant-thinking",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: oldModel.provider,
+				api: oldModel.api,
+				model: oldModel.id,
+				content: [{ type: "thinking", thinking: "plan", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_old", summary: [] }) }],
+			},
+		} as unknown as SessionEntry];
+		const inputs: ResponseItem[][] = [];
+		const coordinator = createCoordinator(branch, async (selectedModel, _basePayload, input) => {
+			inputs.push(input ?? []);
+			if (selectedModel.id === oldModel.id) throw new Error("OpenAI Codex compaction failed (400): invalid request");
+			return details(modelKey(selectedModel));
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await coordinator.prepareRequest(newModel, context(), [
+			{ type: "message", role: "assistant", id: "msg_pi_0", status: "completed", phase: undefined, content: [{ type: "output_text", text: "plan", annotations: [] }] },
+			userInput("hello"),
+		]);
+		expect(inputs).toHaveLength(2);
+		expect(inputs[0]?.[0]?.type).toBe("reasoning");
+		expect(inputs[1]?.[0]?.type).toBe("message");
+	});
+
 	test("records a failed transition only when the first request runs", async () => {
-		const failing = createCoordinator([], async () => { throw new Error("remote unavailable"); });
+		let calls = 0;
+		const failing = createCoordinator([], async () => { calls++; throw new Error("remote unavailable"); });
 		const oldModel = model("openai-codex", "old");
 		const newModel = model("openai-codex", "new");
 		await failing.selectModel({ model: newModel, previousModel: oldModel }, context());
 		expect(failing.transitionFailure("session", newModel)).toBeUndefined();
 		await failing.prepareRequest(newModel, context(), [userInput("hello")]).catch(() => {});
-		expect(failing.transitionFailure("session", newModel)).toBe("remote unavailable; current-model fallback failed: remote unavailable");
+		expect(calls).toBe(1);
+		expect(failing.transitionFailure("session", newModel)).toBe("remote unavailable");
 		await failing.selectModel({ model: model("anthropic", "claude"), previousModel: newModel }, context());
 		expect(failing.transitionFailure("session", newModel)).toBeUndefined();
+	});
+
+	test("does not fallback for policy errors despite an HTTP 400", async () => {
+		let calls = 0;
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const coordinator = createCoordinator([], async () => {
+			calls++;
+			throw new Error("OpenAI Codex compaction failed (400): cyber_policy");
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await expect(coordinator.prepareRequest(newModel, context(), [userInput("hello")])).rejects.toThrow("cyber_policy");
+		expect(calls).toBe(1);
+	});
+
+	test("preserves the previous-model error when fallback also fails", async () => {
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			if (selectedModel.id === oldModel.id) throw new Error("OpenAI Codex compaction failed (400): retired model");
+			throw new Error("current model failed");
+		});
+		await coordinator.selectModel({ model: newModel, previousModel: oldModel }, context());
+		await expect(coordinator.prepareRequest(newModel, context(), [userInput("hello")])).rejects.toThrow("OpenAI Codex compaction failed (400): retired model");
 	});
 });
