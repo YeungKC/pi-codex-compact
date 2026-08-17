@@ -133,11 +133,12 @@ describe("Codex session coordinator", () => {
 			modelId: currentModel.id,
 		}] as unknown as SessionEntry[];
 		const request = [userInput("child task")];
-		let compactedWith: Model<any> | undefined;
-		let compactedInput: ResponseItem[] | undefined;
+		const compactedWith: Model<any>[] = [];
+		const compactedInputs: ResponseItem[][] = [];
 		const coordinator = createCoordinator(branch, async (selectedModel, _basePayload, input) => {
-			compactedWith = selectedModel;
-			compactedInput = input;
+			compactedWith.push(selectedModel);
+			compactedInputs.push(input!);
+			if (selectedModel === previousModel) throw new Error("400 context window");
 			return details(modelKey(selectedModel), "child");
 		});
 
@@ -145,8 +146,8 @@ describe("Codex session coordinator", () => {
 			{ type: "compaction", encrypted_content: "child" },
 			userInput("child task"),
 		]);
-		expect(compactedWith).toBe(previousModel);
-		expect(compactedInput).toEqual(request);
+		expect(compactedWith).toEqual([previousModel, currentModel]);
+		expect(compactedInputs).toEqual([request, request]);
 		expect((branch.at(-1) as { data: NativeCompactionDetails }).data).toMatchObject({
 			modelKey: modelKey(currentModel),
 			compHash: "hash-b",

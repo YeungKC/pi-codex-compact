@@ -420,13 +420,27 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			);
 		} catch (error) {
 			if (!pending && checkpoint.status === "none") return undefined;
-			const native = await deps.withStatus(ctx, () => deps.createCheckpoint({
+			const createCheckpointFor = (selectedModel: Model<any>) => deps.withStatus(ctx, () => deps.createCheckpoint({
 				ctx,
-				model: historyModel,
+				model: selectedModel,
 				input: requestInput!,
 				basePayload,
 				signal: ctx.signal,
 			}));
+			let native: Awaited<ReturnType<CheckpointFactory>>;
+			try {
+				native = await createCheckpointFor(historyModel);
+			} catch (firstError) {
+				if (
+					(modelKey(model) === modelKey(historyModel) && compactionHash(model) === compactionHash(historyModel))
+					|| !shouldRetryWithCurrentModel(firstError)
+				) throw firstError;
+				try {
+					native = await createCheckpointFor(model);
+				} catch {
+					throw firstError;
+				}
+			}
 			const details = {
 				...preserveRequestUser(native.details, requestInput!),
 				modelKey: modelKey(model),
