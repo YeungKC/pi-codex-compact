@@ -399,6 +399,25 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(0);
 	});
 
+	test("coalesces concurrent automatic compaction", async () => {
+		let calls = 0;
+		let release!: () => void;
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			calls++;
+			await new Promise<void>((resolve) => { release = resolve; });
+			return details(modelKey(selectedModel));
+		}, undefined, () => true);
+		const currentModel = model("openai-codex", "current");
+		const first = coordinator.prepareRequest(currentModel, context(), [userInput("one")]);
+		await Promise.resolve();
+		const second = coordinator.prepareRequest(currentModel, context(), [userInput("two")]);
+		await Promise.resolve();
+		expect(calls).toBe(1);
+		release();
+		await Promise.all([first, second]);
+		expect(calls).toBe(1);
+	});
+
 	test("checks the automatic limit again after transition compaction", async () => {
 		const compactedWith: string[] = [];
 		const oldModel = model("openai-codex", "old", "hash-a");

@@ -126,6 +126,7 @@ function resolveModel(ctx: ExtensionContext, key: string): Model<any> | undefine
 export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 	const pendingBySession = new Map<string, PendingTransition>();
 	const transitionBySession = new Map<string, Promise<void>>();
+	const automaticCompactionBySession = new Map<string, Promise<void>>();
 	const failureBySession = new Map<string, { modelKey: string; message: string }>();
 	let generation = 0;
 
@@ -133,6 +134,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		generation++;
 		pendingBySession.clear();
 		transitionBySession.clear();
+		automaticCompactionBySession.clear();
 		failureBySession.clear();
 	};
 
@@ -381,29 +383,41 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		}
 		let branch = deps.getBranch(ctx);
 		{
-			const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
-			const currentHistory = effectiveInputForBranch({
-				branch: compactionBranch,
-				model,
-				tools: deps.getAllTools(),
-				allowCheckpointModelMismatch: true,
-			});
-			if (deps.shouldAutoCompact?.({ ctx, model, input: currentHistory })) {
-				const startGeneration = generation;
-				const leafId = conversationLeafId(branch);
-				const native = await deps.withStatus(ctx, () => deps.createCheckpoint({
-					ctx,
+			const activeAutomaticCompaction = automaticCompactionBySession.get(sessionId);
+			if (activeAutomaticCompaction) {
+				await activeAutomaticCompaction;
+			} else {
+				const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
+				const currentHistory = effectiveInputForBranch({
+					branch: compactionBranch,
 					model,
-					input: currentHistory,
-					basePayload,
-					signal: ctx.signal,
-				}));
-				if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
-					throw new Error("The session changed while Codex automatic compaction was running.");
+					tools: deps.getAllTools(),
+					allowCheckpointModelMismatch: true,
+				});
+				if (deps.shouldAutoCompact?.({ ctx, model, input: currentHistory })) {
+					const startGeneration = generation;
+					const leafId = conversationLeafId(branch);
+					const automaticCompaction = deps.withStatus(ctx, () => deps.createCheckpoint({
+						ctx,
+						model,
+						input: currentHistory,
+						basePayload,
+						signal: ctx.signal,
+					})).then((native) => {
+						if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
+							throw new Error("The session changed while Codex automatic compaction was running.");
+						}
+						deps.appendCheckpoint(native.details);
+					});
+					automaticCompactionBySession.set(sessionId, automaticCompaction);
+					try {
+						await automaticCompaction;
+					} finally {
+						if (automaticCompactionBySession.get(sessionId) === automaticCompaction) automaticCompactionBySession.delete(sessionId);
+					}
 				}
-				deps.appendCheckpoint(native.details);
-				branch = deps.getBranch(ctx);
 			}
+			branch = deps.getBranch(ctx);
 		}
 		const currentCheckpoint = findNativeCheckpoint(branch);
 		if (currentCheckpoint.status === "none") return undefined;
