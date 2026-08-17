@@ -394,7 +394,8 @@ describe("Codex session coordinator", () => {
 			message: { role: "user", content: [{ type: "image", data: "bytes", mimeType: "image/png" }] },
 		} as unknown as SessionEntry;
 		let compactInput: ResponseItem[] | undefined;
-		const coordinator = createCoordinator([currentUser], async (_model, _payload, input) => {
+		const branch = [currentUser];
+		const coordinator = createCoordinator(branch, async (_model, _payload, input) => {
 			compactInput = input;
 			return details("openai-codex:openai-codex-responses:old");
 		});
@@ -405,6 +406,17 @@ describe("Codex session coordinator", () => {
 		const input = await coordinator.prepareRequest(newModel, context(), [imageUser]);
 		expect(compactInput).toEqual([]);
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, imageUser]);
+		branch.push({ id: "next-user", parentId: "checkpoint", timestamp: new Date().toISOString(), type: "message", message: { role: "user", content: "next" } } as unknown as SessionEntry);
+		const nextInput = await coordinator.prepareRequest(newModel, context(), [
+			{ type: "compaction", encrypted_content: "opaque" },
+			imageUser,
+			userInput("next"),
+		]);
+		expect(nextInput).toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			imageUser,
+			userInput("next"),
+		]);
 	});
 
 	test("does not repeat a transition already satisfied by Pi compaction", async () => {

@@ -65,6 +65,22 @@ describe("Codex compaction history", () => {
 		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
 	});
 
+	test("keeps machine-readable SSE errors out of model fallback", async () => {
+	let failure: unknown;
+	try {
+		await callRemoteCompaction({
+			url: "https://example.test/compact",
+			headers: new Headers(),
+			body: {},
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			fetchImpl: async () => new Response("data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"invalid request\"}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+		});
+	} catch (error) {
+		failure = error;
+	}
+	expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
 	test("counts function-call metadata in approximate token accounting", () => {
 		const tokens = approximateResponseItemTokens([{ type: "function_call", name: "a-very-long-tool-name", call_id: "call-123456789", arguments: "{}" } as never]);
 		expect(tokens).toBeGreaterThan(1);
@@ -264,6 +280,32 @@ describe("Codex compaction history", () => {
 			{ type: "function_call_output", call_id: "1", output: "1234567890" },
 		], 2);
 		expect(result[1]?.output).toBe("1234567890".slice(0, 4));
+	});
+
+	test("trims image-bearing function output below the image estimate", () => {
+		const result = trimFunctionCallHistoryToFitContextWindow([
+			{ type: "function_call_output", output: [{ type: "input_image", image_url: "data:image/png;base64,large" }] },
+		], 100);
+		expect(result[0]?.output).toBe("");
+		expect(approximateResponseItemTokens(result)).toBeLessThanOrEqual(100);
+	});
+
+	test("keeps machine-readable auth and policy errors out of model fallback", async () => {
+		for (const body of ['{"code":"invalid_api_key"}', '{"code":"policy_violation"}']) {
+			let failure: unknown;
+			try {
+				await callRemoteCompaction({
+					url: "https://example.test/compact",
+					headers: new Headers(),
+					body: {},
+					model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+					fetchImpl: async () => new Response(body, { status: 400 }),
+				});
+			} catch (error) {
+				failure = error;
+			}
+			expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+		}
 	});
 
 	test("filters V1 tool history before replay", () => {

@@ -16,6 +16,12 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const MAX_REMOTE_RETRIES = 2;
 export const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
+const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?policy|safety[ _-]?policy|policy[ _-]?violation|unauthorized|forbidden|permission|api[ _-]?key|invalid[ _-]?api[ _-]?key|authentication[ _-]?error|(?:invalid|expired|bearer|refresh)[ _-]?token|cancel(?:led|lation)?|aborted)/i;
+
+export function isFailClosedCompactionError(message: string): boolean {
+	return FAIL_CLOSED_ERROR_PATTERN.test(message);
+}
+
 export type JsonObject = Record<string, unknown>;
 export type ResponseItem = JsonObject & { type?: string };
 
@@ -25,6 +31,7 @@ export interface NativeCompactionDetails {
 	strategy: "v1" | "v2" | "token-budget";
 	modelKey: string;
 	compHash?: string;
+	preservedInput?: ResponseItem[];
 	replacementHistory: ResponseItem[];
 }
 
@@ -83,6 +90,8 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 
 	const replacementHistory = value.replacementHistory.filter(isResponseItem);
 	if (replacementHistory.length !== value.replacementHistory.length) return undefined;
+	const preservedInput = Array.isArray(value.preservedInput) ? value.preservedInput.filter(isResponseItem) : undefined;
+	if (value.preservedInput !== undefined && (preservedInput === undefined || preservedInput.length !== value.preservedInput.length)) return undefined;
 	const strategy = value.strategy === undefined
 		? "v2"
 		: value.strategy === "v1"
@@ -112,6 +121,7 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 		strategy,
 		modelKey: value.modelKey,
 		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
+		...(preservedInput ? { preservedInput: preservedInput.map(cloneItem) } : {}),
 		replacementHistory: replacementHistory.map(cloneItem),
 	};
 }
@@ -438,6 +448,7 @@ export function effectiveInputForBranch(params: {
 		const tail = branch.slice(checkpoint.checkpoint.entryIndex + 1);
 		return [
 			...checkpoint.checkpoint.details.replacementHistory.map(cloneItem),
+			...(checkpoint.checkpoint.details.preservedInput ?? []).map(cloneItem),
 			...entriesToResponseItems(params.model, tail, params.tools),
 		];
 	}
@@ -507,7 +518,11 @@ export function approximateResponseItemTokens(items: ResponseItem[]): number {
 
 function truncateFunctionOutput(item: ResponseItem, maxTokens: number): ResponseItem {
 	const copy = cloneItem(item);
-	if (typeof copy.output === "string") copy.output = truncateTextPrefix(copy.output, maxTokens * 4);
+	if (imagePartCount(copy.output) > 0) {
+		copy.output = truncateTextPrefix(textOnly(copy.output), maxTokens * 4);
+	} else if (typeof copy.output === "string") {
+		copy.output = truncateTextPrefix(copy.output, maxTokens * 4);
+	}
 	return copy;
 }
 
@@ -526,6 +541,12 @@ export function trimFunctionCallHistoryToFitContextWindow(
 		const kept = Math.max(1, current - excess);
 		result[index] = truncateFunctionOutput(item, kept);
 		excess -= current - approximateTokens(result[index]!);
+	}
+	while (excess > 0) {
+		const index = result.findIndex((item) => item.type === "function_call_output" && imagePartCount(item) > 0);
+		if (index < 0) break;
+		result.splice(index, 1);
+		excess = approximateResponseItemTokens(result) - maxTokens;
 	}
 	return result;
 }
@@ -802,7 +823,7 @@ function canFallbackForStatus(status: number, body: string): boolean {
 	if (![400, 403, 404, 408, 409, 429].includes(status) && status < 500) return false;
 	if (status === 403 && !/(?:model|invalid request|not found|overloaded)/i.test(body)) return false;
 	if (status === 404 && !/(?:model|invalid request|overloaded)/i.test(body)) return false;
-	return !/(?:malformed|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|unauthorized|forbidden|permission|api key|authentication|(?:invalid|expired|bearer|refresh)[ _-]?token|cancel(?:led|lation)?|aborted)/i.test(body);
+	return !isFailClosedCompactionError(body);
 }
 
 function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
@@ -855,10 +876,14 @@ async function parseSseResponse(response: Response): Promise<{ item: ResponseIte
 		}
 		if (!isJsonObject(event)) return;
 		if (event.type === "error") {
+			const code = typeof event.code === "string" ? event.code : "";
 			if (typeof event.message !== "string" || !event.message.trim()) {
 				throw new RetryableCompactionStreamError("OpenAI Codex compaction failed.");
 			}
-			throw new NonRetryableCompactionError(event.message);
+			const error = new NonRetryableCompactionError(event.message);
+			throw code && isFailClosedCompactionError(code)
+				? markFallbackEligibility(error, false)
+				: error;
 		}
 		if (event.type === "response.failed") {
 			const response = isJsonObject(event.response) ? event.response : {};
@@ -868,7 +893,7 @@ async function parseSseResponse(response: Response): Promise<{ item: ResponseIte
 			const message = rawMessage ?? "OpenAI Codex compaction ended with response.failed.";
 			const eligible = rawMessage !== undefined && rawMessage.trim().length > 0
 				&& (code === "context_length_exceeded" || code === "invalid_prompt")
-				&& !/(?:malformed|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|safety policy|policy violation|unauthorized|forbidden|permission|api key|authentication|(?:invalid|expired|bearer|refresh)[ _-]?token|cancel(?:led|lation)?|aborted)/i.test(message);
+				&& !isFailClosedCompactionError(message);
 			throw markFallbackEligibility(new NonRetryableCompactionError(`OpenAI Codex compaction failed (${code}): ${message}`), eligible);
 		}
 		if (event.type === "response.incomplete") {

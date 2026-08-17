@@ -4,6 +4,7 @@ import { compactionHash } from "./capabilities.ts";
 import {
 	effectiveInputForBranch,
 	findNativeCheckpoint,
+	isFailClosedCompactionError,
 	fullInputForBranch,
 	piContextInputForBranch,
 	systemPromptInputForModel,
@@ -52,7 +53,7 @@ function shouldRetryWithCurrentModel(error: unknown): boolean {
 		return (error as { retryWithCurrentModel?: unknown }).retryWithCurrentModel === true;
 	}
 	const message = error instanceof Error ? error.message : String(error);
-	if (/(?:abort|cancel|auth|account|malformed|invalid compaction|misalignment_policy|cyber_policy|invalid[_ ]image|content policy|safety policy|policy violation|unauthorized|forbidden|permission|api key|(?:invalid|expired|bearer|refresh)[ _-]?token)/i.test(message)) return false;
+	if (isFailClosedCompactionError(message) || /(?:auth|account|invalid compaction)/i.test(message)) return false;
 	return /(?:\b(?:400|403|408|409|429|5\d\d)\b|invalid request|unexpected status|context window|context_length_exceeded|invalid_prompt|usage limit|server overloaded|internal server|retry limit)/i.test(message);
 }
 
@@ -84,6 +85,28 @@ function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseI
 	return textContent(currentUser.message.content) === textContent(requestUser.content)
 		? branch.filter((_entry, index) => index !== currentUserIndex)
 		: branch;
+}
+
+function checkpointPreservesCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): boolean {
+	const checkpoint = findNativeCheckpoint(branch);
+	const requestUser = requestInput?.findLast((item) => item.role === "user");
+	const preservedUser = checkpoint.status === "valid" ? checkpoint.checkpoint.details.preservedInput?.findLast((item) => item.role === "user") : undefined;
+	return Boolean(requestUser && preservedUser && textContent(preservedUser.content) === textContent(requestUser.content));
+}
+
+function preserveCurrentUser(
+	details: NativeCompactionDetails,
+	branch: SessionEntry[],
+	requestInput: ResponseItem[] | undefined,
+	compactionInput?: ResponseItem[],
+): NativeCompactionDetails {
+	const requestUser = requestInput?.findLast((item) => item.role === "user");
+	const currentUser = branch.findLast((entry) => entry.type === "message" && entry.message.role === "user");
+	if (!requestUser || !currentUser || currentUser.type !== "message") return details;
+	if (compactionInput?.some((item) => item.role === "user" && textContent(item.content) === textContent(requestUser.content))) return details;
+	return textContent(currentUser.message.content) === textContent(requestUser.content)
+		? { ...details, preservedInput: [structuredClone(requestUser)] }
+		: details;
 }
 
 function sameItem(left: ResponseItem, right: ResponseItem): boolean {
@@ -199,7 +222,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			}
 			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) continue;
 			deps.appendCheckpoint({
-				...native.details,
+				...preserveCurrentUser(native.details, branch, requestInput, input),
 				modelKey: targetModelKey,
 				compHash: compactionHash(currentModel),
 			});
@@ -245,7 +268,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						throw new Error("The session changed while Codex model-transition compaction was running.");
 					}
 					deps.appendCheckpoint({
-						...native.details,
+						...preserveCurrentUser(native.details, branch, requestInput),
 						modelKey: modelKey(model),
 						...(currentHash ? { compHash: currentHash } : {}),
 					});
@@ -427,7 +450,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 							throw new Error("The session changed while Codex automatic compaction was running.");
 						}
-						deps.appendCheckpoint(native.details);
+						deps.appendCheckpoint(preserveCurrentUser(native.details, branch, requestInput, currentHistory));
 					});
 					automaticCompactionBySession.set(sessionId, automaticCompaction);
 					try {
@@ -441,9 +464,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		}
 		const currentCheckpoint = findNativeCheckpoint(branch);
 		if (currentCheckpoint.status === "none") return undefined;
+		if (checkpointPreservesCurrentUser(branch, requestInput)) {
+			const requestUserIndex = tail.findLastIndex((item) => item.role === "user");
+			if (requestUserIndex >= 0) tail = tail.filter((_item, index) => index !== requestUserIndex);
+		}
 		return [
 			...effectiveInputForBranch({
-				branch,
+				branch: branchBeforeCurrentUser(branch, requestInput),
 				model,
 				tools: deps.getAllTools(),
 				allowCheckpointModelMismatch: true,
