@@ -110,6 +110,12 @@ function preserveCurrentUser(
 		: details;
 }
 
+function preserveRequestUser(details: NativeCompactionDetails, requestInput: ResponseItem[]): NativeCompactionDetails {
+	const requestUser = requestInput.findLast((item) => item.role === "user");
+	if (!requestUser || details.replacementHistory.some((item) => sameItem(item, requestUser))) return details;
+	return { ...details, preservedInput: [structuredClone(requestUser)] };
+}
+
 function sameItem(left: ResponseItem, right: ResponseItem): boolean {
 	return sameValue(left, right);
 }
@@ -139,7 +145,8 @@ function requestTail(
 	systemPromptInput: ResponseItem[],
 ): ResponseItem[] {
 	if (!requestInput) return [];
-	for (const prefix of prefixes.flatMap((value) => systemPromptInput.length > 0 ? [value, [...systemPromptInput, ...value]] : [value])) {
+	const candidates = prefixes.flatMap((value) => systemPromptInput.length > 0 ? [value, [...systemPromptInput, ...value]] : [value]);
+	for (const prefix of candidates) {
 		if (requestInput.length < prefix.length) continue;
 		if (prefix.every((item, index) => sameItem(item, requestInput[index]!))) {
 			return requestInput.slice(prefix.length);
@@ -153,6 +160,33 @@ function resolveModel(ctx: ExtensionContext, key: string): Model<any> | undefine
 	if (parts.length < 3) return undefined;
 	const model = ctx.modelRegistry.find(parts[0]!, parts.slice(2).join(":"));
 	return model && modelKey(model) === key ? model : undefined;
+}
+
+function pendingTransitionFromBranch(
+	branch: SessionEntry[],
+	currentModel: Model<any>,
+	ctx: ExtensionContext,
+): PendingTransition | undefined {
+	const selectedIndex = branch.findLastIndex((entry) =>
+		entry.type === "model_change" && entry.provider === currentModel.provider && entry.modelId === currentModel.id,
+	);
+	if (selectedIndex < 0) return undefined;
+	if (branch.slice(selectedIndex + 1).some((entry) => entry.type === "message" && entry.message.role === "assistant")) return undefined;
+	const previousAssistant = branch.slice(0, selectedIndex).findLast((entry) =>
+		entry.type === "message"
+			&& entry.message.role === "assistant"
+			&& typeof entry.message.provider === "string"
+			&& typeof entry.message.api === "string"
+			&& typeof entry.message.model === "string",
+	);
+	if (!previousAssistant || previousAssistant.type !== "message") return undefined;
+	const previousModel = resolveModel(ctx, modelKey({
+		provider: previousAssistant.message.provider!,
+		api: previousAssistant.message.api!,
+		id: previousAssistant.message.model!,
+	}));
+	if (!previousModel || !isOpenAICodexModel(previousModel) || !needsTransitionCompaction(previousModel, currentModel)) return undefined;
+	return { previousModel, targetModelKey: modelKey(currentModel) };
 }
 
 export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
@@ -335,6 +369,10 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const branchBefore = deps.getBranch(ctx);
 		let pending = pendingBySession.get(sessionId);
 		const checkpoint = findNativeCheckpoint(branchBefore);
+		if (!pending && checkpoint.status === "none") {
+			pending = pendingTransitionFromBranch(branchBefore, model, ctx);
+			if (pending) pendingBySession.set(sessionId, pending);
+		}
 		if (
 			pending
 			&& checkpoint.status === "valid"
@@ -382,7 +420,35 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			);
 		} catch (error) {
 			if (!pending && checkpoint.status === "none") return undefined;
-			throw error;
+			const createCheckpointFor = (selectedModel: Model<any>) => deps.withStatus(ctx, () => deps.createCheckpoint({
+				ctx,
+				model: selectedModel,
+				input: requestInput!,
+				basePayload,
+				signal: ctx.signal,
+			}));
+			let native: Awaited<ReturnType<CheckpointFactory>>;
+			try {
+				native = await createCheckpointFor(historyModel);
+			} catch (firstError) {
+				if (
+					(modelKey(model) === modelKey(historyModel) && compactionHash(model) === compactionHash(historyModel))
+					|| !shouldRetryWithCurrentModel(firstError)
+				) throw firstError;
+				try {
+					native = await createCheckpointFor(model);
+				} catch {
+					throw firstError;
+				}
+			}
+			const details = {
+				...preserveRequestUser(native.details, requestInput!),
+				modelKey: modelKey(model),
+				...(compactionHash(model) ? { compHash: compactionHash(model) } : {}),
+			};
+			deps.appendCheckpoint(details);
+			pendingBySession.delete(sessionId);
+			return [...details.replacementHistory, ...(details.preservedInput ?? [])];
 		}
 
 		const activeAutomaticCompaction = automaticCompactionBySession.get(sessionId);

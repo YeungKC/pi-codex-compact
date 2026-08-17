@@ -115,6 +115,46 @@ describe("Codex session coordinator", () => {
 		expect(compactions).toBe(0);
 	});
 
+	test("rebases a pending fork transition from the authoritative request when its inherited prefix changed", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = model("openai-codex", "current", "hash-b");
+		const branch = [{
+			id: "old-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "assistant", provider: previousModel.provider, api: previousModel.api, model: previousModel.id, content: [{ type: "text", text: "old reply" }] },
+		}, {
+			id: "selected-current-model",
+			parentId: "old-assistant",
+			timestamp: new Date().toISOString(),
+			type: "model_change",
+			provider: currentModel.provider,
+			modelId: currentModel.id,
+		}] as unknown as SessionEntry[];
+		const request = [userInput("child task")];
+		const compactedWith: Model<any>[] = [];
+		const compactedInputs: ResponseItem[][] = [];
+		const coordinator = createCoordinator(branch, async (selectedModel, _basePayload, input) => {
+			compactedWith.push(selectedModel);
+			compactedInputs.push(input!);
+			if (selectedModel === previousModel) throw new Error("400 context window");
+			return details(modelKey(selectedModel), "child");
+		});
+
+		expect(await coordinator.prepareRequest(currentModel, context([previousModel, currentModel]), request)).toEqual([
+			{ type: "compaction", encrypted_content: "child" },
+			userInput("child task"),
+		]);
+		expect(compactedWith).toEqual([previousModel, currentModel]);
+		expect(compactedInputs).toEqual([request, request]);
+		expect((branch.at(-1) as { data: NativeCompactionDetails }).data).toMatchObject({
+			modelKey: modelKey(currentModel),
+			compHash: "hash-b",
+			preservedInput: request,
+		});
+	});
+
 	test("blocks a request for the wrong model while a transition is pending", async () => {
 		const coordinator = createCoordinator();
 		const previousModel = model("openai-codex", "previous");
@@ -124,6 +164,48 @@ describe("Codex session coordinator", () => {
 		await expect(coordinator.prepareRequest(previousModel, context(), [userInput("hello")])).rejects.toThrow(
 			"pending Codex model transition targets a different model",
 		);
+	});
+
+	test("recovers a pending transition from a forked branch before its first request", async () => {
+		const oldModel = model("openai-codex", "old", "hash-a");
+		const newModel = model("openai-codex", "new", "hash-b");
+		const branch = [{
+			id: "old-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: oldModel.provider,
+				api: oldModel.api,
+				model: oldModel.id,
+				content: [{ type: "text", text: "old reply" }],
+			},
+		}, {
+			id: "selected-new-model",
+			parentId: "old-assistant",
+			timestamp: new Date().toISOString(),
+			type: "model_change",
+			provider: newModel.provider,
+			modelId: newModel.id,
+		}, {
+			id: "current-user",
+			parentId: "selected-new-model",
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "continue" }] },
+		}] as unknown as SessionEntry[];
+		const compactedWith: string[] = [];
+		const coordinator = createCoordinator(branch, async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			return details(modelKey(selectedModel), "forked");
+		});
+		const input = await coordinator.prepareRequest(newModel, context([oldModel, newModel]), [
+			{ type: "message", role: "assistant", id: "msg_pi_0", status: "completed", phase: undefined, content: [{ type: "output_text", text: "old reply", annotations: [] }] },
+			userInput("continue"),
+		]);
+		expect(compactedWith).toEqual([modelKey(oldModel)]);
+		expect(input).toEqual([{ type: "compaction", encrypted_content: "forked" }, userInput("continue")]);
 	});
 
 	test("requires provider input when replaying a native checkpoint", async () => {
