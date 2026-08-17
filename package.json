@@ -2,6 +2,7 @@
   "name": "@yeungkc/pi-codex-compact",
   "version": "0.0.4",
   "description": "Pi extension implementing Codex CLI-compatible remote V1/V2 compaction for OpenAI Codex models.",
+  "packageManager": "pnpm@11.18.0",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -24,7 +25,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "bun test"
+    "test": "vitest run"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.80.10",
@@ -53,5 +54,8 @@
     "scheduler.test.ts",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
 }

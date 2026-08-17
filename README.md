@@ -1,34 +1,44 @@
 # pi-codex-compact
 
-Pi extension implementing the observable Codex CLI remote compaction flow for `openai-codex` models.
+Pi extension for Codex remote compaction on `openai-codex` models.
 
-## Codex CLI-compatible behavior
+## Motivation
 
-The extension follows Codex CLI's observable remote-compaction behavior where Pi exposes the required lifecycle hooks:
+Long-lived coding sessions only work when compaction preserves the context that matters. Codex's model-native compaction is markedly better at this than replacing history with a local prose summary: it returns an opaque checkpoint that lets the model resume its own compressed state, including recent model-visible tool state.
 
-- Remote V2 is the default; legacy V1 is available through the explicit feature setting.
-- Model-transition compaction is deferred until the first request after model selection.
-- Opaque native checkpoints are persisted and replayed through Pi's session.
-- Automatic compaction runs before the provider request instead of aborting a completed turn.
+In practice, this lets a single Codex session continue through repeated compactions without the gradual loss of continuity common with repeatedly summarized history. Results still depend on the selected model and Codex service; this is the intended benefit, not a fidelity guarantee.
 
-Pi does not expose every Codex CLI internal seam. Token accounting, provider capability metadata, mid-turn continuation, and fresh token-budget windows therefore use documented compatibility adaptations.
+## Install
 
-## Implementation details
+Requires Node.js `>=22.19.0`, Pi `>=0.80.10`, and an `openai-codex` model.
 
-- Sends the active Responses history followed by `{ "type": "compaction_trigger" }`.
-- Uses the normal Codex Responses stream and requires exactly one `compaction` item with opaque `encrypted_content`.
-- Persists the native checkpoint in Pi's session (a real compaction entry for Pi compaction and a custom entry for model transitions).
-- Replays the checkpoint plus the active branch tail on later requests.
-- Defers Codex-to-Codex model-transition compaction until the first request after selection, using the previous model and preserving that request's new input.
-- Retains recent eligible message items, drops old tool/reasoning items, and caps retained agent messages at 10,000 tokens.
-- Uses Codex V2's 64,000-token retained-message budget and trims old function-call output before remote requests.
-- Runs automatic remote compaction in the awaited `before_provider_request` hook instead of aborting a completed turn.
-- Uses the current request's non-input parameters for compaction and retries transition compaction with the current model only for eligible model/request failures.
-- Retries transient HTTP and stream failures.
+```bash
+pi install npm:@yeungkc/pi-codex-compact
+/reload
+```
 
-For unsupported providers, Pi keeps ownership of local text summarization. For the explicit `tokenBudget` feature, the extension uses the closest available Pi compaction boundary; Pi extensions cannot create Codex's true fresh context window. The extension does not generate a local text summary and does not add a visible continuation message. Manual and overflow compactions use Pi's `session_before_compact` lifecycle hook; normal automatic compaction runs before the next provider request. If no limit is configured, the extension derives a 90% context-window limit, matching Codex's default. The built-in `openai-codex` provider is routed deterministically like Codex CLI: V2 by default, or V1 when the `remote_compaction_v2` feature is disabled.
+For a local checkout:
 
-To select the legacy V1 path explicitly:
+```bash
+pi install .
+/reload
+```
+
+## Verify
+
+Confirm that Pi registered the package:
+
+```bash
+pi list
+```
+
+Then, in an `openai-codex` session, run `/compact`. A successful remote compaction displays `✓ OpenAI compaction complete`. The checkpoint is stored in the local Pi session JSONL and is replayed on later requests.
+
+## Configuration
+
+No configuration is required. By default, the extension uses Codex remote-compaction V2 and automatically compacts retained history at 90% of the selected model's context window. The current user input is not included in this pre-request threshold check.
+
+Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`, or in a trusted project's `.pi/pi-codex-compact.json`. Pi loads the global file first; valid project settings override it. Missing or invalid fields leave the global or default value in place:
 
 ```json
 {
@@ -40,26 +50,69 @@ To select the legacy V1 path explicitly:
 }
 ```
 
-Save this as `~/.pi/agent/pi-codex-compact.json` or in a trusted project's `.pi/pi-codex-compact.json`. Runtime endpoint probing is not used.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `remoteCompactionV2` | `true` | Use Codex V2; set `false` only for the legacy V1 endpoint. |
+| `tokenBudget` | `false` | Use Pi's nearest token-budget compaction boundary. Pi cannot create Codex's true fresh token window. |
+| `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold. |
+| `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` excludes a reliable prefix baseline when Pi exposes one. |
+| `fallbackBufferTokens` | `0` | Add estimated tokens to the automatic-compaction threshold. |
 
-## Install
+The extension does not probe endpoints at runtime.
 
-From a local checkout:
+## Behavior
+
+Where Pi exposes the needed lifecycle hooks, this extension follows Codex CLI's observable remote-compaction flow:
+
+- Sends active Responses history followed by `{ "type": "compaction_trigger" }`.
+- Uses V2 by default and persists the returned opaque `encrypted_content` checkpoint.
+- Replays the checkpoint with the active Pi branch tail on later requests.
+- Defers model-transition compaction until the first request after model selection.
+- Runs automatic compaction before a provider request, not after an aborted turn.
+- Retains recent eligible messages, drops old tool/reasoning items, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
+- Retries transient HTTP and stream failures. For eligible model/request failures during a transition, it retries with the newly selected model.
+
+Unsupported providers keep Pi's normal local text summarization.
+
+## Compatibility limits
+
+Codex CLI internally owns exact `comp_hash` capability metadata, token accounting, mid-turn continuation, and fresh token-budget windows. Pi does not expose those seams to extensions.
+
+The extension therefore:
+
+- fails closed when the persisted and selected models lack comparable compaction hashes;
+- estimates history, stable system/tool prefix, images, and tool output for automatic compaction;
+- uses Pi's closest token-budget boundary rather than inventing a local text summary; and
+- treats the actual pre-provider request as authoritative when a fork has changed Pi's inherited history.
+
+These are deliberate compatibility adaptations, not server probing or local-summary fallbacks.
+
+## Update and remove
 
 ```bash
-pi install .
-/reload
+pi update npm:@yeungkc/pi-codex-compact
+pi uninstall npm:@yeungkc/pi-codex-compact
 ```
 
-After publication:
+Removing the package does not delete existing Pi session JSONL files or their native checkpoints. Remove `~/.pi/agent/pi-codex-compact.json` separately if it is no longer wanted.
+
+## Releases
+
+Changing `package.json`'s version on `main` runs the test suite, publishes the package to npm with provenance, mirrors it to GitHub Packages, and creates a GitHub Release tagged `v<version>`. Existing registry versions and releases are skipped on rerun. An existing tag without a release fails closed rather than attaching a release to an unknown commit.
+
+## Development
 
 ```bash
-pi install npm:@yeungkc/pi-codex-compact
-/reload
+pnpm install --frozen-lockfile
+pnpm test
 ```
 
-## Known boundary
+## Troubleshooting and contributions
 
-Codex CLI owns exact provider capability metadata (`comp_hash`), token accounting, mid-turn continuation, and fresh token-budget context windows internally. Pi extensions do not expose those seams. This extension transitions only when both persisted/current compaction hashes exist and differ; missing hashes fail closed and do not trigger a guessed transition. It estimates history plus the stable system/tool prefix with a 90% default, including best-effort image/tool weights, and uses Pi's closest token-budget boundary. These are explicit compatibility limits, not server probing or local-summary fallbacks.
+If this extension behaves unexpectedly in your Pi or Codex setup, fork this repository, install the fork locally with `pi install .`, and reproduce or diagnose the behavior in your own branch. Pull requests with a focused reproduction and tests are very welcome.
 
-Checkpoints are model-specific and are stored in the local Pi session JSONL.
+Do not include credentials or session JSONL content in an issue or pull request.
+
+## License
+
+[MIT](LICENSE)
