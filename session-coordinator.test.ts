@@ -618,6 +618,22 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(0);
 	});
 
+	test("fails closed when a cross-model checkpoint has no hashes", async () => {
+		const oldModel = modelWithoutHash("openai-codex", "old");
+		const newModel = modelWithoutHash("openai-codex", "new");
+		const branch = [checkpointEntry(details(modelKey(oldModel)))];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details("unexpected");
+		});
+		await expect(coordinator.prepareRequest(newModel, context([oldModel, newModel]), [
+			...details(modelKey(oldModel)).replacementHistory,
+			userInput("hello"),
+		])).rejects.toThrow("requires model-transition compaction first");
+		expect(calls).toBe(0);
+	});
+
 	test("falls back to the current model when the checkpoint model is unavailable", async () => {
 		let createdFor: string | undefined;
 		const oldModel = model("openai-codex", "retired", "hash-old");
@@ -633,16 +649,25 @@ describe("Codex session coordinator", () => {
 
 	test("uses current-model recovery fallback through prepareRequest", async () => {
 		let createdFor: string | undefined;
+		let compactInput: ResponseItem[] | undefined;
 		const oldModel = model("openai-codex", "retired", "hash-old");
 		const newModel = model("openai-codex", "current", "hash-new");
-		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "hash-old" })];
-		const coordinator = createCoordinator(branch, async (selectedModel) => {
+		const branch = [checkpointEntry({ ...details(modelKey(oldModel)), compHash: "hash-old" }), {
+			id: "current-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "hello" }] },
+		} as unknown as SessionEntry];
+		const coordinator = createCoordinator(branch, async (selectedModel, _basePayload, input) => {
 			createdFor = modelKey(selectedModel);
+			compactInput = input;
 			return details(modelKey(selectedModel));
 		});
 		const input = [...details(modelKey(oldModel)).replacementHistory, userInput("hello")];
 		await coordinator.prepareRequest(newModel, context([newModel]), input);
 		expect(createdFor).toBe(modelKey(newModel));
+		expect(compactInput).toEqual(details(modelKey(oldModel)).replacementHistory);
 	});
 
 	test("recovers a pending transition after reload with the checkpoint model", async () => {

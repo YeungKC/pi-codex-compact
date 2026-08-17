@@ -74,7 +74,7 @@ function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseI
 	const currentUser = currentUserIndex >= 0 ? branch[currentUserIndex] : undefined;
 	if (!requestUser || !currentUser || currentUser.type !== "message") return branch;
 	return textContent(currentUser.message.content) === textContent(requestUser.content)
-		? branch.slice(0, currentUserIndex)
+		? branch.filter((_entry, index) => index !== currentUserIndex)
 		: branch;
 }
 
@@ -199,7 +199,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		throw new Error("The session changed while Codex model-transition compaction was running.");
 	};
 
-	const recoverCurrentModel = async (model: Model<any>, ctx: ExtensionContext, basePayload?: JsonObject): Promise<void> => {
+	const recoverCurrentModel = async (model: Model<any>, ctx: ExtensionContext, basePayload?: JsonObject, requestInput?: ResponseItem[]): Promise<void> => {
 		if (!isOpenAICodexModel(model)) return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const checkpoint = findNativeCheckpoint(deps.getBranch(ctx));
@@ -215,7 +215,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		if (previousHash === undefined || currentHash === undefined || previousHash === currentHash) return;
 		const startGeneration = generation;
 		const transition = previousModel
-			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration, undefined)
+			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration, requestInput)
 			: (async () => {
 					const branch = deps.getBranch(ctx);
 					const leafId = conversationLeafId(branch);
@@ -223,7 +223,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						ctx,
 						model,
 						input: effectiveInputForBranch({
-							branch,
+							branch: branchBeforeCurrentUser(branch, requestInput),
 							model,
 							tools: deps.getAllTools(),
 							allowCheckpointModelMismatch: true,
@@ -366,7 +366,19 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			}
 		}
 
-		await recoverCurrentModel(model, ctx, basePayload);
+		await recoverCurrentModel(model, ctx, basePayload, requestInput);
+		const recoveredCheckpoint = findNativeCheckpoint(deps.getBranch(ctx));
+		if (recoveredCheckpoint.status === "valid" && recoveredCheckpoint.checkpoint.details.strategy !== "token-budget") {
+			const checkpointDetails = recoveredCheckpoint.checkpoint.details;
+			if (checkpointDetails.modelKey !== modelKey(model)) {
+				const checkpointModel = resolveModel(ctx, checkpointDetails.modelKey);
+				const checkpointHash = checkpointDetails.compHash ?? (checkpointModel ? compactionHash(checkpointModel) : undefined);
+				const currentHash = compactionHash(model);
+				if (checkpointHash === undefined || currentHash === undefined || checkpointHash !== currentHash) {
+					throw new Error("The latest Codex compaction checkpoint requires model-transition compaction first.");
+				}
+			}
+		}
 		let branch = deps.getBranch(ctx);
 		{
 			const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
