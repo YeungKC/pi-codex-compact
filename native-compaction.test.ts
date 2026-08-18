@@ -197,8 +197,8 @@ describe("Codex compaction history", () => {
 	});
 
 	test.each([
-		["content_filter", false, 1],
-		["new_protocol_reason", false, 1],
+		["content_filter", false, 3],
+		["new_protocol_reason", false, 3],
 		["server_error", false, 3],
 	] as const)("handles incomplete reason %s", async (reason, expectedFallback, expectedCalls) => {
 		vi.useFakeTimers();
@@ -267,63 +267,86 @@ describe("Codex compaction history", () => {
 		{
 			name: "unknown HTTP code",
 			response: () => new Response(JSON.stringify({ error: { code: "future_protocol_code" } }), { status: 500 }),
-			expectedFallback: false,
+			expectedFallback: true,
+			expectedCalls: 3,
 		},
 		{
 			name: "canceled HTTP error",
 			response: () => new Response(JSON.stringify({ error: { code: "canceled" } }), { status: 400 }),
 			expectedFallback: false,
+			expectedCalls: 1,
 		},
 		{
 			name: "message-only HTTP usage limit",
 			response: () => new Response(JSON.stringify({ error: { message: "usage limit reached" } }), { status: 429 }),
 			expectedFallback: true,
+			expectedCalls: 1,
 		},
 		{
 			name: "quota response.failed error",
 			response: () => sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota exceeded\"}}}\n\ndata: [DONE]\n\n"),
 			expectedFallback: false,
+			expectedCalls: 1,
 		},
 		{
 			name: "policy response.failed error",
 			response: () => sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\",\"message\":\"policy violation\"}}}\n\ndata: [DONE]\n\n"),
 			expectedFallback: false,
+			expectedCalls: 1,
 		},
 		{
 			name: "machine-readable SSE error",
 			response: () => sse("data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"invalid request\"}\n\ndata: [DONE]\n\n"),
 			expectedFallback: false,
+			expectedCalls: 1,
+		},
+		{
+			name: "malformed SSE data",
+			response: () => sse("data: {bad\n\n"),
+			expectedFallback: false,
+			expectedCalls: 3,
 		},
 		{
 			name: "non-object SSE data",
 			response: () => sse("data: null\n\n"),
 			expectedFallback: false,
+			expectedCalls: 3,
 		},
 		{
 			name: "unknown SSE message-only error",
 			response: () => sse('data: {"type":"future.error","message":"unknown"}\n\n'),
 			expectedFallback: false,
+			expectedCalls: 3,
 		},
 		{
 			name: "unknown SSE error event",
 			response: () => sse('data: {"type":"future.error","code":"future_protocol_code","message":"unknown"}\n\n'),
 			expectedFallback: false,
+			expectedCalls: 3,
 		},
 		{
 			name: "unknown SSE code",
 			response: () => sse('data: {"type":"error","code":"new_protocol_code","message":"invalid request"}\n\n'),
 			expectedFallback: false,
+			expectedCalls: 3,
 		},
-	])("keeps $name fail-closed", async ({ response, expectedFallback }) => {
-		let calls = 0;
-		const failure = await callRemoteCompaction(remoteRequest({
-			fetchImpl: async () => {
-				calls++;
-				return response();
-			},
-		})).catch(error => error);
-		expect(failure).toMatchObject({ retryWithCurrentModel: expectedFallback });
-		expect(calls).toBe(1);
+	])("handles $name", async ({ response, expectedFallback, expectedCalls }) => {
+		vi.useFakeTimers();
+		try {
+			let calls = 0;
+			const promise = callRemoteCompaction(remoteRequest({
+				fetchImpl: async () => {
+					calls++;
+					return response();
+				},
+			}));
+			const failure = promise.catch(error => error);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ retryWithCurrentModel: expectedFallback });
+			expect(calls).toBe(expectedCalls);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	test("preserves nested SSE error details", async () => {
@@ -620,6 +643,12 @@ describe("Codex compaction history", () => {
 		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image", image_url: `data:image/png;base64,${"x".repeat(40_000)}` }] }])).toBeLessThan(2_000);
 		expect(retainRecentMessages([{ type: "message", role: "user", content: [{ type: "input_image" }] }], 1_199)).toEqual([
 			{ type: "message", role: "user", content: [{ type: "input_image" }] },
+		]);
+		expect(retainRecentMessages([
+			{ type: "message", role: "user", content: [{ type: "input_image", image_url: "old" }] },
+			{ type: "message", role: "user", content: [{ type: "input_image", image_url: "new" }] },
+		], 1)).toEqual([
+			{ type: "message", role: "user", content: [{ type: "input_image", image_url: "new" }] },
 		]);
 	});
 

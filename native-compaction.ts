@@ -825,12 +825,12 @@ function isDescendantProgressAgentMessage(item: ResponseItem): boolean {
 }
 
 function retainedMessageTokens(item: ResponseItem): number {
-	if (typeof item.content === "string") return Math.ceil(item.content.length / 4);
-	if (!Array.isArray(item.content)) return 0;
-	return item.content.reduce((total, part) => {
+	if (typeof item.content === "string") return Math.max(1, Math.ceil(item.content.length / 4));
+	if (!Array.isArray(item.content)) return 1;
+	return Math.max(1, item.content.reduce((total, part) => {
 		if (!isJsonObject(part) || (part.type !== "input_text" && part.type !== "output_text") || typeof part.text !== "string") return total;
 		return total + Math.ceil(part.text.length / 4);
-	}, 0);
+	}, 0));
 }
 
 function retainedItemTokens(item: ResponseItem): number {
@@ -1062,8 +1062,8 @@ function classifySseCompactionError(code: string, message: string, includeCode =
 	if (SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode) && !RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)) {
 		return markFallbackEligibility(withRetryDelay(new NonRetryableCompactionError(detail), message), true);
 	}
-	if (!isKnownCompactionErrorCode(normalizedCode)) {
-		return markFallbackEligibility(withRetryDelay(new NonRetryableCompactionError(detail), message), false);
+	if (!normalizedCode || !isKnownCompactionErrorCode(normalizedCode)) {
+		return markFallbackEligibility(withRetryDelay(new RetryableCompactionStreamError(detail), message), false);
 	}
 	if (
 		RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)
@@ -1101,9 +1101,13 @@ function classifyHttpCompactionError(
 		|| RETRYABLE_COMPACTION_ERROR_PATTERN.test(body);
 	const malformedClientError = status === 400 && !code && !knownMessage;
 	const unknownCode = Boolean(code) && !isKnownCompactionErrorCode(code) && !isFailClosedCompactionError(machineDetails);
-	const fallback = malformedClientError || unknownCode ? false : canFallbackForStatus(status, body);
+	const fallback = malformedClientError
+		? false
+		: unknownCode
+			? !isFailClosedCompactionError(machineDetails)
+			: canFallbackForStatus(status, body);
 	const terminal = malformedClientError
-		|| unknownCode
+		|| (unknownCode && !isRetryableStatus(status))
 		|| isFailClosedCompactionError(machineDetails)
 		|| NON_RETRYABLE_FALLBACK_ERROR_CODES.has(code)
 		|| USAGE_LIMIT_MESSAGE_PATTERN.test(body);
@@ -1211,14 +1215,9 @@ async function parseSseResponse(
 		try {
 			event = JSON.parse(data);
 		} catch {
-			throw new NonRetryableCompactionError("OpenAI Codex returned malformed compaction SSE data.");
+			return;
 		}
-		if (!isJsonObject(event)) {
-			throw markFallbackEligibility(
-				new NonRetryableCompactionError("OpenAI Codex returned malformed compaction SSE event."),
-				false,
-			);
-		}
+		if (!isJsonObject(event)) return;
 		if (event.type === "error") {
 			const nested = isJsonObject(event.error) ? event.error : {};
 			const code = typeof event.code === "string"
@@ -1259,11 +1258,11 @@ async function parseSseResponse(
 				: isJsonObject(response.incomplete_details)
 					? response.incomplete_details
 					: {};
-			const reason = typeof details.reason === "string" ? details.reason : "";
+			const reason = typeof details.reason === "string" ? details.reason : "unknown";
 			const message = typeof details.message === "string" && details.message.trim()
 				? details.message
-				: "OpenAI Codex compaction ended with response.incomplete.";
-			throw classifySseCompactionError(reason, message, Boolean(reason));
+				: `OpenAI Codex compaction ended with response.incomplete (${reason}).`;
+			throw markFallbackEligibility(withRetryDelay(new RetryableCompactionStreamError(message), message), false);
 		}
 		if (event.type !== "response.output_item.done" && (typeof event.code === "string" || typeof event.message === "string" || isJsonObject(event.error))) {
 			const nested = isJsonObject(event.error) ? event.error : {};
