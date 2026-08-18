@@ -84,12 +84,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_start", () => {
-		coordinator.clear();
-	});
-	pi.on("session_shutdown", () => {
-		coordinator.clear();
-	});
+	pi.on("session_start", coordinator.clear);
+	pi.on("session_shutdown", coordinator.clear);
 	pi.on("model_select", async (event, ctx) => {
 		await coordinator.selectModel(event, ctx);
 	});
@@ -120,9 +116,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				stripInputFromPayload(event.payload),
 			);
 			if (!input) return undefined;
-			const payload: JsonObject = { ...event.payload, input };
-			delete payload.messages;
-			delete payload.previous_response_id;
+			const payload = stripInputFromPayload(event.payload);
+			payload.input = input;
 			return payload;
 		} catch (error) {
 			ctx.abort();
