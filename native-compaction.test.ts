@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 type RemoteRequest = Parameters<typeof callRemoteCompaction>[0];
 const remoteModel = { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never;
@@ -126,15 +126,24 @@ describe("Codex compaction history", () => {
 			name: "missing-model HTTP 404",
 			response: () => new Response(JSON.stringify({ error: { code: "model_not_found" } }), { status: 404 }),
 			expectedFallback: true,
+			expectedCalls: 1,
 		},
 		{
 			name: "code-only context failure",
 			response: () => sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\"}}}\n\ndata: [DONE]\n\n"),
 			expectedFallback: true,
+			expectedCalls: 1,
 		},
-	])("allows $name to fall back", async ({ response, expectedFallback }) => {
-		const failure = await callRemoteCompaction(remoteRequest({ fetchImpl: async () => response() })).catch(error => error);
+	])("allows $name to fall back", async ({ response, expectedFallback, expectedCalls }) => {
+		let calls = 0;
+		const failure = await callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return response();
+			},
+		})).catch(error => error);
 		expect(failure).toMatchObject({ retryWithCurrentModel: expectedFallback });
+		expect(calls).toBe(expectedCalls);
 	});
 
 	test("retries transient response.failed errors and preserves details", async () => {
@@ -360,18 +369,6 @@ describe("Codex compaction history", () => {
 		expect(tokens).toBeGreaterThan(1);
 	});
 
-	test("does not retry a legacy missing-model HTTP 404", async () => {
-		let calls = 0;
-		const failure = await captureFailure(callLegacyRemoteCompaction(remoteRequest({
-			fetchImpl: async () => {
-				calls++;
-				return new Response(JSON.stringify({ error: { code: "model_not_found" } }), { status: 404 });
-			},
-		})));
-		expect(calls).toBe(1);
-		expect(failure).toMatchObject({ retryWithCurrentModel: true });
-	});
-
 	test("keeps an unstructured HTTP 400 fail-closed", async () => {
 		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
 			fetchImpl: async () => new Response("bad request details", { status: 400 }),
@@ -382,13 +379,6 @@ describe("Codex compaction history", () => {
 	test("keeps generic HTTP 403 out of model fallback", async () => {
 		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
 			fetchImpl: async () => new Response("", { status: 403 }),
-		})));
-		expect(failure).toMatchObject({ retryWithCurrentModel: false });
-	});
-
-	test("keeps malformed HTTP 400 out of model fallback", async () => {
-		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
-			fetchImpl: async () => new Response("malformed request", { status: 400 }),
 		})));
 		expect(failure).toMatchObject({ retryWithCurrentModel: false });
 	});

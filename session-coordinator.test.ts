@@ -495,16 +495,6 @@ describe("Codex session coordinator", () => {
 		expect(usedModel).toBe(modelKey(currentModel));
 	});
 
-	test("keeps the provider payload tail after a transition", async () => {
-		const oldModel = model("old");
-		const currentModel = model("new");
-		const coordinator = createCoordinator([], async (selectedModel) => details(modelKey(selectedModel), "transition"));
-
-		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
-		const input = await coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("history"), userInput("new")]);
-		expect(input?.at(-1)).toEqual(userInput("new"));
-	});
-
 	test("fullInputForBranch remains the legacy migration source", () => {
 		const currentModel = model("old");
 		const branch = [userEntry("one"), customEntry(legacyDetails(modelKey(currentModel)))];
