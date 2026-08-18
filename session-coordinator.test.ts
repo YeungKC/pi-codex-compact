@@ -89,22 +89,6 @@ function userInput(text: string): ResponseItem {
 	return { role: "user", content: [{ type: "input_text", text }] };
 }
 
-function assistantEntry(selectedModel: Model<any>, id = "assistant"): SessionEntry {
-	return {
-		id,
-		parentId: null,
-		timestamp: new Date().toISOString(),
-		type: "message",
-		message: {
-			role: "assistant",
-			provider: selectedModel.provider,
-			api: selectedModel.api,
-			model: selectedModel.id,
-			content: [{ type: "text", text: "answer" }],
-		},
-	} as unknown as SessionEntry;
-}
-
 function createCoordinator(
 	branch: SessionEntry[] = [],
 	createCheckpoint?: (selectedModel: Model<any>, input: ResponseItem[], basePayload?: Record<string, unknown>) => Promise<NativeCompactionDetails>,
@@ -157,7 +141,19 @@ describe("Codex session coordinator", () => {
 	test("recovers a model transition when a resumed session has no model-change entry", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
-		const branch = [assistantEntry(oldModel)];
+		const branch = [{
+			id: "assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: oldModel.provider,
+				api: oldModel.api,
+				model: oldModel.id,
+				content: [{ type: "text", text: "answer" }],
+			},
+		} as unknown as SessionEntry];
 		const compactedWith: string[] = [];
 		const coordinator = createCoordinator(branch, async (selectedModel) => {
 			compactedWith.push(modelKey(selectedModel));
