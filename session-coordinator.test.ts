@@ -514,6 +514,29 @@ describe("Codex session coordinator", () => {
 		]);
 	});
 
+	test("keeps a duplicate user after omitted pre-checkpoint history", async () => {
+		const currentModel = model("old");
+		const branch = [
+			userEntry("old"),
+			userEntry("same"),
+			customEntry({
+				...details(modelKey(currentModel)),
+				preservedInput: [userInput("same")],
+			}),
+		];
+		const coordinator = createCoordinator(branch);
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+			userInput("same"),
+		])).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+			userInput("same"),
+		]);
+	});
+
 	test("keeps a new same-text user after a checkpoint preserves the prior turn", async () => {
 		const currentModel = model("old");
 		const oldUser = { type: "message", id: "old-turn", role: "user", content: [{ type: "input_text", text: "same" }] };
@@ -587,6 +610,57 @@ describe("Codex session coordinator", () => {
 		const input = await coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("history"), userInput("new")]);
 		expect(compactedInput).toEqual([userInput("history")]);
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "automatic" }, userInput("new")]);
+	});
+
+	test("preserves a duplicate current user during automatic compaction", async () => {
+		const currentModel = model("old");
+		const branch = [userEntry("same", "old-entry")];
+		const oldUser = { type: "message", id: "old-turn", role: "user", content: [{ type: "input_text", text: "same" }] };
+		const coordinator = createCoordinator(
+			branch,
+			async (_selectedModel, input) => {
+				expect(input).toEqual([userInput("same")]);
+				return {
+					...details(modelKey(currentModel), "automatic"),
+					replacementHistory: [oldUser, { type: "compaction", encrypted_content: "automatic" }],
+				};
+			},
+			() => true,
+		);
+
+		const input = await coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("same"), userInput("same")]);
+		expect(input?.filter((item) => item.role === "user")).toEqual([oldUser, userInput("same")]);
+	});
+
+	test("does not duplicate a user across transition and automatic compaction", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const branch = [userEntry("current")];
+		let calls = 0;
+		const coordinator = createCoordinator(
+			branch,
+			async (selectedModel, input) => {
+				calls++;
+				if (calls === 1) {
+					expect(selectedModel).toBe(oldModel);
+					expect(input).toEqual([]);
+					return details(modelKey(oldModel), "transition");
+				}
+				expect(selectedModel).toBe(currentModel);
+				expect(input).toEqual([{ type: "compaction", encrypted_content: "transition" }, userInput("current")]);
+				return {
+					...details(modelKey(currentModel), "automatic"),
+					replacementHistory: [userInput("current"), { type: "compaction", encrypted_content: "automatic" }],
+				};
+			},
+			() => true,
+		);
+
+		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
+		const input = await coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("current")]);
+
+		expect(calls).toBe(2);
+		expect(input?.filter((item) => item.role === "user")).toEqual([userInput("current")]);
 	});
 
 	test("uses the current model for a persisted known hash when the old model is unavailable", async () => {

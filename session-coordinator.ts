@@ -125,7 +125,7 @@ function requestInputWithoutFailedRequest(
 function hasBranchTailAfterCheckpoint(branch: SessionEntry[]): boolean {
 	const checkpoint = findNativeCheckpoint(branch);
 	return checkpoint.status !== "valid"
-		|| branch.slice(checkpoint.checkpoint.entryIndex + 1).some((entry) => entry.type === "message");
+		|| branch.slice(checkpoint.checkpoint.entryIndex + 1).some(isContextEntry);
 }
 
 function textContent(value: unknown): string {
@@ -148,12 +148,21 @@ function messageContent(entry: Extract<SessionEntry, { type: "message" }>): unkn
 	return (entry.message as unknown as JsonObject).content;
 }
 
+function isContextEntry(entry: SessionEntry): boolean {
+	return entry.type === "message" || entry.type === "custom_message";
+}
+
 function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): SessionEntry[] {
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
+	const branchUserCount = branch.filter((entry) =>
+		(entry.type === "message" && entry.message.role === "user") || entry.type === "custom_message",
+	).length;
+	const requestUserCount = requestInput?.filter((item) => item.role === "user").length ?? 0;
+	if (requestUserCount > branchUserCount) return branch;
 	const currentUserIndex = branch.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user");
 	const currentUser = currentUserIndex >= 0 ? branch[currentUserIndex] : undefined;
 	if (!requestUser || !currentUser || currentUser.type !== "message") return branch;
-	if (branch.slice(currentUserIndex + 1).some((entry) => entry.type === "message")) return branch;
+	if (branch.slice(currentUserIndex + 1).some(isContextEntry)) return branch;
 	return textContent(messageContent(currentUser)) === textContent(requestUser.content)
 		? branch.filter((_entry, index) => index !== currentUserIndex)
 		: branch;
@@ -161,23 +170,39 @@ function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseI
 
 function checkpointPreservedCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): ResponseItem | undefined {
 	const checkpoint = findNativeCheckpoint(branch);
-	if (checkpoint.status !== "valid" || branch.slice(checkpoint.checkpoint.entryIndex + 1).some((entry) => entry.type === "message")) return undefined;
+	if (checkpoint.status !== "valid" || branch.slice(checkpoint.checkpoint.entryIndex + 1).some(isContextEntry)) return undefined;
+	const checkpointUsers = [
+		...checkpoint.checkpoint.details.replacementHistory,
+		...(checkpoint.checkpoint.details.preservedInput ?? []),
+	].filter((item) => item.role === "user");
+	const requestUserCount = requestInput?.filter((item) => item.role === "user").length ?? 0;
+	if (requestUserCount > checkpointUsers.length) return undefined;
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
-	const preservedUser = checkpoint.checkpoint.details.preservedInput?.findLast((item) => item.role === "user");
-	return requestUser && preservedUser && sameValue(preservedUser.content, requestUser.content) ? preservedUser : undefined;
+	const checkpointUser = checkpointUsers.findLast((item) => item.role === "user");
+	return requestUser && checkpointUser && sameValue(checkpointUser.content, requestUser.content) ? checkpointUser : undefined;
+}
+
+function appendPreservedUser(details: NativeCompactionDetails, requestUser: ResponseItem): NativeCompactionDetails {
+	return {
+		...details,
+		preservedInput: [...(details.preservedInput ?? []), structuredClone(requestUser)],
+	};
 }
 
 function preserveCurrentUser(
 	details: NativeCompactionDetails,
 	branch: SessionEntry[],
 	requestInput: ResponseItem[] | undefined,
+	alreadyPreserved = false,
 ): NativeCompactionDetails {
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const currentUser = branch.findLast((entry) => entry.type === "message" && entry.message.role === "user");
-	if (!requestUser || !currentUser || currentUser.type !== "message") return details;
+	if (!requestUser || !currentUser || currentUser.type !== "message" || alreadyPreserved) return details;
+	const compactedBranch = branchBeforeCurrentUser(branch, requestInput);
+	if (compactedBranch.length < branch.length) return appendPreservedUser(details, requestUser);
 	if (details.replacementHistory.some((item) => item.role === "user" && sameValue(item.content, requestUser.content))) return details;
 	return textContent(messageContent(currentUser)) === textContent(requestUser.content)
-		? { ...details, preservedInput: [structuredClone(requestUser)] }
+		? appendPreservedUser(details, requestUser)
 		: details;
 }
 
@@ -190,10 +215,14 @@ function rebindCheckpoint(details: NativeCompactionDetails, modelKeyValue: strin
 	};
 }
 
+function withoutLastUser(items: ResponseItem[]): ResponseItem[] {
+	const lastUserIndex = items.findLastIndex((item) => item.role === "user");
+	return lastUserIndex < 0 ? items : items.filter((_item, index) => index !== lastUserIndex);
+}
+
 function preserveRequestUser(details: NativeCompactionDetails, requestInput: ResponseItem[]): NativeCompactionDetails {
 	const requestUser = requestInput.findLast((item) => item.role === "user");
-	if (!requestUser || details.replacementHistory.some((item) => sameValue(item, requestUser))) return details;
-	return { ...details, preservedInput: [structuredClone(requestUser)] };
+	return requestUser ? appendPreservedUser(details, requestUser) : details;
 }
 
 function ensureNotAborted(signal?: AbortSignal): void {
@@ -214,6 +243,13 @@ function sameValue(left: unknown, right: unknown): boolean {
 	const rightKeys = Object.keys(right);
 	return leftKeys.length === rightKeys.length
 		&& leftKeys.every((key) => Object.hasOwn(right, key) && sameValue(left[key], right[key]));
+}
+
+function sameUserOccurrence(left: ResponseItem, right: ResponseItem): boolean {
+	const leftId = typeof left.id === "string" ? left.id : undefined;
+	const rightId = typeof right.id === "string" ? right.id : undefined;
+	if (leftId !== undefined || rightId !== undefined) return leftId !== undefined && leftId === rightId;
+	return sameValue(left.content, right.content);
 }
 
 function requestTail(
@@ -671,10 +707,11 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				return [...migrated.replacementHistory, ...migratedTail];
 			}
 			if (!pending && checkpoint.status === "none") return undefined;
+			const compactionInput = withoutLastUser(requestInput!);
 			const createCheckpointFor = (selectedModel: Model<any>) => deps.createCheckpoint({
 				ctx,
 				model: selectedModel,
-				input: requestInput!,
+				input: compactionInput,
 				basePayload,
 				signal: ctx.signal,
 			});
@@ -786,7 +823,12 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 							throw new Error("The session changed while Codex automatic compaction was running.");
 						}
-						deps.appendCheckpoint(preserveCurrentUser(native.details, branch, requestInput));
+						deps.appendCheckpoint(preserveCurrentUser(
+							native.details,
+							branch,
+							requestInput,
+							checkpointPreservedCurrentUser(branch, requestInput) !== undefined,
+						));
 					});
 					automaticCompactionBySession.set(sessionId, automaticCompaction);
 					try {
@@ -801,17 +843,9 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const currentCheckpoint = findNativeCheckpoint(branch);
 		if (currentCheckpoint.status === "none") return undefined;
 		const preservedUser = checkpointPreservedCurrentUser(branch, requestInput);
-		const currentUserIndex = requestInput?.findLastIndex((item) => item.role === "user") ?? -1;
-		const preservedUserAlreadyInRequest = preservedUser !== undefined
-			&& currentUserIndex > 0
-			&& requestInput?.some((item, index) =>
-				index < currentUserIndex
-				&& item.role === "user"
-				&& sameValue(item.content, preservedUser.content),
-			);
-		if (preservedUser && !preservedUserAlreadyInRequest) {
+		if (preservedUser) {
 			const preservedUserIndex = tail.findLastIndex((item) =>
-				item.role === "user" && sameValue(item.content, preservedUser.content),
+				item.role === "user" && sameUserOccurrence(item, preservedUser),
 			);
 			if (preservedUserIndex >= 0) tail = tail.filter((_item, index) => index !== preservedUserIndex);
 		}
