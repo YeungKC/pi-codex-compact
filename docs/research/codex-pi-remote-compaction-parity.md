@@ -88,7 +88,7 @@ The extension now supports `debug: "off" | "errors" | "verbose"`:
 - `errors`: record retries and terminal failures.
 - `verbose`: also record threshold decisions, sanitized endpoint/attempt data, HTTP status, SSE event types, input item counts, and approximate token budgets.
 
-Debug records do not contain request input, tool payloads, authorization, URLs with credentials/query data, raw HTTP/SSE error bodies, or opaque checkpoint content. The repository's trusted local `.pi/pi-codex-compact.json` selects `"verbose"` for local diagnosis. Custom debug entries are session metadata and do not enter LLM context.
+Debug records do not contain request input, tool payloads, authorization, URLs with credentials/query data, raw HTTP/SSE error bodies, or opaque checkpoint content. Custom debug entries are session metadata and do not enter LLM context.
 
 ## Remaining non-parity areas
 

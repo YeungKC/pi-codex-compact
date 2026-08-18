@@ -56,7 +56,7 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`, or in a t
 | `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` excludes a reliable prefix baseline when Pi exposes one. |
 | `debug` | `"off"` | Persist sanitized compaction diagnostics: `"errors"` records retries/failures; `"verbose"` also records thresholds, requests, responses, and SSE event types. |
 
-The extension does not probe endpoints at runtime. This repository includes `.pi/pi-codex-compact.json` with `"debug": "verbose"` for detailed local development diagnostics. Debug entries never include request input, authorization, tool payloads, or opaque checkpoint content.
+The extension does not probe endpoints at runtime. Debug entries never include request input, authorization, tool payloads, or opaque checkpoint content.
 
 ## Behavior
 
