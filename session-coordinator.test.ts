@@ -300,6 +300,22 @@ describe("Codex session coordinator", () => {
 		]);
 	});
 
+	test("does not duplicate history after a missing transformed item", async () => {
+		const currentModel = model("old");
+		const branch = [userEntry("a", "a"), userEntry("b", "b"), userEntry("c", "c"), customEntry(legacyDetails(modelKey(currentModel)))];
+		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
+			expect(input).toEqual([userInput("a"), userInput("b"), userInput("c")]);
+			return details(modelKey(currentModel), "migrated");
+		});
+		const request = [userInput("a"), userInput("inserted"), userInput("c"), userInput("new")];
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "migrated" },
+			userInput("inserted"),
+			userInput("new"),
+		]);
+	});
+
 	test("uses the legacy checkpoint model before falling back to the current model", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");

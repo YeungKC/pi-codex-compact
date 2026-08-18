@@ -192,7 +192,7 @@ function unmatchedRequestItems(requestInput: ResponseItem[], histories: Response
 		const matches: number[] = [];
 		for (const historyItem of history) {
 			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && sameItem(item, historyItem));
-			if (nextIndex < 0) break;
+			if (nextIndex < 0) continue;
 			requestIndex = nextIndex + 1;
 			matches.push(nextIndex);
 		}
