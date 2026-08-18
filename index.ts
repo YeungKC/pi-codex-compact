@@ -39,17 +39,25 @@ function setFeatureHeader(headers: Record<string, string | null>, includeRemoteC
 }
 
 export default function codexCompactionExtension(pi: ExtensionAPI): void {
+	const basePayloadBySession = new Map<string, JsonObject>();
+	const turnStateBySession = new Map<string, string>();
+	const rememberTurnState = (sessionId: string, state: string): void => {
+		if (!turnStateBySession.has(sessionId)) turnStateBySession.set(sessionId, state);
+	};
 
 	const coordinator = createSessionCoordinator({
 		getBranch: (ctx) => ctx.sessionManager.getBranch() as SessionEntry[],
 		getAllTools: () => pi.getAllTools(),
 		createCheckpoint: ({ ctx, model, input, basePayload, signal }) => {
+			const sessionId = ctx.sessionManager.getSessionId();
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			return createNativeCheckpoint({
 				ctx,
 				model,
 				input,
-				basePayload,
+				basePayload: basePayload ?? basePayloadBySession.get(sessionId),
+				turnState: turnStateBySession.get(sessionId),
+				onTurnState: (state) => rememberTurnState(sessionId, state),
 				signal,
 				config,
 				allTools: pi.getAllTools(),
@@ -86,8 +94,18 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_start", coordinator.clear);
-	pi.on("session_shutdown", coordinator.clear);
+	const clear = () => {
+		coordinator.clear();
+		basePayloadBySession.clear();
+		turnStateBySession.clear();
+	};
+	pi.on("session_start", clear);
+	pi.on("session_shutdown", clear);
+	const clearTurnState = (_event: unknown, ctx: { sessionManager: { getSessionId(): string } }) => {
+		turnStateBySession.delete(ctx.sessionManager.getSessionId());
+	};
+	pi.on("turn_start", clearTurnState);
+	pi.on("turn_end", clearTurnState);
 	pi.on("model_select", async (event, ctx) => {
 		await coordinator.selectModel(event, ctx);
 	});
@@ -95,7 +113,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("context", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
 		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
-		if (checkpoint.status !== "valid") return undefined;
+		if (checkpoint.status !== "valid" && checkpoint.status !== "legacy") return undefined;
 		return {
 			messages: event.messages.filter((message) => message.role !== "compactionSummary"),
 		};
@@ -104,18 +122,28 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return;
 		setFeatureHeader(event.headers, loadConfig(ctx.cwd, ctx.isProjectTrusted()).remoteCompactionV2);
+		const turnState = turnStateBySession.get(ctx.sessionManager.getSessionId());
+		if (turnState) event.headers["x-codex-turn-state"] = turnState;
+	});
+
+	pi.on("after_provider_response", (event, ctx) => {
+		if (!isOpenAICodexModel(ctx.model)) return;
+		const turnState = Object.entries(event.headers).find(([name]) => name.toLowerCase() === "x-codex-turn-state")?.[1];
+		if (turnState) rememberTurnState(ctx.sessionManager.getSessionId(), turnState);
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
 		const requestInput = Array.isArray(event.payload.input) ? event.payload.input : undefined;
+		const basePayload = stripInputFromPayload(event.payload);
+		basePayloadBySession.set(ctx.sessionManager.getSessionId(), basePayload);
 		try {
 			const input = await coordinator.prepareRequest(
 				model,
 				ctx,
 				requestInput,
-				stripInputFromPayload(event.payload),
+				basePayload,
 			);
 			if (!input) return undefined;
 			const payload = stripInputFromPayload(event.payload);
@@ -152,10 +180,14 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				event.reason === "overflow" && event.willRetry,
 				event.signal,
 			);
+			const sessionId = ctx.sessionManager.getSessionId();
 			const native = await createNativeCheckpoint({
 				ctx,
 				model,
 				input,
+				basePayload: basePayloadBySession.get(sessionId),
+				turnState: turnStateBySession.get(sessionId),
+				onTurnState: (state) => rememberTurnState(sessionId, state),
 				signal: event.signal,
 				config,
 				allTools: pi.getAllTools(),

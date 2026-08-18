@@ -67,10 +67,12 @@ describe("Codex compaction history", () => {
 			apiKey,
 			headers: { "x-codex-beta-features": "other,remote_compaction_v2", "x-remove": null },
 			sessionId: "session",
+			turnState: "sticky",
 			includeRemoteCompactionV2: false,
 		});
 		expect(headers.get("accept")).toBe("application/json");
 		expect(headers.get("x-codex-beta-features")).toBe("other");
+		expect(headers.get("x-codex-turn-state")).toBe("sticky");
 		expect(headers.get("x-remove")).toBeNull();
 	});
 

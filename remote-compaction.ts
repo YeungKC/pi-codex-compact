@@ -29,6 +29,8 @@ export type NativeCheckpointRequest = {
 	model: Model<any>;
 	input: ResponseItem[];
 	basePayload?: JsonObject;
+	turnState?: string;
+	onTurnState?: (turnState: string) => void;
 	signal?: AbortSignal;
 	config: CodexCompactionConfig;
 	allTools: Parameters<typeof buildToolPayload>[0];
@@ -43,7 +45,11 @@ export type NativeCheckpointResult = {
 function compactionBasePayload(params: NativeCheckpointRequest): JsonObject {
 	const base = params.basePayload ? structuredClone(params.basePayload) : {};
 	const activeModel = params.ctx.model;
-	if (activeModel && modelKey(activeModel) !== modelKey(params.model)) {
+	const payloadModel = typeof base.model === "string" ? base.model : undefined;
+	if (
+		(activeModel && modelKey(activeModel) !== modelKey(params.model))
+		|| (payloadModel !== undefined && payloadModel !== params.model.id)
+	) {
 		// A transition compacts with the previous model. Do not reuse settings
 		// already mapped for the newly selected model.
 		delete base.reasoning;
@@ -94,6 +100,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		apiKey: auth.apiKey,
 		headers: auth.headers,
 		sessionId,
+		turnState: params.turnState,
 		includeRemoteCompactionV2: params.config.remoteCompactionV2,
 	});
 
@@ -112,6 +119,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 			model: params.model,
 			signal: params.signal,
 		});
+		if (remote.turnState) params.onTurnState?.(remote.turnState);
 		return {
 			details: {
 				kind: NATIVE_COMPACTION_KIND,
@@ -140,6 +148,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		model: params.model,
 		signal: params.signal,
 	});
+	if (remote.turnState) params.onTurnState?.(remote.turnState);
 	return {
 		details: {
 			kind: NATIVE_COMPACTION_KIND,

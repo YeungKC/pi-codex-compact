@@ -10,6 +10,12 @@ Codex server-side compaction of model-visible history into an opaque continuatio
 **Compaction trigger**:
 A transient final request item that asks the remote Codex service to compact the supplied history. It is a request signal, not retained history.
 
+**Turn state**:
+A server response header used for sticky routing during one active Codex turn. The extension sends it on later requests and remote compaction in that turn, then clears it at turn boundaries. Pi exposes this header for HTTP responses and remote compaction; its WebSocket response metadata is not exposed to extensions.
+
+**Request settings**:
+The last Codex provider payload settings that Pi exposes. Manual compaction reuses its instructions, tools, reasoning, service tier, and text settings because Pi's compaction event does not carry the provider payload.
+
 **Native compaction item**:
 The opaque `compaction` item returned by remote compaction. It is model state for continuation, not a human-readable summary.
 
@@ -32,7 +38,7 @@ Whether a model or configuration can continue from an existing native compaction
 Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
 
 **Legacy checkpoint**:
-A version-1 native compaction entry written by an earlier extension version. The first request migrates it by remote-compacting the full branch instead of replaying its stored replacement history.
+A version-1 native compaction entry written by an earlier extension version. The first request migrates it by remote-compacting the full branch instead of replaying its stored replacement history or Pi's prose compaction summary.
 
 **Malformed checkpoint**:
 A native compaction entry that fails the current schema. It is ignored and the full branch is replayed; a later remote compaction can write a valid replacement instead of permanently blocking the session.

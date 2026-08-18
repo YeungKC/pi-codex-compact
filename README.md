@@ -65,6 +65,7 @@ Where Pi exposes the needed lifecycle hooks, this extension follows Codex CLI's 
 - Replays the checkpoint with the active Pi branch tail on later requests.
 - Defers model-transition compaction until the first request after model selection.
 - Runs automatic compaction before a provider request, not after an aborted turn.
+- Reuses Codex request settings for manual compaction and forwards the server's sticky turn state only within the active turn.
 - Retains recent eligible user and agent messages, drops developer/system and old tool/reasoning items, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
 - Retries transient HTTP and stream failures. For eligible model/request failures during a transition, it retries with the newly selected model.
 
@@ -72,12 +73,12 @@ Unsupported providers keep Pi's normal local text summarization.
 
 ## Compatibility limits
 
-Codex CLI internally owns exact `comp_hash` capability metadata, token accounting, and mid-turn continuation. Pi does not expose those seams to extensions.
+Codex CLI internally owns exact `comp_hash` capability metadata, token accounting, and mid-turn continuation. Pi does not expose those seams to extensions. Pi's WebSocket provider path also does not expose `response.metadata` turn-state events; use Pi's SSE transport when normal-response sticky routing must be observed by this extension.
 
 The extension therefore:
 
 - uses the frozen Codex model hash snapshot; an absent hash skips only hash-transition compaction;
-- migrates version-1 native checkpoints by remote-compacting the full branch on the first request;
+- migrates version-1 native checkpoints by remote-compacting the full branch on the first request, without replaying Pi's old prose compaction summary;
 - estimates history, the current compaction-window prefix, images, and tool output for automatic compaction;
 - treats the actual pre-provider request as authoritative when a fork has changed Pi's inherited history.
 

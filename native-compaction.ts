@@ -118,11 +118,13 @@ export type CheckpointLookup =
 export type RemoteCompactionResult = {
 	compactionItem: ResponseItem;
 	usage?: Usage;
+	turnState?: string;
 };
 
 export type LegacyCompactionResult = {
 	replacementHistory: ResponseItem[];
 	usage?: Usage;
+	turnState?: string;
 };
 
 export function isJsonObject(value: unknown): value is JsonObject {
@@ -964,6 +966,7 @@ export function buildCodexHeaders(params: {
 	apiKey: string;
 	headers?: Record<string, string | null>;
 	sessionId: string;
+	turnState?: string;
 	includeRemoteCompactionV2?: boolean;
 }): Headers {
 	const headers = new Headers();
@@ -980,6 +983,7 @@ export function buildCodexHeaders(params: {
 	headers.set("content-type", "application/json");
 	headers.set("session-id", params.sessionId);
 	headers.set("x-client-request-id", params.sessionId);
+	if (params.turnState) headers.set("x-codex-turn-state", params.turnState);
 	const featureHeader = headers.get("x-codex-beta-features");
 	const features = params.includeRemoteCompactionV2 === false
 		? removeFeatureHeader(featureHeader)
@@ -1410,7 +1414,11 @@ export function callRemoteCompaction(params: {
 		idleTimeoutMs: V2_COMPACTION_IDLE_TIMEOUT_MS,
 		parse: async (response, idleTimeoutMs) => {
 			const parsed = await parseSseResponse(response, params.signal, idleTimeoutMs);
-			return { compactionItem: parsed.item, usage: usageFromResponse(params.model, parsed.usage) };
+			return {
+				compactionItem: parsed.item,
+				usage: usageFromResponse(params.model, parsed.usage),
+				...(response.headers.get("x-codex-turn-state") ? { turnState: response.headers.get("x-codex-turn-state")! } : {}),
+			};
 		},
 	});
 }
@@ -1475,6 +1483,7 @@ export function callLegacyRemoteCompaction(params: {
 			return {
 				replacementHistory: parsed.output.map(cloneItem),
 				usage: usageFromResponse(params.model, parsed.usage),
+				...(response.headers.get("x-codex-turn-state") ? { turnState: response.headers.get("x-codex-turn-state")! } : {}),
 			};
 		},
 	});
