@@ -842,7 +842,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		ensureNotAborted(operationSignal);
 		const currentBranch = deps.getBranch(ctx);
 		return effectiveInputForBranch({
-			branch: branchBeforeCurrentUser(currentBranch, requestInput),
+			branch: currentBranch,
 			model,
 			tools: deps.getAllTools(),
 			allowCheckpointModelMismatch: true,

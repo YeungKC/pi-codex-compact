@@ -552,7 +552,7 @@ describe("Codex session coordinator", () => {
 		});
 
 		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
-		await expect(coordinator.prepareCompaction(currentModel, context([oldModel, currentModel]), [userInput("history")])).resolves.toEqual([]);
+		await expect(coordinator.prepareCompaction(currentModel, context([oldModel, currentModel]), [userInput("history")])).resolves.toEqual([userInput("history")]);
 		expect(compactedWith).toEqual([]);
 	});
 
