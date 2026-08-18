@@ -78,6 +78,19 @@ test("filters Pi compaction summaries before legacy checkpoint migration", () =>
 	expect(result).toEqual({ messages: [{ role: "user", content: [{ type: "text", text: "keep" }] }] });
 });
 
+test("clears turn state when navigating to another session-tree leaf", () => {
+	const { handlers, ctx } = installExtension();
+	handlers.get("after_provider_response")?.({ headers: { "x-codex-turn-state": "active" } }, ctx);
+	const beforeTreeHeaders: Record<string, string | null> = {};
+	handlers.get("before_provider_headers")?.({ headers: beforeTreeHeaders }, ctx);
+	expect(beforeTreeHeaders["x-codex-turn-state"]).toBe("active");
+
+	handlers.get("session_tree")?.({ newLeafId: "other", oldLeafId: "current" }, ctx);
+	const afterTreeHeaders: Record<string, string | null> = {};
+	handlers.get("before_provider_headers")?.({ headers: afterTreeHeaders }, ctx);
+	expect(afterTreeHeaders["x-codex-turn-state"]).toBeUndefined();
+});
+
 test("reuses the last request settings and turn state for manual compaction", async () => {
 	const { handlers, ctx, model } = installExtension();
 	await handlers.get("before_provider_request")?.({

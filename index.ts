@@ -101,6 +101,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	};
 	pi.on("session_start", clear);
 	pi.on("session_shutdown", clear);
+	pi.on("session_tree", clear);
 	const clearTurnState = (_event: unknown, ctx: { sessionManager: { getSessionId(): string } }) => {
 		turnStateBySession.delete(ctx.sessionManager.getSessionId());
 	};
