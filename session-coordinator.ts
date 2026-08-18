@@ -61,6 +61,12 @@ function conversationLeafId(branch: SessionEntry[]): string | undefined {
 	return [...branch].reverse().find((entry) => entry.type !== "custom")?.id;
 }
 
+function hasBranchTailAfterCheckpoint(branch: SessionEntry[]): boolean {
+	const checkpoint = findNativeCheckpoint(branch);
+	return checkpoint.status !== "valid"
+		|| branch.slice(checkpoint.checkpoint.entryIndex + 1).some((entry) => entry.type === "message");
+}
+
 function textContent(value: unknown): string {
 	if (typeof value === "string") return value;
 	if (Array.isArray(value)) return value.map(textContent).join("");
@@ -99,12 +105,11 @@ function preserveCurrentUser(
 	details: NativeCompactionDetails,
 	branch: SessionEntry[],
 	requestInput: ResponseItem[] | undefined,
-	compactionInput?: ResponseItem[],
 ): NativeCompactionDetails {
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const currentUser = branch.findLast((entry) => entry.type === "message" && entry.message.role === "user");
 	if (!requestUser || !currentUser || currentUser.type !== "message") return details;
-	if (compactionInput?.some((item) => item.role === "user" && textContent(item.content) === textContent(requestUser.content))) return details;
+	if (details.replacementHistory.some((item) => item.role === "user" && textContent(item.content) === textContent(requestUser.content))) return details;
 	return textContent(currentUser.message.content) === textContent(requestUser.content)
 		? { ...details, preservedInput: [structuredClone(requestUser)] }
 		: details;
@@ -257,7 +262,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			}
 			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) continue;
 			deps.appendCheckpoint({
-				...preserveCurrentUser(native.details, branch, requestInput, input),
+				...preserveCurrentUser(native.details, branch, requestInput),
 				modelKey: targetModelKey,
 				compHash: compactionHash(currentModel),
 			});
@@ -361,6 +366,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		skipAutomaticCompaction = false,
 	): Promise<ResponseItem[] | undefined> => {
 		const sessionId = ctx.sessionManager.getSessionId();
+		let transitionCompactionCompleted = false;
 		const activeTransition = transitionBySession.get(sessionId);
 		if (activeTransition) {
 			await activeTransition;
@@ -461,6 +467,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			transitionBySession.set(sessionId, transition);
 			try {
 				await transition;
+				transitionCompactionCompleted = true;
 			} catch (error) {
 				if (generation === startGeneration) {
 					failureBySession.set(sessionId, { modelKey: modelKey(model), message: error instanceof Error ? error.message : String(error) });
@@ -503,7 +510,10 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					tools: deps.getAllTools(),
 					allowCheckpointModelMismatch: true,
 				});
-				if (deps.shouldAutoCompact?.({ ctx, model, input: currentHistory })) {
+				if (
+					(transitionCompactionCompleted || hasBranchTailAfterCheckpoint(compactionBranch))
+					&& deps.shouldAutoCompact?.({ ctx, model, input: currentHistory })
+				) {
 					const startGeneration = generation;
 					const leafId = conversationLeafId(branch);
 					const automaticCompaction = deps.withStatus(ctx, () => deps.createCheckpoint({
@@ -516,7 +526,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 							throw new Error("The session changed while Codex automatic compaction was running.");
 						}
-						deps.appendCheckpoint(preserveCurrentUser(native.details, branch, requestInput, currentHistory));
+						deps.appendCheckpoint(preserveCurrentUser(native.details, branch, requestInput));
 					});
 					automaticCompactionBySession.set(sessionId, automaticCompaction);
 					try {

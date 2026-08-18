@@ -16,7 +16,58 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const MAX_REMOTE_RETRIES = 2;
 export const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
-const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?policy|safety[ _-]?policy|policy[ _-]?violation|unauthorized|forbidden|permission|api[ _-]?key|invalid[ _-]?api[ _-]?key|authentication[ _-]?error|(?:invalid|expired|bearer|refresh)[ _-]?token|cancel(?:led|lation)?|aborted)/i;
+const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?violation|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|authentication[_ -]?error|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing)/i;
+const MODEL_FALLBACK_ERROR_CODES = new Set([
+	"context_length_exceeded",
+	"context_window_exceeded",
+	"invalid_prompt",
+	"invalid_request",
+	"invalid_request_error",
+	"model_not_found",
+	"usage_limit_reached",
+	"usage_limit_exceeded",
+	"rate_limit_reached",
+	"rate_limit_exceeded",
+	"server_overloaded",
+	"server_is_overloaded",
+	"server_overload",
+	"slow_down",
+	"retry_limit",
+]);
+const NON_RETRYABLE_FALLBACK_ERROR_CODES = new Set([
+	"context_length_exceeded",
+	"context_window_exceeded",
+	"invalid_prompt",
+	"invalid_request",
+	"invalid_request_error",
+	"model_not_found",
+	"usage_limit_reached",
+	"usage_limit_exceeded",
+	"retry_limit",
+]);
+const RETRYABLE_COMPACTION_ERROR_CODES = new Set([
+	"internal_server_error",
+	"server_error",
+	"service_unavailable",
+	"server_overloaded",
+	"server_is_overloaded",
+	"server_overload",
+	"rate_limit_reached",
+	"rate_limit_exceeded",
+	"slow_down",
+	"timeout",
+	"gateway_timeout",
+	"upstream_error",
+	"connection_reset",
+	"connection_closed",
+	"try_again",
+	"internal_server",
+	"gateway_error",
+	"temporary_unavailable",
+	"temporarily_unavailable",
+]);
+const USAGE_LIMIT_MESSAGE_PATTERN = /usage[_ -]?limit(?:[ _-]?(?:reached|exceeded|hit))?/i;
+const RETRYABLE_COMPACTION_ERROR_PATTERN = /(?:server[_ -]?(?:error|(?:is[_ -]?)?overload(?:ed)?)|service[_ -]?unavailable|temporar(?:y|ily)[_ -]?unavailable|upstream|internal[_ -]?server|gateway|timeout|try[_ -]?again|connection[_ -]?(?:reset|closed)|rate[_ -]?limit|slow[_ -]?down)/i;
 
 export function isFailClosedCompactionError(message: string): boolean {
 	return FAIL_CLOSED_ERROR_PATTERN.test(message);
@@ -77,9 +128,28 @@ function cloneItem<T>(value: T): T {
 
 function isResponseItem(value: unknown): value is ResponseItem {
 	if (!isJsonObject(value)) return false;
-	return typeof value.type === "string" || (
-		typeof value.role === "string" && (typeof value.content === "string" || Array.isArray(value.content))
-	);
+	if (typeof value.type !== "string") {
+		return typeof value.role === "string" && (typeof value.content === "string" || Array.isArray(value.content));
+	}
+	switch (value.type) {
+		case "message":
+	case "agent_message":
+			return typeof value.role === "string" && (typeof value.content === "string" || Array.isArray(value.content));
+		case "function_call":
+			return typeof value.call_id === "string" && typeof value.name === "string" && typeof value.arguments === "string";
+		case "function_call_output":
+			return typeof value.call_id === "string" && Object.hasOwn(value, "output");
+		case "reasoning":
+			return typeof value.encrypted_content === "string" || Array.isArray(value.summary) || Array.isArray(value.content);
+		case "compaction":
+		case "context_compaction":
+			return typeof value.encrypted_content === "string";
+		case "tool_search_call":
+		case "tool_search_output":
+			return typeof value.call_id === "string";
+		default:
+			return false;
+	}
 }
 
 export function parseNativeCompactionDetails(value: unknown): NativeCompactionDetails | undefined {
@@ -500,6 +570,9 @@ function imagePartCount(value: unknown): number {
 function approximateTokens(item: ResponseItem): number {
 	const imageTokens = imagePartCount(item) * 1_200;
 	if (imageTokens > 0) return imageTokens + Math.max(0, Math.ceil(responseItemText(item).length / 4));
+	if (item.type === "reasoning" || item.type === "compaction" || item.type === "context_compaction") {
+		return approximateTokenCount(item);
+	}
 	if (item.type === "function_call" || (typeof item.type === "string" && item.type.includes("tool") && item.type !== "function_call_output")) {
 		return Math.max(1, Math.ceil(JSON.stringify(item).length / 4));
 	}
@@ -524,9 +597,11 @@ function truncateFunctionOutput(item: ResponseItem, maxTokens: number): Response
 export function trimFunctionCallHistoryToFitContextWindow(
 	items: ResponseItem[],
 	maxTokens: number,
+	reservedTokens = 0,
 ): ResponseItem[] {
 	const result = items.map(cloneItem);
-	let excess = approximateResponseItemTokens(result) - maxTokens;
+	const inputBudget = Math.max(0, maxTokens - reservedTokens);
+	let excess = approximateResponseItemTokens(result) - inputBudget;
 	if (excess <= 0) return result;
 	for (const [index, item] of result.entries()) {
 		if (excess <= 0) break;
@@ -540,7 +615,7 @@ export function trimFunctionCallHistoryToFitContextWindow(
 		const index = result.findIndex((item) => item.type === "function_call_output" && imagePartCount(item) > 0);
 		if (index < 0) break;
 		result.splice(index, 1);
-		excess = approximateResponseItemTokens(result) - maxTokens;
+		excess = approximateResponseItemTokens(result) - inputBudget;
 	}
 	return result;
 }
@@ -776,25 +851,40 @@ export function mergeFeatureHeader(existing: string | null | undefined): string 
 	return [...new Set([...features, REMOTE_COMPACTION_FEATURE])].join(",");
 }
 
+export function removeFeatureHeader(existing: string | null | undefined): string {
+	return (existing ?? "")
+		.split(",")
+		.map((value) => value.trim())
+		.filter((value) => value && value.toLowerCase() !== REMOTE_COMPACTION_FEATURE)
+		.join(",");
+}
+
 export function buildCodexHeaders(params: {
 	apiKey: string;
-	headers?: Record<string, string>;
+	headers?: Record<string, string | null>;
 	sessionId: string;
 	includeRemoteCompactionV2?: boolean;
 }): Headers {
-	const headers = new Headers(params.headers);
+	const headers = new Headers();
+	for (const [name, value] of Object.entries(params.headers ?? {})) {
+		if (value === null) headers.delete(name);
+		else headers.set(name, value);
+	}
 	headers.set("authorization", `Bearer ${params.apiKey}`);
 	headers.set("chatgpt-account-id", extractCodexAccountId(params.apiKey));
 	headers.set("originator", "pi");
 	headers.set("user-agent", "pi-codex-compact");
 	headers.set("OpenAI-Beta", "responses=experimental");
-	headers.set("accept", "text/event-stream");
+	headers.set("accept", params.includeRemoteCompactionV2 === false ? "application/json" : "text/event-stream");
 	headers.set("content-type", "application/json");
 	headers.set("session-id", params.sessionId);
 	headers.set("x-client-request-id", params.sessionId);
-	if (params.includeRemoteCompactionV2 !== false) {
-		headers.set("x-codex-beta-features", mergeFeatureHeader(headers.get("x-codex-beta-features")));
-	}
+	const featureHeader = headers.get("x-codex-beta-features");
+	const features = params.includeRemoteCompactionV2 === false
+		? removeFeatureHeader(featureHeader)
+		: mergeFeatureHeader(featureHeader);
+	if (features) headers.set("x-codex-beta-features", features);
+	else headers.delete("x-codex-beta-features");
 	return headers;
 }
 
@@ -820,15 +910,98 @@ function canFallbackForStatus(status: number, body: string): boolean {
 	return !isFailClosedCompactionError(body);
 }
 
-function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
-	Object.defineProperty(error, "retryWithCurrentModel", { value: eligible, enumerable: false });
+export function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
+	Object.defineProperty(error, "retryWithCurrentModel", { value: eligible, enumerable: false, configurable: true });
 	return error as Error & { retryWithCurrentModel: boolean };
 }
 
 class NonRetryableCompactionError extends Error {}
 class RetryableCompactionStreamError extends Error {}
 
+function normalizedErrorCode(code: string): string {
+	return code.trim().toLowerCase();
+}
+
+function isKnownCompactionErrorCode(code: string): boolean {
+	return !code
+		|| MODEL_FALLBACK_ERROR_CODES.has(code)
+		|| NON_RETRYABLE_FALLBACK_ERROR_CODES.has(code)
+		|| RETRYABLE_COMPACTION_ERROR_CODES.has(code);
+}
+
+function classifySseCompactionError(code: string, message: string, includeCode = false): Error {
+	const detail = includeCode && code
+		? `OpenAI Codex compaction failed (${code}): ${message}`
+		: message || `OpenAI Codex compaction failed (${code}).`;
+	const normalizedCode = normalizedErrorCode(code);
+	const machineDetails = `${normalizedCode} ${message}`;
+	if (isFailClosedCompactionError(machineDetails)) {
+		return markFallbackEligibility(new NonRetryableCompactionError(detail), false);
+	}
+	if (
+		NON_RETRYABLE_FALLBACK_ERROR_CODES.has(normalizedCode)
+		|| USAGE_LIMIT_MESSAGE_PATTERN.test(message)
+	) {
+		return markFallbackEligibility(new NonRetryableCompactionError(detail), true);
+	}
+	if (!isKnownCompactionErrorCode(normalizedCode)) {
+		return markFallbackEligibility(new NonRetryableCompactionError(detail), false);
+	}
+	if (
+		RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)
+		|| RETRYABLE_COMPACTION_ERROR_PATTERN.test(machineDetails)
+	) {
+		return markFallbackEligibility(new RetryableCompactionStreamError(detail), true);
+	}
+	if (MODEL_FALLBACK_ERROR_CODES.has(normalizedCode)) {
+		return markFallbackEligibility(new NonRetryableCompactionError(detail), true);
+	}
+	return markFallbackEligibility(new NonRetryableCompactionError(detail), false);
+}
+
+function errorCodeFromResponseBody(body: string): string {
+	try {
+		const parsed = JSON.parse(body) as unknown;
+		const error = isJsonObject(parsed) && isJsonObject(parsed.error) ? parsed.error : parsed;
+		if (!isJsonObject(error)) return "";
+		const code = typeof error.code === "string" ? error.code : error.type;
+		return typeof code === "string" ? code : "";
+	} catch {
+		return "";
+	}
+}
+
+function classifyHttpCompactionError(
+	status: number,
+	body: string,
+	prefix: string,
+): { error: Error & { retryWithCurrentModel: boolean }; retryable: boolean } {
+	const code = normalizedErrorCode(errorCodeFromResponseBody(body));
+	const machineDetails = `${code} ${body}`;
+	const knownMessage = /(?:context|invalid request|model|not found|overloaded|rate[_ -]?limit|usage[_ -]?limit)/i.test(body)
+		|| isFailClosedCompactionError(machineDetails)
+		|| RETRYABLE_COMPACTION_ERROR_PATTERN.test(body);
+	const malformedClientError = status === 400 && !code && !knownMessage;
+	const unknownCode = Boolean(code) && !isKnownCompactionErrorCode(code) && !isFailClosedCompactionError(machineDetails);
+	const fallback = malformedClientError || unknownCode ? false : canFallbackForStatus(status, body);
+	const terminal = malformedClientError
+		|| unknownCode
+		|| isFailClosedCompactionError(machineDetails)
+		|| NON_RETRYABLE_FALLBACK_ERROR_CODES.has(code)
+		|| USAGE_LIMIT_MESSAGE_PATTERN.test(body);
+	const retryable = isRetryableStatus(status) && !terminal;
+	const error = retryable
+		? new Error(`${prefix} (${status}): ${body || "HTTP error"}`)
+		: new NonRetryableCompactionError(`${prefix} (${status}): ${body || "HTTP error"}`);
+	return { error: markFallbackEligibility(error, fallback), retryable };
+}
+
+function abortError(signal: AbortSignal): Error {
+	return signal.reason instanceof Error ? signal.reason : new Error("Compaction aborted");
+}
+
 async function delay(ms: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) throw abortError(signal);
 	if (ms <= 0) return;
 	await new Promise<void>((resolve, reject) => {
 		const cleanup = () => signal?.removeEventListener("abort", onAbort);
@@ -842,17 +1015,29 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 			reject(signal?.reason instanceof Error ? signal.reason : new Error("Compaction aborted"));
 		};
 		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
 	});
 }
 
-async function parseSseResponse(response: Response): Promise<{ item: ResponseItem; usage?: unknown }> {
-	if (!response.body) throw new Error("OpenAI Codex returned an empty compaction stream.");
+async function parseSseResponse(response: Response, signal?: AbortSignal): Promise<{ item: ResponseItem; usage?: unknown }> {
+	if (signal?.aborted) throw abortError(signal);
+	if (!response.body) {
+		throw markFallbackEligibility(
+			new RetryableCompactionStreamError("OpenAI Codex returned an empty compaction stream."),
+			true,
+		);
+	}
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
 	let completed = false;
+	let stopReading = false;
 	let usage: unknown;
 	const compactionItems: ResponseItem[] = [];
+	const onAbort = () => {
+		void reader.cancel().catch(() => {});
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
 
 	const processBlock = (block: string) => {
 		const data = block
@@ -868,56 +1053,111 @@ async function parseSseResponse(response: Response): Promise<{ item: ResponseIte
 		} catch {
 			throw new NonRetryableCompactionError("OpenAI Codex returned malformed compaction SSE data.");
 		}
-		if (!isJsonObject(event)) return;
+		if (!isJsonObject(event)) {
+			throw markFallbackEligibility(
+				new NonRetryableCompactionError("OpenAI Codex returned malformed compaction SSE event."),
+				false,
+			);
+		}
 		if (event.type === "error") {
-			const code = typeof event.code === "string" ? event.code : "";
-			if (typeof event.message !== "string" || !event.message.trim()) {
-				throw new RetryableCompactionStreamError("OpenAI Codex compaction failed.");
+			const nested = isJsonObject(event.error) ? event.error : {};
+			const code = typeof event.code === "string"
+				? event.code
+				: typeof nested.code === "string"
+					? nested.code
+					: "";
+			const message = typeof event.message === "string" && event.message.trim()
+				? event.message
+				: typeof nested.message === "string" && nested.message.trim()
+					? nested.message
+					: "";
+			if (!message && !code) {
+				throw markFallbackEligibility(
+					new NonRetryableCompactionError("OpenAI Codex compaction failed."),
+					false,
+				);
 			}
-			const error = new NonRetryableCompactionError(event.message);
-			throw code && isFailClosedCompactionError(code)
-				? markFallbackEligibility(error, false)
-				: error;
+			throw classifySseCompactionError(code, message, true);
 		}
 		if (event.type === "response.failed") {
 			const response = isJsonObject(event.response) ? event.response : {};
 			const failure = isJsonObject(response.error) ? response.error : {};
-			const code = typeof failure.code === "string" ? failure.code : "response.failed";
-			const rawMessage = typeof failure.message === "string" ? failure.message : undefined;
-			const message = rawMessage ?? "OpenAI Codex compaction ended with response.failed.";
-			const eligible = rawMessage !== undefined && rawMessage.trim().length > 0
-				&& (code === "context_length_exceeded" || code === "invalid_prompt")
-				&& !isFailClosedCompactionError(message);
-			throw markFallbackEligibility(new NonRetryableCompactionError(`OpenAI Codex compaction failed (${code}): ${message}`), eligible);
+			const code = typeof failure.code === "string"
+				? failure.code
+				: typeof failure.type === "string"
+					? failure.type
+					: "response.failed";
+			const message = typeof failure.message === "string"
+				? failure.message
+				: "OpenAI Codex compaction ended with response.failed.";
+			throw classifySseCompactionError(code, message, true);
 		}
 		if (event.type === "response.incomplete") {
-			throw new RetryableCompactionStreamError("OpenAI Codex compaction ended with response.incomplete.");
+			const response = isJsonObject(event.response) ? event.response : {};
+			const details = isJsonObject(event.incomplete_details)
+				? event.incomplete_details
+				: isJsonObject(response.incomplete_details)
+					? response.incomplete_details
+					: {};
+			const reason = typeof details.reason === "string" ? details.reason : "";
+			const message = typeof details.message === "string" && details.message.trim()
+				? details.message
+				: "OpenAI Codex compaction ended with response.incomplete.";
+			throw classifySseCompactionError(reason, message, Boolean(reason));
+		}
+		if (event.type !== "response.output_item.done" && (typeof event.code === "string" || typeof event.message === "string" || isJsonObject(event.error))) {
+			const nested = isJsonObject(event.error) ? event.error : {};
+			const code = typeof event.code === "string"
+				? event.code
+				: typeof nested.code === "string"
+					? nested.code
+					: "";
+			const message = typeof event.message === "string"
+				? event.message
+				: typeof nested.message === "string"
+					? nested.message
+					: "";
+			throw classifySseCompactionError(code, message, true);
 		}
 		if (event.type === "response.output_item.done" && isResponseItem(event.item) && event.item.type === "compaction") {
 			compactionItems.push(event.item);
 		}
 		if (event.type === "response.completed" || event.type === "response.done") {
 			completed = true;
+			stopReading = true;
 			usage = isJsonObject(event.response) ? event.response.usage : undefined;
 		}
 	};
 
-	while (true) {
-		const { done, value } = await reader.read();
-		buffer += decoder.decode(value, { stream: !done });
-		buffer = buffer.replace(/\r\n/g, "\n");
-		let boundary = buffer.indexOf("\n\n");
-		while (boundary >= 0) {
-			processBlock(buffer.slice(0, boundary));
-			buffer = buffer.slice(boundary + 2);
-			boundary = buffer.indexOf("\n\n");
+	try {
+		while (!stopReading) {
+			const { done, value } = await reader.read();
+			buffer += decoder.decode(value, { stream: !done });
+			buffer = buffer.replace(/\r\n/g, "\n");
+			let boundary = buffer.indexOf("\n\n");
+			while (!stopReading && boundary >= 0) {
+				processBlock(buffer.slice(0, boundary));
+				buffer = buffer.slice(boundary + 2);
+				boundary = buffer.indexOf("\n\n");
+			}
+			if (done) break;
 		}
-		if (done) break;
+		if (!stopReading && buffer.trim()) processBlock(buffer);
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+		try {
+			await reader.cancel();
+		} catch {}
+		try {
+			reader.releaseLock();
+		} catch {}
 	}
-	if (buffer.trim()) processBlock(buffer);
 	if (!completed) {
-		throw new RetryableCompactionStreamError(
-			"OpenAI Codex compaction stream closed before response.completed.",
+		throw markFallbackEligibility(
+			new RetryableCompactionStreamError(
+				"OpenAI Codex compaction stream closed before response.completed.",
+			),
+			true,
 		);
 	}
 	if (compactionItems.length !== 1) {
@@ -973,18 +1213,23 @@ export async function callRemoteCompaction(params: {
 			});
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
-				const message = `OpenAI Codex compaction failed (${response.status}): ${body || response.statusText}`;
-				if (!isRetryableStatus(response.status)) throw markFallbackEligibility(new NonRetryableCompactionError(message), canFallbackForStatus(response.status, body));
-				const error = markFallbackEligibility(new Error(message), canFallbackForStatus(response.status, body));
-				if (attempt === MAX_REMOTE_RETRIES) throw error;
-				lastError = error;
+				const classified = classifyHttpCompactionError(
+					response.status,
+					body || response.statusText,
+					"OpenAI Codex compaction failed",
+				);
+				if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
+				lastError = classified.error;
 				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
 				continue;
 			}
-			const parsed = await parseSseResponse(response);
+			const parsed = await parseSseResponse(response, params.signal);
 			return { strategy: "v2", compactionItem: parsed.item, usage: usageFromResponse(params.model, parsed.usage) };
 		} catch (error) {
-			if (params.signal?.aborted || error instanceof NonRetryableCompactionError) throw error;
+			if (params.signal?.aborted) {
+				throw markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
+			}
+			if (error instanceof NonRetryableCompactionError) throw error;
 			lastError = error;
 			if (attempt === MAX_REMOTE_RETRIES) throw error;
 			await delay(1000 * 2 ** attempt, params.signal);
@@ -1045,19 +1290,22 @@ export async function callLegacyRemoteCompaction(params: {
 			});
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
-				const eligible = canFallbackForStatus(response.status, body);
-				const error = markFallbackEligibility(
-					isRetryableStatus(response.status)
-						? new Error(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`)
-						: new NonRetryableCompactionError(`OpenAI Codex legacy compaction failed (${response.status}): ${body || response.statusText}`),
-					eligible,
+				const classified = classifyHttpCompactionError(
+					response.status,
+					body || response.statusText,
+					"OpenAI Codex legacy compaction failed",
 				);
-				if (!isRetryableStatus(response.status) || attempt === MAX_REMOTE_RETRIES) throw error;
-				lastError = error;
-				await delay(1000 * 2 ** attempt, params.signal);
+				if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
+				lastError = classified.error;
+				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
 				continue;
 			}
-			const parsed = await response.json() as JsonObject;
+			let parsed: JsonObject;
+			try {
+				parsed = await response.json() as JsonObject;
+			} catch {
+				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid JSON.");
+			}
 			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {
 				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid output.");
 			}
@@ -1067,7 +1315,10 @@ export async function callLegacyRemoteCompaction(params: {
 				usage: usageFromResponse(params.model, parsed.usage),
 			};
 		} catch (error) {
-			if (params.signal?.aborted || error instanceof NonRetryableCompactionError || attempt === MAX_REMOTE_RETRIES) throw error;
+			if (params.signal?.aborted) {
+				throw markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
+			}
+			if (error instanceof NonRetryableCompactionError || attempt === MAX_REMOTE_RETRIES) throw error;
 			lastError = error;
 			await delay(1000 * 2 ** attempt, params.signal);
 		}

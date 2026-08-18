@@ -12,6 +12,8 @@ import {
 	callRemoteCompaction,
 	filterLegacyCompactionHistory,
 	modelKey,
+	approximateTokenCount,
+	markFallbackEligibility,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
 	resolveCodexCompactUrl,
@@ -45,11 +47,25 @@ export type NativeCheckpointResult = {
 export async function createNativeCheckpoint(params: NativeCheckpointRequest): Promise<NativeCheckpointResult> {
 	const auth = await params.ctx.modelRegistry.getApiKeyAndHeaders(params.model);
 	if (!auth.ok || !auth.apiKey) {
-		throw new Error(auth.ok ? "OpenAI Codex authentication is unavailable." : auth.error);
+		throw markFallbackEligibility(
+			new Error(auth.ok ? "OpenAI Codex authentication is unavailable." : auth.error),
+			false,
+		);
 	}
 	const sessionId = params.ctx.sessionManager.getSessionId();
+	const baseUrl = auth.baseUrl ?? params.model.baseUrl;
 	const tools = buildToolPayload(params.allTools, params.activeToolNames);
-	const input = trimFunctionCallHistoryToFitContextWindow(params.input, params.model.contextWindow);
+	// Leave room for the stable request prefix and the V2 trigger item.
+	const reservedTokens = approximateTokenCount({
+		instructions: params.ctx.getSystemPrompt(),
+		tools,
+		...(params.config.remoteCompactionV2 ? { input: [{ type: "compaction_trigger" }] } : {}),
+	});
+	const input = trimFunctionCallHistoryToFitContextWindow(
+		params.input,
+		params.model.contextWindow,
+		reservedTokens,
+	);
 	const headers = buildCodexHeaders({
 		apiKey: auth.apiKey,
 		headers: auth.headers,
@@ -59,7 +75,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 
 	if (!params.config.remoteCompactionV2) {
 		const remote = await callLegacyRemoteCompaction({
-			url: resolveCodexCompactUrl(params.model.baseUrl),
+			url: resolveCodexCompactUrl(baseUrl),
 			headers,
 			body: buildLegacyCompactionRequestBody({
 				basePayload: params.basePayload,
@@ -94,7 +110,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		sessionId,
 	});
 	const remote = await callRemoteCompaction({
-		url: resolveCodexResponsesUrl(params.model.baseUrl),
+		url: resolveCodexResponsesUrl(baseUrl),
 		headers,
 		body,
 		model: params.model,

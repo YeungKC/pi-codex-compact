@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { createSessionCoordinator } from "./session-coordinator.ts";
-import { modelKey, NATIVE_COMPACTION_KIND, type NativeCompactionDetails, type ResponseItem } from "./native-compaction.ts";
+import { fullInputForBranch, modelKey, NATIVE_COMPACTION_KIND, type NativeCompactionDetails, type ResponseItem } from "./native-compaction.ts";
 
 function model(provider: string, id: string, compHash: string | undefined = `test-${id}`): Model<any> {
 	return { provider, api: "openai-codex-responses", id, reasoning: true, ...(compHash !== undefined ? { compHash } : {}) } as Model<any>;
@@ -654,6 +654,44 @@ describe("Codex session coordinator", () => {
 		expect(compactedWith).toBe(modelKey(oldModel));
 	});
 
+	test("preserves the current user when remote compaction returns no replacement history", async () => {
+		const currentModel = model("openai-codex", "current");
+		const branch = [
+			{
+				id: "user",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: { role: "user", content: [{ type: "text", text: "current" }] },
+			},
+			{
+				id: "assistant",
+				parentId: "user",
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: currentModel.provider,
+					api: currentModel.api,
+					model: currentModel.id,
+					content: [{ type: "text", text: "reply" }],
+				},
+			},
+		] as unknown as SessionEntry[];
+		const coordinator = createCoordinator(
+			branch,
+			async () => ({ ...details(modelKey(currentModel)), strategy: "v1", replacementHistory: [] }),
+			undefined,
+			() => true,
+		);
+		const input = await coordinator.prepareRequest(
+			currentModel,
+			context(),
+			fullInputForBranch({ branch, model: currentModel, tools: [] }),
+		);
+		expect(JSON.stringify(input)).toContain("current");
+	});
+
 	test("runs automatic compaction before the next request and keeps its tail", async () => {
 		const branch: SessionEntry[] = [{
 			id: "history",
@@ -672,6 +710,24 @@ describe("Codex session coordinator", () => {
 			{ type: "compaction", encrypted_content: "opaque" },
 			userInput("new"),
 		]);
+	});
+
+	test("does not recompact a checkpoint without a branch tail", async () => {
+		const currentModel = model("openai-codex", "current");
+		const branch = [
+			checkpointEntry(details(modelKey(currentModel), "opaque")),
+			{ id: "model-change", type: "model_change", modelId: "current", provider: "openai-codex" },
+			{ id: "thinking-change", type: "thinking_level_change", level: "high" },
+		] as unknown as SessionEntry[];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details(modelKey(currentModel), "unexpected");
+		}, undefined, () => true);
+		const history = details(modelKey(currentModel)).replacementHistory;
+		const input = await coordinator.prepareRequest(currentModel, context(), [...history, userInput("new")]);
+		expect(calls).toBe(0);
+		expect(input).toEqual([...history, userInput("new")]);
 	});
 
 	test("keeps the current user input after an existing checkpoint", async () => {

@@ -1,7 +1,76 @@
-import { describe, expect, test } from "vitest";
-import { buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, approximateResponseItemTokens, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { describe, expect, test, vi } from "vitest";
+import { createNativeCheckpoint } from "./remote-compaction.ts";
+import { approximateResponseItemTokens, buildCodexHeaders, buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
+	test("marks authentication failures fail-closed", async () => {
+		await expect(createNativeCheckpoint({
+			ctx: {
+				modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "403" }) },
+			} as never,
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			input: [],
+			config: { remoteCompactionV2: true, autoCompactScope: "total" },
+			allTools: [],
+			activeToolNames: [],
+		})).rejects.toMatchObject({ retryWithCurrentModel: false });
+	});
+
+	test("uses JSON for V1 and removes a stale V2 feature token", () => {
+		const apiKey = `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account" } })).toString("base64url")}.c`;
+		const headers = buildCodexHeaders({
+			apiKey,
+			headers: { "x-codex-beta-features": "other,remote_compaction_v2", "x-remove": null },
+			sessionId: "session",
+			includeRemoteCompactionV2: false,
+		});
+		expect(headers.get("accept")).toBe("application/json");
+		expect(headers.get("x-codex-beta-features")).toBe("other");
+		expect(headers.get("x-remove")).toBeNull();
+	});
+
+	test("reserves the stable prefix before sending remote compaction", async () => {
+		let requestUrl: string | undefined;
+		let requestBody: Record<string, unknown> | undefined;
+		vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+			requestUrl = url;
+			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response([
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } });
+		});
+		try {
+			await createNativeCheckpoint({
+				ctx: {
+					getSystemPrompt: () => "i".repeat(400),
+					modelRegistry: {
+						getApiKeyAndHeaders: async () => ({
+							ok: true,
+							apiKey: `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account" } })).toString("base64url")}.c`,
+							headers: {},
+							baseUrl: "https://auth.example/backend-api",
+						}),
+					},
+					sessionManager: { getSessionId: () => "session" },
+				} as never,
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses", contextWindow: 160 } as never,
+				input: [{ type: "function_call_output", call_id: "1", output: "x".repeat(400) }],
+				config: { remoteCompactionV2: true, autoCompactScope: "total" },
+				allTools: [],
+				activeToolNames: [],
+			});
+			expect(requestUrl).toBe("https://auth.example/backend-api/codex/responses");
+			expect(requestBody?.input).toEqual(expect.arrayContaining([
+				expect.objectContaining({ type: "compaction_trigger" }),
+			]));
+			const output = (requestBody?.input as Array<{ type?: string; output?: string }>).find((item) => item.type === "function_call_output");
+			expect(output?.output?.length).toBeLessThan(400);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	test("preserves eligible response.failed details for model fallback", async () => {
 		let calls = 0;
 		const body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too large\"}}}\n\ndata: [DONE]\n\n";
@@ -33,7 +102,7 @@ describe("Codex compaction history", () => {
 		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
 	});
 
-	test("keeps response.failed without a message out of model fallback", async () => {
+	test("allows code-only context failures to trigger model fallback", async () => {
 		let failure: unknown;
 		try {
 			await callRemoteCompaction({
@@ -46,6 +115,254 @@ describe("Codex compaction history", () => {
 		} catch (error) {
 			failure = error;
 		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+	});
+
+	test("retries transient response.failed errors and preserves details", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"internal_server_error\",\"message\":\"busy\"}}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+				},
+			});
+			const failure = expect(promise).rejects.toMatchObject({ message: expect.stringContaining("busy"), retryWithCurrentModel: true });
+			await vi.runAllTimersAsync();
+			await failure;
+			expect(calls).toBe(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("fails closed for content-filter and unknown incomplete reasons", async () => {
+		vi.useFakeTimers();
+		try {
+			for (const reason of ["content_filter", "new_protocol_reason"]) {
+				let calls = 0;
+				const promise = callRemoteCompaction({
+					url: "https://example.test/compact",
+					headers: new Headers(),
+					body: {},
+					model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+					fetchImpl: async () => {
+						calls++;
+						return new Response(`data: ${JSON.stringify({ type: "response.incomplete", response: { incomplete_details: { reason } } })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+					},
+				});
+				const failure = promise.catch((error) => error);
+				await vi.runAllTimersAsync();
+				expect(await failure).toMatchObject({ retryWithCurrentModel: false });
+				expect(calls).toBe(1);
+			}
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("retries an explicitly transient incomplete reason", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response('data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"server_error"}}}\n\n', { headers: { "content-type": "text/event-stream" } });
+				},
+			});
+			const failure = promise.catch((error) => error);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ retryWithCurrentModel: true });
+			expect(calls).toBe(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("falls back immediately for usage-limit response.failed errors", async () => {
+		let calls = 0;
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"usage_limit_reached\",\"message\":\"try another model\"}}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+				},
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(calls).toBe(1);
+		expect(failure).toMatchObject({ retryWithCurrentModel: true });
+	});
+
+	test("maps HTTP usage errors and transient overloads separately", async () => {
+		for (const [status, body, expectedCalls] of [
+			[429, { error: { type: "usage_limit_reached", message: "try another model" } }, 1],
+			[429, { error: { code: "rate_limit_reached", message: "slow down" } }, 3],
+			[503, { error: { code: "server_is_overloaded", message: "busy" } }, 3],
+		] as const) {
+			let calls = 0;
+			let failure: unknown;
+			try {
+				await callRemoteCompaction({
+					url: "https://example.test/compact",
+					headers: new Headers(),
+					body: {},
+					model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+					fetchImpl: async () => {
+						calls++;
+						return new Response(JSON.stringify(body), { status });
+					},
+				});
+			} catch (error) {
+				failure = error;
+			}
+			expect(calls).toBe(expectedCalls);
+			expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+		}
+	});
+
+	test("keeps unknown HTTP error codes fail-closed", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response(JSON.stringify({ error: { code: "future_protocol_code" } }), { status: 500 });
+				},
+			});
+			const failure = promise.catch((error) => error);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ retryWithCurrentModel: false });
+			expect(calls).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("keeps canceled HTTP errors fail-closed", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response(JSON.stringify({ error: { code: "canceled" } }), { status: 400 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
+	});
+
+	test("rejects malformed V1 response items without retrying", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callLegacyRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response(JSON.stringify({ output: [{ type: "message" }] }), { status: 200 });
+				},
+			});
+			const failure = promise.catch((error) => error);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ message: expect.stringContaining("invalid output") });
+			expect(calls).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("does not retry malformed V1 JSON success responses", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callLegacyRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response("{", { status: 200 });
+				},
+			});
+			const failure = promise.catch((error) => error);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ message: expect.stringContaining("invalid JSON") });
+			expect(calls).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("does not retry a message-only HTTP usage limit", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response(JSON.stringify({ error: { message: "usage limit reached" } }), { status: 429 });
+				},
+			});
+			const failure = promise.catch((error) => error);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ retryWithCurrentModel: true });
+			expect(calls).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("keeps terminal quota response.failed errors out of retries", async () => {
+		let calls = 0;
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota exceeded\"}}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+				},
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(calls).toBe(1);
 		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
 	});
 
@@ -66,19 +383,169 @@ describe("Codex compaction history", () => {
 	});
 
 	test("keeps machine-readable SSE errors out of model fallback", async () => {
-	let failure: unknown;
-	try {
-		await callRemoteCompaction({
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"invalid request\"}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+	});
+
+	test("keeps non-object SSE data fail-closed", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("data: null\n\n", { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
+	});
+
+	test("keeps unknown SSE message-only errors fail-closed", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response('data: {"type":"future.error","message":"unknown"}\n\n', { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
+	});
+
+	test("keeps unknown SSE error events fail-closed", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response('data: {"type":"future.error","code":"future_protocol_code","message":"unknown"}\n\n', { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
+	});
+
+	test("keeps unknown SSE codes fail-closed", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response('data: {"type":"error","code":"new_protocol_code","message":"invalid request"}\n\n', { headers: { "content-type": "text/event-stream" } }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
+	});
+
+	test("preserves nested SSE error details", async () => {
+		let calls = 0;
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response("data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"nested invalid prompt\"}}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+				},
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ message: "OpenAI Codex compaction failed (invalid_prompt): nested invalid prompt", retryWithCurrentModel: true });
+		expect(calls).toBe(1);
+	});
+
+	test("returns after a completed SSE event without waiting for EOF", async () => {
+		let cancelled = false;
+		const result = await callRemoteCompaction({
 			url: "https://example.test/compact",
 			headers: new Headers(),
 			body: {},
 			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
-			fetchImpl: async () => new Response("data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"invalid request\"}\n\ndata: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+			fetchImpl: async () => {
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode([
+							'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+							'data: {"type":"response.completed"}',
+						].join("\n\n") + "\n\n"));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				});
+				return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+			},
 		});
-	} catch (error) {
-		failure = error;
-	}
-	expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(false);
+		expect(result.compactionItem).toMatchObject({ type: "compaction", encrypted_content: "opaque" });
+		expect(cancelled).toBe(true);
+	});
+
+	test("cancels an open SSE reader when the compaction is aborted", async () => {
+		const controller = new AbortController();
+		let started!: () => void;
+		let cancelled = false;
+		const streamStarted = new Promise<void>((resolve) => { started = resolve; });
+		const pending = callRemoteCompaction({
+			url: "https://example.test/compact",
+			headers: new Headers(),
+			body: {},
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			signal: controller.signal,
+			fetchImpl: async () => new Response(new ReadableStream<Uint8Array>({
+				start() {
+					started();
+				},
+				cancel() {
+					cancelled = true;
+				},
+			}), { headers: { "content-type": "text/event-stream" } }),
+		});
+		await streamStarted;
+		controller.abort();
+		const outcome = await Promise.race([
+			pending.then(
+				() => ({ state: "resolved" as const }),
+				error => ({ state: "rejected" as const, error }),
+			),
+			new Promise<{ state: "timeout" }>((resolve) => setTimeout(() => resolve({ state: "timeout" }), 100)),
+		]);
+		expect(outcome).toMatchObject({ state: "rejected", error: { retryWithCurrentModel: false } });
+		expect(cancelled).toBe(true);
+	});
+
+	test("counts opaque reasoning and compaction payloads", () => {
+		const opaque = "x".repeat(4_000);
+		expect(approximateResponseItemTokens([{ type: "reasoning", encrypted_content: opaque }])).toBeGreaterThan(500);
+		expect(approximateResponseItemTokens([{ type: "compaction", encrypted_content: opaque }])).toBeGreaterThan(500);
 	});
 
 	test("counts function-call metadata in approximate token accounting", () => {
@@ -105,6 +572,22 @@ describe("Codex compaction history", () => {
 		}
 		expect(calls).toBe(1);
 		expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+	});
+
+	test("keeps an unstructured HTTP 400 fail-closed", async () => {
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => new Response("bad request details", { status: 400 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
 	});
 
 	test("keeps generic HTTP 403 out of model fallback", async () => {
@@ -280,6 +763,13 @@ describe("Codex compaction history", () => {
 			{ type: "function_call_output", call_id: "1", output: "1234567890" },
 		], 2);
 		expect(result[1]?.output).toBe("1234567890".slice(0, 4));
+	});
+
+	test("reserves request overhead while trimming function output", () => {
+		const result = trimFunctionCallHistoryToFitContextWindow([
+			{ type: "function_call_output", call_id: "1", output: "1234567890" },
+		], 4, 2);
+		expect(approximateResponseItemTokens(result)).toBeLessThanOrEqual(2);
 	});
 
 	test("trims image-bearing function output below the image estimate", () => {

@@ -11,6 +11,7 @@ import {
 	isJsonObject,
 	isOpenAICodexModel,
 	mergeFeatureHeader,
+	removeFeatureHeader,
 	approximateResponseItemTokens,
 	approximateTokenCount,
 	buildToolPayload,
@@ -31,12 +32,15 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function setFeatureHeader(headers: Record<string, string | null>): void {
+function setFeatureHeader(headers: Record<string, string | null>, includeRemoteCompactionV2: boolean): void {
 	const existing = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-codex-beta-features");
-	if (existing) {
-		headers[existing[0]] = mergeFeatureHeader(existing[1]);
-	} else {
-		headers["x-codex-beta-features"] = mergeFeatureHeader(undefined);
+	const features = includeRemoteCompactionV2
+		? mergeFeatureHeader(existing?.[1])
+		: removeFeatureHeader(existing?.[1]);
+	if (features) {
+		headers[existing?.[0] ?? "x-codex-beta-features"] = features;
+	} else if (existing) {
+		delete headers[existing[0]];
 	}
 }
 
@@ -126,16 +130,13 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return;
-		if (loadConfig(ctx.cwd, ctx.isProjectTrusted()).remoteCompactionV2) {
-			setFeatureHeader(event.headers);
-		}
+		setFeatureHeader(event.headers, loadConfig(ctx.cwd, ctx.isProjectTrusted()).remoteCompactionV2);
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
-		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
 		try {
 			const transitionFailure = coordinator.transitionFailure(sessionId, model);
 			if (transitionFailure) throw new Error(transitionFailure);
@@ -188,6 +189,16 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				allTools: pi.getAllTools(),
 				activeToolNames: pi.getActiveTools(),
 			}));
+			const requestUser = input.findLast((item) => item.role === "user");
+			const knownUsers = [
+				...native.details.replacementHistory,
+				...(native.details.preservedInput ?? []),
+			];
+			const details = requestUser && !knownUsers.some((item) =>
+				item.role === "user" && JSON.stringify(item.content) === JSON.stringify(requestUser.content)
+			)
+				? { ...native.details, preservedInput: [...(native.details.preservedInput ?? []), structuredClone(requestUser)] }
+				: native.details;
 
 			return {
 				compaction: {
@@ -195,7 +206,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 					firstKeptEntryId: event.preparation.firstKeptEntryId,
 					tokensBefore: event.preparation.tokensBefore,
 					usage: native.usage,
-					details: native.details,
+					details,
 				},
 			};
 		} catch (error) {
