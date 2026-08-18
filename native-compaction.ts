@@ -837,6 +837,38 @@ function retainedItemTokens(item: ResponseItem): number {
 	return item.type === "agent_message" ? approximateTokens(item) : retainedMessageTokens(item);
 }
 
+const IMAGE_RESIZE_NOTICE_START = "<image_resize_notice>";
+const IMAGE_RESIZE_NOTICE_END = "</image_resize_notice>";
+
+type RetainedMessageGroup = {
+	source: ResponseItem;
+	notice?: ResponseItem;
+};
+
+function isImageResizeNotice(item: ResponseItem): boolean {
+	if (item.type !== "message" || item.role !== "developer" || !Array.isArray(item.content) || item.content.length !== 1) return false;
+	const part = item.content[0];
+	if (!isJsonObject(part) || part.type !== "input_text" || typeof part.text !== "string") return false;
+	const text = part.text.trim().toLowerCase();
+	return text.startsWith(IMAGE_RESIZE_NOTICE_START)
+		&& text.endsWith(IMAGE_RESIZE_NOTICE_END);
+}
+
+function retainedMessageGroups(items: ResponseItem[]): RetainedMessageGroup[] {
+	const groups: RetainedMessageGroup[] = [];
+	for (let index = 0; index < items.length; index++) {
+		const source = items[index]!;
+		const notice = items[index + 1];
+		if (notice && isImageResizeNotice(notice)) {
+			groups.push({ source, notice });
+			index++;
+		} else {
+			groups.push({ source });
+		}
+	}
+	return groups;
+}
+
 function retainedByCodex(item: ResponseItem): boolean {
 	if (item.type === "agent_message") {
 		return !isDescendantProgressAgentMessage(item)
@@ -851,19 +883,27 @@ function retainedByCodex(item: ResponseItem): boolean {
 export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED_MESSAGE_TOKEN_BUDGET): ResponseItem[] {
 	let remaining = maxTokens;
 	const retained: ResponseItem[] = [];
-	for (const item of [...items].reverse()) {
-		if (remaining <= 0 || !retainedByCodex(item)) continue;
-		const tokens = retainedItemTokens(item);
+	for (const group of retainedMessageGroups(items).reverse()) {
+		if (remaining <= 0 || !retainedByCodex(group.source)) continue;
+		const noticeTokens = group.notice ? retainedMessageTokens(group.notice) : 0;
+		const sourceTokens = retainedItemTokens(group.source);
+		const tokens = sourceTokens + noticeTokens;
 		if (tokens <= remaining) {
-			retained.push(cloneItem(item));
+			if (group.notice) retained.push(cloneItem(group.notice));
+			retained.push(cloneItem(group.source));
 			remaining -= tokens;
 			continue;
 		}
-		const truncated = (item.type === "message" || item.type === undefined)
-			? truncateMessage(item, remaining)
+		if (remaining <= noticeTokens) continue;
+		const sourceBudget = remaining - noticeTokens;
+		const truncated = (group.source.type === "message" || group.source.type === undefined)
+			? truncateMessage(group.source, sourceBudget)
 			: undefined;
-		if (truncated) remaining = 0;
-		if (truncated) retained.push(truncated);
+		if (truncated) {
+			if (group.notice) retained.push(cloneItem(group.notice));
+			retained.push(truncated);
+			remaining = 0;
+		}
 	}
 	return retained.reverse();
 }

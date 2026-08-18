@@ -29,7 +29,7 @@ The active period that starts when replacement history becomes live and ends at 
 `Total` counts active context. `BodyAfterPrefix` counts context growth after the current window's prefix; when no prefix baseline exists, its scoped usage is zero while the full context-window limit still applies.
 
 **Retained item**:
-An original history item that remains separately visible in replacement history after remote compaction. V2 applies Codex's item filters and retained-message budget; by default this excludes developer/system items and keeps only eligible user and agent messages.
+An original history item that remains separately visible in replacement history after remote compaction. V2 applies Codex's item filters and retained-message budget; this excludes standalone developer/system items and keeps only eligible user and agent messages, plus an immediately attached generated image-resize notice.
 
 **Compaction compatibility**:
 Whether a model or configuration can continue from an existing native compaction item. Codex represents this with optional `comp_hash`; an absent hash is not evidence of incompatibility.

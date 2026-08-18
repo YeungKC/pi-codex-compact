@@ -584,6 +584,28 @@ describe("Codex compaction history", () => {
 		expect(result).toEqual([]);
 	});
 
+	test("keeps an attached image resize notice with its retained source", () => {
+		const userImage = { type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] };
+		const userNotice = {
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: "\n<image_resize_notice>\nImage 1 of 1 in the preceding user message was resized.\n</image_resize_notice>\n" }],
+		};
+		const toolNotice = {
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: "\n<image_resize_notice>\nImage 1 of 1 in the preceding tool output was resized.\n</image_resize_notice>\n" }],
+		};
+		const result = retainRecentMessages([
+			userImage,
+			userNotice,
+			{ type: "message", role: "developer", content: [{ type: "input_text", text: "unlisted notice" }] },
+			{ type: "function_call_output", call_id: "tool", output: "tool output" },
+			toolNotice,
+		]);
+		expect(result).toEqual([userImage, userNotice]);
+	});
+
 	test("retains eligible agent messages within the per-item limit", () => {
 		const result = retainRecentMessages([
 			{ type: "agent_message", content: [{ type: "input_text", text: "Message Type: COMMENTARY\nsmall" }] },

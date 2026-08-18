@@ -66,7 +66,7 @@ Where Pi exposes the needed lifecycle hooks, this extension follows Codex CLI's 
 - Defers model-transition compaction until the first request after model selection.
 - Runs automatic compaction before a provider request, not after an aborted turn.
 - Reuses Codex request settings for manual compaction and forwards the server's sticky turn state only within the active turn.
-- Retains recent eligible user and agent messages, drops developer/system and old tool/reasoning items, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
+- Retains recent eligible user and agent messages, drops standalone developer/system and old tool/reasoning items, keeps an attached generated image-resize notice with its retained source, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
 - Retries transient HTTP and stream failures. For eligible model/request failures during a transition, it retries with the newly selected model.
 
 Unsupported providers keep Pi's normal local text summarization.
