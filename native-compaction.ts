@@ -257,6 +257,43 @@ export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
 	return { status: "none" };
 }
 
+function assistantInputTokens(entry: SessionEntry): number | undefined {
+	if (entry.type !== "message") return undefined;
+	const message = entry.message as unknown as JsonObject;
+	if (
+		message.role !== "assistant"
+		|| message.provider !== "openai-codex"
+		|| message.api !== "openai-codex-responses"
+		|| message.stopReason === "error"
+		|| message.stopReason === "aborted"
+	) return undefined;
+	const usage = isJsonObject(message.usage) ? message.usage : undefined;
+	if (!usage || typeof usage.input !== "number" || !Number.isFinite(usage.input)) return undefined;
+	const cacheRead = typeof usage.cacheRead === "number" && Number.isFinite(usage.cacheRead) ? usage.cacheRead : 0;
+	const cacheWrite = typeof usage.cacheWrite === "number" && Number.isFinite(usage.cacheWrite) ? usage.cacheWrite : 0;
+	return Math.max(0, usage.input + cacheRead + cacheWrite);
+}
+
+/**
+ * Finds the Codex body-after-prefix baseline for the active compaction window.
+ * Server-observed assistant usage wins; a current native checkpoint provides the
+ * estimate used before the first response in a new window.
+ */
+export function estimateCompactionWindowPrefillTokens(params: {
+	branch: SessionEntry[];
+	stablePrefixTokens: number;
+}): number | undefined {
+	const checkpoint = findNativeCheckpoint(params.branch);
+	const checkpointIndex = checkpoint.status === "valid" || checkpoint.status === "legacy"
+		? checkpoint.checkpoint.entryIndex
+		: -1;
+	const observed = params.branch.slice(checkpointIndex + 1).map(assistantInputTokens).find((value) => value !== undefined);
+	if (observed !== undefined) return observed;
+	if (checkpoint.status !== "valid") return undefined;
+	return approximateResponseItemTokens(checkpoint.checkpoint.details.replacementHistory)
+		+ Math.max(0, Math.floor(params.stablePrefixTokens));
+}
+
 function shortHash(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }

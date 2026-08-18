@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 type RemoteRequest = Parameters<typeof callRemoteCompaction>[0];
 const remoteModel = { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never;
@@ -367,6 +367,54 @@ describe("Codex compaction history", () => {
 	test("counts function-call metadata in approximate token accounting", () => {
 		const tokens = approximateResponseItemTokens([{ type: "function_call", name: "a-very-long-tool-name", call_id: "call-123456789", arguments: "{}" } as never]);
 		expect(tokens).toBeGreaterThan(1);
+	});
+
+	test("uses the first assistant usage after the current compaction window as its baseline", () => {
+		const branch = [
+			{ id: "before", type: "message", message: { role: "assistant", usage: { input: 900, cacheRead: 0, cacheWrite: 0, totalTokens: 950 } } },
+			{ id: "checkpoint", type: "custom", customType: NATIVE_COMPACTION_KIND, data: {
+				kind: NATIVE_COMPACTION_KIND,
+				version: NATIVE_COMPACTION_VERSION,
+				strategy: "v2",
+				modelKey: "openai-codex:openai-codex-responses:gpt",
+				replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+			} },
+			{ id: "other-provider", type: "message", message: {
+				role: "assistant",
+				provider: "anthropic",
+				api: "anthropic-messages",
+				stopReason: "stop",
+				usage: { input: 900, cacheRead: 0, cacheWrite: 0, totalTokens: 950 },
+			} },
+			{ id: "after", type: "message", message: {
+				role: "assistant",
+				provider: "openai-codex",
+				api: "openai-codex-responses",
+				stopReason: "stop",
+				usage: { input: 100, cacheRead: 20, cacheWrite: 5, totalTokens: 150 },
+			} },
+		] as never;
+
+		expect(estimateCompactionWindowPrefillTokens({ branch, stablePrefixTokens: 10 })).toBe(125);
+	});
+
+	test("leaves the body-after-prefix baseline unset before the first usage", () => {
+		expect(estimateCompactionWindowPrefillTokens({
+			branch: [{ id: "user", type: "message", message: { role: "user", content: "hello" } }] as never,
+			stablePrefixTokens: 10,
+		})).toBeUndefined();
+	});
+
+	test("estimates a new baseline from replacement history after compaction", () => {
+		const branch = [{ id: "checkpoint", type: "custom", customType: NATIVE_COMPACTION_KIND, data: {
+			kind: NATIVE_COMPACTION_KIND,
+			version: NATIVE_COMPACTION_VERSION,
+			strategy: "v2",
+			modelKey: "openai-codex:openai-codex-responses:gpt",
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+	} }] as never;
+
+		expect(estimateCompactionWindowPrefillTokens({ branch, stablePrefixTokens: 10 })).toBeGreaterThan(10);
 	});
 
 	test("keeps an unstructured HTTP 400 fail-closed", async () => {

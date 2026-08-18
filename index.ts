@@ -5,6 +5,7 @@ import { autoCompactTokenLimit, loadConfig } from "./config.ts";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
 import { createSessionCoordinator } from "./session-coordinator.ts";
 import {
+	estimateCompactionWindowPrefillTokens,
 	findNativeCheckpoint,
 	fullInputForBranch,
 	isJsonObject,
@@ -58,15 +59,25 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
 		shouldAutoCompact: ({ ctx, model, input }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
-			// Pi does not expose Codex's exact usage/prefill split; count the stable prefix approximately.
-			const estimatedPrefillTokens = approximateTokenCount({
+			// Pi exposes assistant usage but not Codex's window counters; estimate the stable prefix.
+			const estimatedStablePrefixTokens = approximateTokenCount({
 				instructions: ctx.getSystemPrompt(),
 				tools: buildToolPayload(pi.getAllTools(), pi.getActiveTools()),
 			});
-			const activeContextTokens = approximateResponseItemTokens(input) + estimatedPrefillTokens;
+			const activeContextTokens = approximateResponseItemTokens(input) + estimatedStablePrefixTokens;
+			const prefillTokens = config.autoCompactScope === "bodyAfterPrefix"
+				? estimateCompactionWindowPrefillTokens({
+						branch: ctx.sessionManager.getBranch() as SessionEntry[],
+						stablePrefixTokens: estimatedStablePrefixTokens,
+					})
+				: undefined;
 			const limit = autoCompactTokenLimit(config, model.contextWindow);
 			return shouldAutoCompact({
-				status: { activeContextTokens, contextWindow: model.contextWindow },
+				status: {
+					activeContextTokens,
+					contextWindow: model.contextWindow,
+					...(prefillTokens !== undefined ? { prefillTokens } : {}),
+				},
 				limit,
 				scope: config.autoCompactScope,
 			});

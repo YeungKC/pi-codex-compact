@@ -52,7 +52,7 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`. Missing o
 | --- | --- | --- |
 | `remoteCompactionV2` | `true` | Use Codex V2; set `false` only for the legacy V1 endpoint. |
 | `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold. |
-| `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` excludes a reliable prefix baseline when Pi exposes one. |
+| `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` counts growth after the current compaction window's prefix. Until a prefix baseline exists, only the context-window hard cap triggers compaction. |
 
 The extension does not probe endpoints at runtime.
 
@@ -78,7 +78,7 @@ The extension therefore:
 
 - uses the frozen Codex model hash snapshot; an absent hash skips only hash-transition compaction;
 - migrates version-1 native checkpoints by remote-compacting the full branch on the first request;
-- estimates history, stable system/tool prefix, images, and tool output for automatic compaction;
+- estimates history, the current compaction-window prefix, images, and tool output for automatic compaction;
 - treats the actual pre-provider request as authoritative when a fork has changed Pi's inherited history.
 
 These are deliberate compatibility adaptations, not server probing or local-summary fallbacks.

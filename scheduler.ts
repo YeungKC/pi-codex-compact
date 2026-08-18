@@ -13,8 +13,10 @@ export function shouldAutoCompact(params: {
 }): boolean {
 	const { status, limit, scope } = params;
 	if (status.activeContextTokens === null) return false;
-	const scoped = scope === "bodyAfterPrefix" && status.prefillTokens !== undefined
-		? Math.max(0, status.activeContextTokens - status.prefillTokens)
+	const scoped = scope === "bodyAfterPrefix"
+		? status.prefillTokens === undefined
+			? 0
+			: Math.max(0, status.activeContextTokens - status.prefillTokens)
 		: status.activeContextTokens;
 	const configuredLimit = limit ?? Math.floor(status.contextWindow * 0.9);
 	return scoped >= configuredLimit || status.activeContextTokens >= status.contextWindow;

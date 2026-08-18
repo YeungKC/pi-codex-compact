@@ -16,6 +16,12 @@ The opaque `compaction` item returned by remote compaction. It is model state fo
 **Replacement history**:
 The model-visible history installed after remote compaction: the native compaction item plus the history items Codex retains separately.
 
+**Compaction window**:
+The active period that starts when replacement history becomes live and ends at the next remote compaction. Body-after-prefix usage counts growth within this window.
+
+**Auto-compaction scope**:
+`Total` counts active context. `BodyAfterPrefix` counts context growth after the current window's prefix; when no prefix baseline exists, its scoped usage is zero while the full context-window limit still applies.
+
 **Retained item**:
 An original history item that remains separately visible in replacement history after remote compaction. V2 applies Codex's item filters and retained-message budget.
 
