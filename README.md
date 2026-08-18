@@ -73,7 +73,7 @@ Unsupported providers keep Pi's normal local text summarization.
 
 ## Compatibility limits
 
-Codex CLI internally owns exact `comp_hash` capability metadata, token accounting, and mid-turn continuation. Pi does not expose those seams to extensions. Pi's WebSocket provider path also does not expose `response.metadata` turn-state events; use Pi's SSE transport when normal-response sticky routing must be observed by this extension.
+Codex CLI internally owns exact `comp_hash` capability metadata, token accounting, mid-turn continuation, and provider retry settings. Pi does not expose those seams to extensions. Pi's WebSocket provider path also does not expose `response.metadata` turn-state events; use Pi's SSE transport when normal-response sticky routing must be observed by this extension. Remote compaction uses Codex's two-retry cap when Pi's provider retry setting is unavailable.
 
 The extension therefore:
 
