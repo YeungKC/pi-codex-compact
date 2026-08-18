@@ -197,7 +197,8 @@ function preserveCurrentUser(
 ): NativeCompactionDetails {
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const currentUser = branch.findLast((entry) => entry.type === "message" && entry.message.role === "user");
-	if (!requestUser || !currentUser || currentUser.type !== "message" || alreadyPreserved) return details;
+	if (!requestUser || !currentUser || currentUser.type !== "message") return details;
+	if (alreadyPreserved && details.replacementHistory.some((item) => item.role === "user" && sameValue(item.content, requestUser.content))) return details;
 	const compactedBranch = branchBeforeCurrentUser(branch, requestInput);
 	if (compactedBranch.length < branch.length) return appendPreservedUser(details, requestUser);
 	if (details.replacementHistory.some((item) => item.role === "user" && sameValue(item.content, requestUser.content))) return details;
