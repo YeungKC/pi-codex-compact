@@ -3,6 +3,7 @@ import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-a
 import type { Model } from "@earendil-works/pi-ai";
 import { createSessionCoordinator } from "./session-coordinator.ts";
 import {
+	effectiveInputForBranch,
 	findNativeCheckpoint,
 	fullInputForBranch,
 	modelKey,
@@ -511,6 +512,33 @@ describe("Codex session coordinator", () => {
 			userInput("same"),
 			userInput("same"),
 		]);
+	});
+
+	test("keeps a new same-text user after a checkpoint preserves the prior turn", async () => {
+		const currentModel = model("old");
+		const oldUser = { type: "message", id: "old-turn", role: "user", content: [{ type: "input_text", text: "same" }] };
+		const newUser = { type: "message", id: "new-turn", role: "user", content: [{ type: "input_text", text: "same" }] };
+		const branch = [
+			userEntry("same", "old-entry"),
+			{
+				id: "assistant",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: { role: "assistant", provider: currentModel.provider, api: currentModel.api, model: currentModel.id, content: [{ type: "text", text: "answer" }] },
+			} as never,
+			customEntry({
+				...details(modelKey(currentModel)),
+				replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+				preservedInput: [oldUser],
+			}),
+		];
+		const coordinator = createCoordinator(branch);
+		const prefix = effectiveInputForBranch({ branch, model: currentModel, tools: [], allowCheckpointModelMismatch: true });
+
+		const result = await coordinator.prepareRequest(currentModel, context([currentModel]), [...prefix, newUser]);
+		expect(result?.at(-1)).toEqual(newUser);
+		expect(result?.find((item) => item.id === "new-turn")).toEqual(newUser);
 	});
 
 	test("manual compaction does not run model-transition compaction", async () => {

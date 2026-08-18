@@ -159,12 +159,12 @@ function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseI
 		: branch;
 }
 
-function checkpointPreservesCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): boolean {
+function checkpointPreservedCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): ResponseItem | undefined {
 	const checkpoint = findNativeCheckpoint(branch);
-	if (checkpoint.status !== "valid" || branch.slice(checkpoint.checkpoint.entryIndex + 1).some((entry) => entry.type === "message")) return false;
+	if (checkpoint.status !== "valid" || branch.slice(checkpoint.checkpoint.entryIndex + 1).some((entry) => entry.type === "message")) return undefined;
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const preservedUser = checkpoint.checkpoint.details.preservedInput?.findLast((item) => item.role === "user");
-	return Boolean(requestUser && preservedUser && sameValue(preservedUser.content, requestUser.content));
+	return requestUser && preservedUser && sameValue(preservedUser.content, requestUser.content) ? preservedUser : undefined;
 }
 
 function preserveCurrentUser(
@@ -800,9 +800,20 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		}
 		const currentCheckpoint = findNativeCheckpoint(branch);
 		if (currentCheckpoint.status === "none") return undefined;
-		if (checkpointPreservesCurrentUser(branch, requestInput)) {
-			const requestUserIndex = tail.findLastIndex((item) => item.role === "user");
-			if (requestUserIndex >= 0) tail = tail.filter((_item, index) => index !== requestUserIndex);
+		const preservedUser = checkpointPreservedCurrentUser(branch, requestInput);
+		const currentUserIndex = requestInput?.findLastIndex((item) => item.role === "user") ?? -1;
+		const preservedUserAlreadyInRequest = preservedUser !== undefined
+			&& currentUserIndex > 0
+			&& requestInput?.some((item, index) =>
+				index < currentUserIndex
+				&& item.role === "user"
+				&& sameValue(item.content, preservedUser.content),
+			);
+		if (preservedUser && !preservedUserAlreadyInRequest) {
+			const preservedUserIndex = tail.findLastIndex((item) =>
+				item.role === "user" && sameValue(item.content, preservedUser.content),
+			);
+			if (preservedUserIndex >= 0) tail = tail.filter((_item, index) => index !== preservedUserIndex);
 		}
 		return [
 			...effectiveInputForBranch({
