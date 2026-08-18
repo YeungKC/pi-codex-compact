@@ -185,7 +185,11 @@ function requestTail(
 }
 
 // ponytail: O(history × request) only on the legacy migration fallback; index item IDs if fork transforms make this hot.
-function unmatchedRequestItems(requestInput: ResponseItem[], histories: ResponseItem[][]): ResponseItem[] {
+function unmatchedRequestItems(
+	requestInput: ResponseItem[],
+	histories: ResponseItem[][],
+	preservedItems: ResponseItem[] = [],
+): ResponseItem[] {
 	let bestMatches: number[] = [];
 	for (const history of histories) {
 		let requestIndex = 0;
@@ -203,7 +207,19 @@ function unmatchedRequestItems(requestInput: ResponseItem[], histories: Response
 		}
 	}
 	const matchedIndexes = new Set(bestMatches);
-	return requestInput.filter((_item, index) => !matchedIndexes.has(index));
+	const preservedIndexes = new Set<number>();
+	for (const preservedItem of preservedItems) {
+		const preservedIndex = requestInput.findLastIndex((item, index) => !preservedIndexes.has(index) && sameItem(item, preservedItem));
+		if (preservedIndex >= 0) {
+			preservedIndexes.add(preservedIndex);
+			matchedIndexes.delete(preservedIndex);
+		}
+	}
+	const unmatched = requestInput.filter((_item, index) => !matchedIndexes.has(index));
+	return [
+		...unmatched,
+		...preservedItems.filter((item) => !requestInput.some((requestItem) => sameItem(requestItem, item))),
+	];
 }
 
 function resolveModel(ctx: ExtensionContext, key: string): Model<any> | undefined {
@@ -580,17 +596,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			if (checkpoint.status === "legacy") {
 				const migrated = await runLegacyMigration();
 				const preserved = migrated.preservedInput ?? [];
-				let migratedTail = unmatchedRequestItems(requestInput!, [
+				const migratedTail = unmatchedRequestItems(requestInput!, [
 					rawHistoryInput,
 					currentRawHistoryInput,
 					historyInput,
 					currentHistoryInput,
-				]);
-				for (const preservedItem of preserved) {
-					const preservedIndex = migratedTail.findIndex((item) => sameItem(item, preservedItem));
-					if (preservedIndex >= 0) migratedTail = migratedTail.filter((_item, index) => index !== preservedIndex);
-				}
-				return [...migrated.replacementHistory, ...preserved, ...migratedTail];
+				], preserved);
+				return [...migrated.replacementHistory, ...migratedTail];
 			}
 			if (!pending && checkpoint.status === "none") return undefined;
 			const createCheckpointFor = (selectedModel: Model<any>) => deps.withStatus(ctx, () => deps.createCheckpoint({
@@ -632,20 +644,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			if (migratedCheckpoint.status !== "valid") {
 				throw new Error("Legacy Codex compaction migration did not create a valid checkpoint.");
 			}
-			let migratedTail = tail;
-			if (checkpointPreservesCurrentUser(migratedBranch, requestInput)) {
-				const requestUserIndex = migratedTail.findLastIndex((item) => item.role === "user");
-				if (requestUserIndex >= 0) migratedTail = migratedTail.filter((_item, index) => index !== requestUserIndex);
-			}
-			return [
-				...effectiveInputForBranch({
-					branch: branchBeforeCurrentUser(migratedBranch, requestInput),
-					model,
-					tools: deps.getAllTools(),
-					allowCheckpointModelMismatch: true,
-				}),
-				...migratedTail,
-			];
+			const migratedTail = unmatchedRequestItems(requestInput!, [
+				rawHistoryInput,
+				currentRawHistoryInput,
+				historyInput,
+				currentHistoryInput,
+			], migratedCheckpoint.checkpoint.details.preservedInput ?? []);
+			return [...migratedCheckpoint.checkpoint.details.replacementHistory, ...migratedTail];
 		}
 
 		const activeAutomaticCompaction = automaticCompactionBySession.get(sessionId);

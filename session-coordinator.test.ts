@@ -300,6 +300,21 @@ describe("Codex session coordinator", () => {
 		]);
 	});
 
+	test("keeps a preserved current user in authoritative request order", async () => {
+		const currentModel = model("old");
+		const branch = [userEntry("current"), customEntry(legacyDetails(modelKey(currentModel)))];
+		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
+			expect(input).toEqual([]);
+			return details(modelKey(currentModel), "migrated");
+		});
+		const request = [userInput("prefix"), userInput("current")];
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "migrated" },
+			...request,
+		]);
+	});
+
 	test("does not duplicate history after a missing transformed item", async () => {
 		const currentModel = model("old");
 		const branch = [userEntry("a", "a"), userEntry("b", "b"), userEntry("c", "c"), customEntry(legacyDetails(modelKey(currentModel)))];
