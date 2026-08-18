@@ -81,3 +81,54 @@ jobs:
           else
             npm publish --provenance --access public
           fi
+
+  publish-github:
+    needs: [version-check, publish]
+    if: needs.version-check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: '@yeungkc'
+          package-manager-cache: false
+
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: '@yeungkc/pi-codex-compact'
+          PACKAGE_VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          if npm view "$PACKAGE_NAME@$PACKAGE_VERSION" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "Already published: $PACKAGE_NAME@$PACKAGE_VERSION"
+          else
+            npm publish --registry=https://npm.pkg.github.com
+          fi
+
+  create-release:
+    needs: [version-check, publish-github]
+    if: needs.version-check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.version-check.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $TAG"
+          elif gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Refusing to create a release for an existing tag: $TAG" >&2
+            exit 1
+          else
+            gh release create "$TAG" --generate-notes --target "$GITHUB_SHA"
+          fi
