@@ -302,16 +302,17 @@ describe("Codex session coordinator", () => {
 
 	test("keeps a preserved current user in authoritative request order", async () => {
 		const currentModel = model("old");
-		const branch = [userEntry("current"), customEntry(legacyDetails(modelKey(currentModel)))];
+		const branch = [userEntry("history"), userEntry("current"), userEntry("current"), customEntry(legacyDetails(modelKey(currentModel)))];
 		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
-			expect(input).toEqual([]);
+			expect(input).toEqual([userInput("history"), userInput("current")]);
 			return details(modelKey(currentModel), "migrated");
 		});
-		const request = [userInput("prefix"), userInput("current")];
+		const request = [userInput("prefix"), userInput("history"), userInput("current")];
 
 		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
 			{ type: "compaction", encrypted_content: "migrated" },
-			...request,
+			userInput("prefix"),
+			userInput("current"),
 		]);
 	});
 
