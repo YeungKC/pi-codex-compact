@@ -144,6 +144,11 @@ function sameItem(left: ResponseItem, right: ResponseItem): boolean {
 	return sameValue(left, right);
 }
 
+function ensureNotAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	throw signal.reason instanceof Error ? signal.reason : new Error("Compaction aborted.");
+}
+
 function sameValue(left: unknown, right: unknown): boolean {
 	if (Object.is(left, right)) return true;
 	if (Array.isArray(left) || Array.isArray(right)) {
@@ -177,6 +182,23 @@ function requestTail(
 		}
 	}
 	throw new Error("The Codex request changed before model-transition compaction completed.");
+}
+
+// ponytail: O(history × request) only on the legacy migration fallback; index item IDs if fork transforms make this hot.
+function requestTailAfterKnownHistory(requestInput: ResponseItem[], histories: ResponseItem[][]): ResponseItem[] {
+	let lastKnownRequestIndex = -1;
+	for (const history of histories) {
+		let requestIndex = 0;
+		let matchedRequestIndex = -1;
+		for (const historyItem of history) {
+			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && sameItem(item, historyItem));
+			if (nextIndex < 0) break;
+			requestIndex = nextIndex + 1;
+			matchedRequestIndex = nextIndex;
+		}
+		lastKnownRequestIndex = Math.max(lastKnownRequestIndex, matchedRequestIndex);
+	}
+	return requestInput.slice(lastKnownRequestIndex + 1);
 }
 
 function resolveModel(ctx: ExtensionContext, key: string): Model<any> | undefined {
@@ -244,7 +266,9 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		startGeneration: number,
 		requestInput: ResponseItem[] | undefined,
 		excludeLastAssistantError = false,
+		signal?: AbortSignal,
 	): Promise<void> => {
+		const operationSignal = signal ?? ctx.signal;
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const branch = deps.getBranch(ctx);
 			const leafId = conversationLeafId(branch);
@@ -263,7 +287,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					model: previousModel,
 					input,
 					basePayload,
-					signal: ctx.signal,
+					signal: operationSignal,
 				}));
 			} catch (firstError) {
 				if (
@@ -282,12 +306,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 							excludeLastAssistantError,
 						}),
 						basePayload,
-						signal: ctx.signal,
+						signal: operationSignal,
 					}));
 				} catch {
 					throw firstError;
 				}
 			}
+			ensureNotAborted(operationSignal);
 			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) continue;
 			deps.appendCheckpoint(rebindCheckpoint(
 				preserveCurrentUser(native.details, branch, requestInput),
@@ -308,7 +333,9 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		basePayload: JsonObject | undefined,
 		requestInput: ResponseItem[],
 		startGeneration: number,
+		signal?: AbortSignal,
 	): Promise<NativeCompactionDetails> => {
+		const operationSignal = signal ?? ctx.signal;
 		const branch = deps.getBranch(ctx);
 		const leafId = conversationLeafId(branch);
 		const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
@@ -319,7 +346,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			model: selectedModel,
 			input: fullInputForBranch({ branch: compactionBranch, model: selectedModel, tools: deps.getAllTools() }),
 			basePayload,
-			signal: ctx.signal,
+			signal: operationSignal,
 		}));
 		let native: Awaited<ReturnType<CheckpointFactory>>;
 		try {
@@ -332,6 +359,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				throw firstError;
 			}
 		}
+		ensureNotAborted(operationSignal);
 		if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 			throw new Error("The session changed while legacy Codex compaction migration was running.");
 		}
@@ -352,8 +380,10 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		requestInput?: ResponseItem[],
 		forceDownshift = false,
 		excludeLastAssistantError = false,
+		signal?: AbortSignal,
 	): Promise<void> => {
 		if (!isOpenAICodexModel(model)) return;
+		const operationSignal = signal ?? ctx.signal;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const checkpoint = findNativeCheckpoint(deps.getBranch(ctx));
 		if (checkpoint.status !== "valid") return;
@@ -380,7 +410,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		}
 		const startGeneration = generation;
 		const transition = previousModel
-			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration, requestInput, excludeLastAssistantError)
+			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration, requestInput, excludeLastAssistantError, operationSignal)
 			: (async () => {
 					const branch = deps.getBranch(ctx);
 					const leafId = conversationLeafId(branch);
@@ -395,8 +425,9 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 							excludeLastAssistantError,
 						}),
 						basePayload,
-						signal: ctx.signal,
+						signal: operationSignal,
 					}));
+					ensureNotAborted(operationSignal);
 					if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 						throw new Error("The session changed while Codex model-transition compaction was running.");
 					}
@@ -543,15 +574,18 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		} catch (error) {
 			if (checkpoint.status === "legacy") {
 				const migrated = await runLegacyMigration();
-				const lastUser = requestInput?.findLast((item) => item.role === "user");
 				const preserved = migrated.preservedInput ?? [];
-				const alreadyPresent = lastUser
-					&& [...migrated.replacementHistory, ...preserved].some((item) => sameItem(item, lastUser));
-				return [
-					...migrated.replacementHistory,
-					...preserved,
-					...(lastUser && !alreadyPresent ? [lastUser] : []),
-				];
+				let migratedTail = requestTailAfterKnownHistory(requestInput!, [
+					rawHistoryInput,
+					currentRawHistoryInput,
+					historyInput,
+					currentHistoryInput,
+				]);
+				for (const preservedItem of preserved) {
+					const preservedIndex = migratedTail.findIndex((item) => sameItem(item, preservedItem));
+					if (preservedIndex >= 0) migratedTail = migratedTail.filter((_item, index) => index !== preservedIndex);
+				}
+				return [...migrated.replacementHistory, ...preserved, ...migratedTail];
 			}
 			if (!pending && checkpoint.status === "none") return undefined;
 			const createCheckpointFor = (selectedModel: Model<any>) => deps.withStatus(ctx, () => deps.createCheckpoint({
@@ -575,6 +609,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					throw firstError;
 				}
 			}
+			ensureNotAborted(ctx.signal);
 			const details = rebindCheckpoint(
 				preserveRequestUser(native.details, requestInput!),
 				modelKey(model),
@@ -671,6 +706,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						basePayload,
 						signal: ctx.signal,
 					})).then((native) => {
+						ensureNotAborted(ctx.signal);
 						if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 							throw new Error("The session changed while Codex automatic compaction was running.");
 						}
@@ -709,8 +745,10 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		requestInput?: ResponseItem[],
 		basePayload?: JsonObject,
 		excludeLastAssistantError = false,
+		signal?: AbortSignal,
 	): Promise<ResponseItem[]> => {
 		if (!isOpenAICodexModel(model)) return [];
+		const operationSignal = signal ?? ctx.signal;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const activeTransition = transitionBySession.get(sessionId);
 		if (activeTransition) await activeTransition;
@@ -736,6 +774,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				startGeneration,
 				requestInput,
 				excludeLastAssistantError,
+				operationSignal,
 			);
 			transitionBySession.set(sessionId, transition);
 			try {
@@ -744,7 +783,8 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				if (transitionBySession.get(sessionId) === transition) transitionBySession.delete(sessionId);
 			}
 		}
-		await recoverCurrentModel(model, ctx, basePayload, requestInput, true, excludeLastAssistantError);
+		await recoverCurrentModel(model, ctx, basePayload, requestInput, true, excludeLastAssistantError, operationSignal);
+		ensureNotAborted(operationSignal);
 		const currentBranch = deps.getBranch(ctx);
 		return effectiveInputForBranch({
 			branch: branchBeforeCurrentUser(currentBranch, requestInput),

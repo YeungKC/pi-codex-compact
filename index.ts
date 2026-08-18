@@ -247,6 +247,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				requestInput,
 				undefined,
 				event.reason === "overflow" && event.willRetry,
+				event.signal,
 			);
 			const native = await withCompactionStatus(ctx, () => createNativeCheckpoint({
 				ctx,
@@ -258,6 +259,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				activeToolNames: pi.getActiveTools(),
 				debug: debugSink(ctx, config.debug),
 			}));
+			if (event.signal.aborted) return { cancel: true };
 			const requestUser = requestInput.findLast((item) => item.role === "user");
 			const knownUsers = [
 				...native.details.replacementHistory,

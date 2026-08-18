@@ -265,6 +265,24 @@ describe("Codex session coordinator", () => {
 		expect(compactedInput).toEqual([userInput("old history")]);
 	});
 
+	test("preserves the transformed request tail during legacy migration", async () => {
+		const currentModel = model("old");
+		const branch = [userEntry("old history"), customEntry(legacyDetails(modelKey(currentModel)))];
+		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
+			expect(input).toEqual([userInput("old history")]);
+			return details(modelKey(currentModel), "migrated");
+		});
+		const request = [
+			userInput("new request"),
+			{ type: "function_call_output", call_id: "call", output: "tool result" },
+		];
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "migrated" },
+			...request,
+		]);
+	});
+
 	test("uses the legacy checkpoint model before falling back to the current model", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
@@ -345,6 +363,28 @@ describe("Codex session coordinator", () => {
 			userInput("history"),
 		]);
 		expect(compactedWith).toEqual([modelKey(oldModel)]);
+	});
+
+	test("does not append a canceled explicit transition checkpoint", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const branch = [userEntry("history")];
+		const controller = new AbortController();
+		const coordinator = createCoordinator(branch, async (selectedModel) => {
+			if (selectedModel === oldModel) controller.abort(new Error("canceled"));
+			return details(modelKey(selectedModel), "canceled");
+		});
+
+		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
+		await expect(coordinator.prepareCompaction(
+			currentModel,
+			context([oldModel, currentModel]),
+			[userInput("history")],
+			undefined,
+			false,
+			controller.signal,
+		)).rejects.toThrow("canceled");
+		expect(branch).toHaveLength(1);
 	});
 
 	test("runs automatic compaction before the provider request", async () => {

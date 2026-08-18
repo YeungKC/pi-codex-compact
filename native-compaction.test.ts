@@ -798,6 +798,14 @@ describe("Codex compaction history", () => {
 		expect(result.map((item) => item.role ?? item.type)).toEqual(["user"]);
 	});
 
+	test("retains eligible developer and system messages", () => {
+		const result = retainRecentMessages([
+			{ type: "message", role: "developer", content: [{ type: "input_text", text: "developer" }] },
+			{ type: "message", role: "system", content: [{ type: "input_text", text: "system" }] },
+		]);
+		expect(result.map((item) => item.role)).toEqual(["developer", "system"]);
+	});
+
 	test("retains eligible agent messages within the per-item limit", () => {
 		const result = retainRecentMessages([
 			{ type: "agent_message", content: [{ type: "input_text", text: "Message Type: COMMENTARY\nsmall" }] },
@@ -1003,12 +1011,14 @@ describe("Codex compaction history", () => {
 
 	test("V1 requests do not contain V2 trigger or streaming fields", () => {
 		const body = buildLegacyCompactionRequestBody({
+			basePayload: { tool_choice: { type: "custom", name: "grammar_tool" } },
 			model: { id: "test" } as never,
 			input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "x" }] }],
 			instructions: "instructions",
 			sessionId: "session",
 		});
 		expect(body.input).toEqual([{ type: "message", role: "user", content: [{ type: "input_text", text: "x" }] }]);
+		expect(body.tool_choice).toEqual({ type: "custom", name: "grammar_tool" });
 		expect(body.stream).toBeUndefined();
 		expect(body.store).toBeUndefined();
 	});

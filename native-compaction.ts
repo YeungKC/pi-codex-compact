@@ -834,7 +834,9 @@ function retainedByCodex(item: ResponseItem): boolean {
 			&& approximateTokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
 	}
 	if (item.type !== "message" && item.type !== undefined) return false;
-	return item.role === "user" && isRetainedUserMessage(item);
+	return item.role === "user"
+		? isRetainedUserMessage(item)
+		: item.role === "developer" || item.role === "system";
 }
 
 /** Mirrors current Codex V2's retained message whitelist and 64k newest-first budget. */
@@ -1434,7 +1436,6 @@ export function buildLegacyCompactionRequestBody(params: {
 	delete body.stream;
 	delete body.store;
 	delete body.include;
-	delete body.tool_choice;
 	return body;
 }
 
