@@ -44,7 +44,10 @@ export function loadConfig(cwd: string, trusted: boolean): CodexCompactionConfig
 	return { ...DEFAULT_CONFIG, ...global, ...project };
 }
 
-/** Codex derives an omitted auto limit from the model context window. */
+/** Codex caps configured auto-compaction limits at 90% of the context window. */
 export function autoCompactTokenLimit(config: CodexCompactionConfig, contextWindow: number): number {
-	return config.autoCompactTokenLimit ?? Math.floor(contextWindow * 0.9);
+	const codexLimit = Math.floor(contextWindow * 0.9);
+	return config.autoCompactTokenLimit === undefined
+		? codexLimit
+		: Math.min(config.autoCompactTokenLimit, codexLimit);
 }

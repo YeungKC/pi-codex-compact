@@ -41,9 +41,14 @@ describe("Codex compaction history", () => {
 		})).rejects.toMatchObject({ retryWithCurrentModel: false });
 	});
 
-	test("preserves provider tools from the authoritative request payload", () => {
+	test("builds the Codex allowlisted request shape", () => {
 		const body = buildCompactionRequestBody({
-			basePayload: { instructions: "rewritten instructions", tools: [{ type: "custom_tool", name: "grammar_tool" }], tool_choice: { type: "custom" } },
+			basePayload: {
+				instructions: "rewritten instructions",
+				tools: [{ type: "custom_tool", name: "grammar_tool" }],
+				tool_choice: { type: "custom" },
+				temperature: 0,
+			},
 			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
 			input: [],
 			instructions: "instructions",
@@ -52,7 +57,8 @@ describe("Codex compaction history", () => {
 		});
 		expect(body.instructions).toBe("rewritten instructions");
 		expect(body.tools).toEqual([{ type: "custom_tool", name: "grammar_tool" }]);
-		expect(body.tool_choice).toEqual({ type: "custom" });
+		expect(body.tool_choice).toBe("auto");
+		expect(body.temperature).toBeUndefined();
 	});
 
 	test("uses JSON for V1 and removes a stale V2 feature token", () => {
@@ -83,6 +89,7 @@ describe("Codex compaction history", () => {
 			await createNativeCheckpoint({
 				ctx: {
 					getSystemPrompt: () => "i".repeat(400),
+					thinkingLevel: "high",
 					modelRegistry: {
 						getApiKeyAndHeaders: async () => ({
 							ok: true,
@@ -100,6 +107,7 @@ describe("Codex compaction history", () => {
 				activeToolNames: [],
 			});
 			expect(requestUrl).toBe("https://auth.example/backend-api/codex/responses");
+			expect(requestBody?.reasoning).toEqual({ effort: "high", summary: "auto" });
 			expect(requestBody?.input).toEqual(expect.arrayContaining([
 				expect.objectContaining({ type: "compaction_trigger" }),
 			]));
@@ -156,9 +164,30 @@ describe("Codex compaction history", () => {
 					return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"internal_server_error\",\"message\":\"busy\"}}}\n\ndata: [DONE]\n\n");
 				},
 			}));
-			const failure = expect(promise).rejects.toMatchObject({ message: expect.stringContaining("busy"), retryWithCurrentModel: true });
+			const failure = expect(promise).rejects.toMatchObject({ message: expect.stringContaining("busy"), retryWithCurrentModel: false });
 			await vi.runAllTimersAsync();
 			await failure;
+			expect(calls).toBe(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("uses the SSE retry-after hint", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callRemoteCompaction(remoteRequest({
+				fetchImpl: async () => {
+					calls++;
+					return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 5s\"}}}\n\ndata: [DONE]\n\n");
+				},
+			}));
+			const failure = promise.catch(error => error);
+			await vi.advanceTimersByTimeAsync(4_999);
+			expect(calls).toBe(1);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ retryWithCurrentModel: false });
 			expect(calls).toBe(3);
 		} finally {
 			vi.useRealTimers();
@@ -168,7 +197,7 @@ describe("Codex compaction history", () => {
 	test.each([
 		["content_filter", false, 1],
 		["new_protocol_reason", false, 1],
-		["server_error", true, 3],
+		["server_error", false, 3],
 	] as const)("handles incomplete reason %s", async (reason, expectedFallback, expectedCalls) => {
 		vi.useFakeTimers();
 		let calls = 0;
@@ -188,7 +217,7 @@ describe("Codex compaction history", () => {
 		}
 	});
 
-	test("falls back immediately for usage-limit response.failed errors", async () => {
+	test("does not switch models for usage-limit SSE errors", async () => {
 		let calls = 0;
 		let failure: unknown;
 		try {
@@ -201,8 +230,8 @@ describe("Codex compaction history", () => {
 		} catch (error) {
 			failure = error;
 		}
-		expect(calls).toBe(1);
-		expect(failure).toMatchObject({ retryWithCurrentModel: true });
+		expect(calls).toBe(3);
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
 	});
 
 	test("maps HTTP usage errors and transient overloads separately", async () => {
@@ -522,12 +551,12 @@ describe("Codex compaction history", () => {
 		expect(result.map((item) => item.role ?? item.type)).toEqual(["user"]);
 	});
 
-	test("retains eligible developer and system messages", () => {
+	test("drops developer and system messages by default", () => {
 		const result = retainRecentMessages([
 			{ type: "message", role: "developer", content: [{ type: "input_text", text: "developer" }] },
 			{ type: "message", role: "system", content: [{ type: "input_text", text: "system" }] },
 		]);
-		expect(result.map((item) => item.role)).toEqual(["developer", "system"]);
+		expect(result).toEqual([]);
 	});
 
 	test("retains eligible agent messages within the per-item limit", () => {
@@ -599,27 +628,35 @@ describe("Codex compaction history", () => {
 		expect(result[0]?.content).toEqual([{ type: "input_text", text: "abcd" }]);
 	});
 
-	test("trims old function output to the request budget", () => {
+	test("replaces an oversized function output with Codex's marker", () => {
 		const result = trimFunctionCallHistoryToFitContextWindow([
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
 			{ type: "function_call_output", call_id: "1", output: "1234567890" },
 		], 2);
-		expect(result[1]?.output).toBe("1234567890".slice(0, 4));
+		expect(result[1]?.output).toBe("Output exceeded the available model context and was truncated");
 	});
 
-	test("reserves request overhead while trimming function output", () => {
+	test("keeps Codex's marker when the remaining budget is tiny", () => {
 		const result = trimFunctionCallHistoryToFitContextWindow([
 			{ type: "function_call_output", call_id: "1", output: "1234567890" },
 		], 4, 2);
-		expect(approximateResponseItemTokens(result)).toBeLessThanOrEqual(2);
+		expect(result[0]?.output).toBe("Output exceeded the available model context and was truncated");
 	});
 
-	test("trims image-bearing function output below the image estimate", () => {
+	test("replaces image-bearing function output with Codex's truncation marker", () => {
 		const result = trimFunctionCallHistoryToFitContextWindow([
 			{ type: "function_call_output", output: [{ type: "input_image", image_url: "data:image/png;base64,large" }] },
 		], 100);
-		expect(result[0]?.output).toBe("");
-		expect(approximateResponseItemTokens(result)).toBeLessThanOrEqual(100);
+		expect(result[0]?.output).toBe("Output exceeded the available model context and was truncated");
+	});
+
+	test("trims the newest function output first", () => {
+		const result = trimFunctionCallHistoryToFitContextWindow([
+			{ type: "function_call_output", call_id: "old", output: "old".repeat(20) },
+			{ type: "function_call_output", call_id: "new", output: "new".repeat(200) },
+		], 120);
+		expect(result[0]?.output).toBe("old".repeat(20));
+		expect(result[1]?.output).toBe("Output exceeded the available model context and was truncated");
 	});
 
 	test("keeps machine-readable auth and policy errors out of model fallback", async () => {
@@ -724,16 +761,17 @@ describe("Codex compaction history", () => {
 		expect(details?.strategy).toBe("v1");
 	});
 
-	test("V1 requests do not contain V2 trigger or streaming fields", () => {
+	test("V1 requests use Codex's allowlisted non-streaming shape", () => {
 		const body = buildLegacyCompactionRequestBody({
-			basePayload: { tool_choice: { type: "custom", name: "grammar_tool" } },
+			basePayload: { tool_choice: { type: "custom", name: "grammar_tool" }, temperature: 0 },
 			model: { id: "test" } as never,
 			input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "x" }] }],
 			instructions: "instructions",
 			sessionId: "session",
 		});
 		expect(body.input).toEqual([{ type: "message", role: "user", content: [{ type: "input_text", text: "x" }] }]);
-		expect(body.tool_choice).toEqual({ type: "custom", name: "grammar_tool" });
+		expect(body.tool_choice).toBeUndefined();
+		expect(body.temperature).toBeUndefined();
 		expect(body.stream).toBeUndefined();
 		expect(body.store).toBeUndefined();
 	});

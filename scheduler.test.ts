@@ -17,4 +17,22 @@ describe("Codex-style token scheduler", () => {
 	test.each(cases)("%s", (_name, status, limit, scope, expected) => {
 		expect(shouldAutoCompact({ status, limit, scope })).toBe(expected);
 	});
+
+	test("downshift uses Codex's strict total limit and body cap", () => {
+		const status = { activeContextTokens: 900, prefillTokens: 200, contextWindow: 1_000 };
+		expect(shouldAutoCompact({ status, limit: 900, scope: "total", reason: "downshift" })).toBe(false);
+		expect(shouldAutoCompact({
+			status: { ...status, activeContextTokens: 901 },
+			limit: 900,
+			scope: "total",
+			reason: "downshift",
+		})).toBe(true);
+		expect(shouldAutoCompact({ status, limit: 500, scope: "bodyAfterPrefix", reason: "downshift" })).toBe(false);
+		expect(shouldAutoCompact({
+			status: { ...status, activeContextTokens: 1_000 },
+			limit: 500,
+			scope: "bodyAfterPrefix",
+			reason: "downshift",
+		})).toBe(true);
+	});
 });

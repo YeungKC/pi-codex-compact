@@ -40,6 +40,24 @@ export type NativeCheckpointResult = {
 	usage?: Awaited<ReturnType<typeof callRemoteCompaction>>["usage"];
 };
 
+function compactionBasePayload(params: NativeCheckpointRequest): JsonObject {
+	const base = params.basePayload ? structuredClone(params.basePayload) : {};
+	const activeModel = params.ctx.model;
+	if (activeModel && modelKey(activeModel) !== modelKey(params.model)) {
+		// A transition compacts with the previous model. Do not reuse settings
+		// already mapped for the newly selected model.
+		delete base.reasoning;
+		delete base.service_tier;
+		delete base.text;
+		delete base.temperature;
+	}
+	if (!Object.hasOwn(base, "reasoning") && params.ctx.thinkingLevel) {
+		const effort = params.model.thinkingLevelMap?.[params.ctx.thinkingLevel] ?? params.ctx.thinkingLevel;
+		if (effort) base.reasoning = { effort, summary: "auto" };
+	}
+	return base;
+}
+
 /**
  * Owns the remote protocol seam. The lifecycle adapter supplies session facts;
  * V1 and V2 remain internal adapters and both return the same checkpoint shape.
@@ -55,10 +73,11 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 	}
 	const sessionId = params.ctx.sessionManager.getSessionId();
 	const baseUrl = auth.baseUrl ?? params.model.baseUrl;
+	const basePayload = compactionBasePayload(params);
 	const generatedTools = buildToolPayload(params.allTools, params.activeToolNames);
-	const tools = Array.isArray(params.basePayload?.tools) ? params.basePayload.tools : generatedTools;
-	const instructions = typeof params.basePayload?.instructions === "string"
-		? params.basePayload.instructions
+	const tools = Array.isArray(basePayload.tools) ? basePayload.tools : generatedTools;
+	const instructions = typeof basePayload.instructions === "string"
+		? basePayload.instructions
 		: params.ctx.getSystemPrompt();
 	// Leave room for the stable request prefix and the V2 trigger item.
 	const reservedTokens = approximateTokenCount({
@@ -83,7 +102,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 			url: resolveCodexCompactUrl(baseUrl),
 			headers,
 			body: buildLegacyCompactionRequestBody({
-				basePayload: params.basePayload,
+				basePayload,
 				model: params.model,
 				input,
 				instructions,
@@ -107,7 +126,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 	}
 
 	const body = buildCompactionRequestBody({
-		basePayload: params.basePayload,
+		basePayload,
 		model: params.model,
 		input,
 		instructions,

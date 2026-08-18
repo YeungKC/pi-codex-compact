@@ -2,6 +2,7 @@ import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-a
 import type { Model } from "@earendil-works/pi-ai";
 import { compactionHash } from "./capabilities.ts";
 import {
+	FAILED_REQUEST_KIND,
 	effectiveInputForBranch,
 	findNativeCheckpoint,
 	isFailClosedCompactionError,
@@ -11,6 +12,7 @@ import {
 	isOpenAICodexModel,
 	isJsonObject,
 	modelKey,
+	type FailedRequestDetails,
 	type JsonObject,
 	type NativeCompactionDetails,
 	type ResponseItem,
@@ -34,7 +36,13 @@ export type SessionCoordinatorDeps = {
 	getAllTools: () => Parameters<typeof effectiveInputForBranch>[0]["tools"];
 	createCheckpoint: CheckpointFactory;
 	appendCheckpoint: (details: NativeCompactionDetails) => void;
-	shouldAutoCompact?: (params: { ctx: ExtensionContext; model: Model<any>; input: ResponseItem[] }) => boolean;
+	appendFailedRequest?: (details: FailedRequestDetails) => void;
+	shouldAutoCompact?: (params: {
+		ctx: ExtensionContext;
+		model: Model<any>;
+		input: ResponseItem[];
+		reason?: "automatic" | "downshift";
+	}) => boolean;
 };
 
 type PendingTransition = {
@@ -71,6 +79,49 @@ function conversationLeafId(branch: SessionEntry[]): string | undefined {
 	return [...branch].reverse().find((entry) => entry.type !== "custom")?.id;
 }
 
+function activeFailedRequest(branch: SessionEntry[]): FailedRequestDetails | undefined {
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry?.type !== "custom" || entry.customType !== FAILED_REQUEST_KIND || !isJsonObject(entry.data)) continue;
+		if (typeof entry.data.entryId !== "string") return undefined;
+		const resolved = branch.slice(index + 1).some((candidate) =>
+			candidate.type === "message"
+				&& candidate.message.role === "assistant"
+				&& candidate.message.stopReason !== "error"
+				&& candidate.message.stopReason !== "aborted",
+		);
+		return resolved
+			? undefined
+			: {
+					kind: FAILED_REQUEST_KIND,
+					entryId: entry.data.entryId,
+					content: structuredClone(entry.data.content),
+				};
+	}
+	return undefined;
+}
+
+function branchWithoutFailedRequest(branch: SessionEntry[], failed: FailedRequestDetails | undefined): SessionEntry[] {
+	return failed ? branch.filter((entry) => entry.id !== failed.entryId) : branch;
+}
+
+function requestInputWithoutFailedRequest(
+	requestInput: ResponseItem[] | undefined,
+	failed: FailedRequestDetails | undefined,
+): ResponseItem[] | undefined {
+	if (!requestInput || !failed) return requestInput;
+	const lastUserIndex = requestInput.findLastIndex((item) => item.role === "user");
+	if (lastUserIndex < 0) return requestInput;
+	const failedIndex = requestInput.findLastIndex((item, index) =>
+		index < lastUserIndex
+			&& item.role === "user"
+			&& sameValue(item.content, failed.content),
+	);
+	return failedIndex < 0
+		? requestInput
+		: requestInput.filter((_item, index) => index !== failedIndex);
+}
+
 function hasBranchTailAfterCheckpoint(branch: SessionEntry[]): boolean {
 	const checkpoint = findNativeCheckpoint(branch);
 	return checkpoint.status !== "valid"
@@ -93,22 +144,27 @@ function textContent(value: unknown): string {
 	return Object.values(value).map(textContent).join("");
 }
 
+function messageContent(entry: Extract<SessionEntry, { type: "message" }>): unknown {
+	return (entry.message as unknown as JsonObject).content;
+}
+
 function branchBeforeCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): SessionEntry[] {
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const currentUserIndex = branch.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user");
 	const currentUser = currentUserIndex >= 0 ? branch[currentUserIndex] : undefined;
 	if (!requestUser || !currentUser || currentUser.type !== "message") return branch;
 	if (branch.slice(currentUserIndex + 1).some((entry) => entry.type === "message")) return branch;
-	return textContent(currentUser.message.content) === textContent(requestUser.content)
+	return textContent(messageContent(currentUser)) === textContent(requestUser.content)
 		? branch.filter((_entry, index) => index !== currentUserIndex)
 		: branch;
 }
 
 function checkpointPreservesCurrentUser(branch: SessionEntry[], requestInput: ResponseItem[] | undefined): boolean {
 	const checkpoint = findNativeCheckpoint(branch);
+	if (checkpoint.status !== "valid" || branch.slice(checkpoint.checkpoint.entryIndex + 1).some((entry) => entry.type === "message")) return false;
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
-	const preservedUser = checkpoint.status === "valid" ? checkpoint.checkpoint.details.preservedInput?.findLast((item) => item.role === "user") : undefined;
-	return Boolean(requestUser && preservedUser && textContent(preservedUser.content) === textContent(requestUser.content));
+	const preservedUser = checkpoint.checkpoint.details.preservedInput?.findLast((item) => item.role === "user");
+	return Boolean(requestUser && preservedUser && sameValue(preservedUser.content, requestUser.content));
 }
 
 function preserveCurrentUser(
@@ -119,8 +175,8 @@ function preserveCurrentUser(
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const currentUser = branch.findLast((entry) => entry.type === "message" && entry.message.role === "user");
 	if (!requestUser || !currentUser || currentUser.type !== "message") return details;
-	if (details.replacementHistory.some((item) => item.role === "user" && textContent(item.content) === textContent(requestUser.content))) return details;
-	return textContent(currentUser.message.content) === textContent(requestUser.content)
+	if (details.replacementHistory.some((item) => item.role === "user" && sameValue(item.content, requestUser.content))) return details;
+	return textContent(messageContent(currentUser)) === textContent(requestUser.content)
 		? { ...details, preservedInput: [structuredClone(requestUser)] }
 		: details;
 }
@@ -231,18 +287,20 @@ function pendingTransitionFromBranch(
 	);
 	const historyEnd = selectedIndex >= 0 ? selectedIndex : branch.length;
 	if (selectedIndex >= 0 && branch.slice(selectedIndex + 1).some((entry) => entry.type === "message" && entry.message.role === "assistant")) return undefined;
-	const previousAssistant = branch.slice(0, historyEnd).findLast((entry) =>
-		entry.type === "message"
-			&& entry.message.role === "assistant"
-			&& typeof entry.message.provider === "string"
-			&& typeof entry.message.api === "string"
-			&& typeof entry.message.model === "string",
-	);
+	const previousAssistant = branch.slice(0, historyEnd).findLast((entry) => {
+		if (entry.type !== "message") return false;
+		const message = entry.message as unknown as JsonObject;
+		return message.role === "assistant"
+			&& typeof message.provider === "string"
+			&& typeof message.api === "string"
+			&& typeof message.model === "string";
+	});
 	if (!previousAssistant || previousAssistant.type !== "message") return undefined;
+	const previousMessage = previousAssistant.message as unknown as JsonObject;
 	const previousModel = resolveModel(ctx, modelKey({
-		provider: previousAssistant.message.provider!,
-		api: previousAssistant.message.api!,
-		id: previousAssistant.message.model!,
+		provider: previousMessage.provider as string,
+		api: previousMessage.api as string,
+		id: previousMessage.model as string,
 	}));
 	if (!previousModel || !isOpenAICodexModel(previousModel)) return undefined;
 	const hashTransition = needsTransitionCompaction(previousModel, currentModel);
@@ -255,6 +313,14 @@ function pendingTransitionFromBranch(
 }
 
 export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
+	const rawGetBranch = deps.getBranch;
+	deps = {
+		...deps,
+		getBranch: (ctx) => {
+			const branch = rawGetBranch(ctx);
+			return branchWithoutFailedRequest(branch, activeFailedRequest(branch));
+		},
+	};
 	const pendingBySession = new Map<string, PendingTransition>();
 	const transitionBySession = new Map<string, Promise<void>>();
 	const automaticCompactionBySession = new Map<string, Promise<void>>();
@@ -267,6 +333,22 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		transitionBySession.clear();
 		automaticCompactionBySession.clear();
 		legacyMigrationBySession.clear();
+	};
+
+	const recordFailedRequest = (ctx: ExtensionContext, requestInput: ResponseItem[] | undefined): void => {
+		const requestUser = requestInput?.findLast((item) => item.role === "user");
+		if (!requestUser) return;
+		const entry = rawGetBranch(ctx).findLast((candidate) =>
+			candidate.type === "message"
+				&& candidate.message.role === "user"
+				&& textContent(candidate.message.content) === textContent(requestUser.content),
+		);
+		if (!entry) return;
+		deps.appendFailedRequest?.({
+			kind: FAILED_REQUEST_KIND,
+			entryId: entry.id,
+			content: structuredClone(requestUser.content),
+		});
 	};
 
 	const runTransition = async (
@@ -419,7 +501,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				allowCheckpointModelMismatch: true,
 				excludeLastAssistantError,
 			});
-			if (deps.shouldAutoCompact?.({ ctx, model, input }) !== true) return;
+			if (deps.shouldAutoCompact?.({ ctx, model, input, reason: "downshift" }) !== true) return;
 		}
 		const startGeneration = generation;
 		const transition = previousModel
@@ -500,6 +582,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		skipAutomaticCompaction = false,
 	): Promise<ResponseItem[] | undefined> => {
 		const sessionId = ctx.sessionManager.getSessionId();
+		requestInput = requestInputWithoutFailedRequest(requestInput, activeFailedRequest(rawGetBranch(ctx)));
 		let transitionCompactionCompleted = false;
 		const activeTransition = transitionBySession.get(sessionId);
 		if (activeTransition) {
@@ -536,31 +619,22 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			?? model;
 		const tools = deps.getAllTools();
 		const historyBranch = branchBeforeCurrentUser(branchBefore, requestInput);
-		const legacyCheckpoint = checkpoint.status === "legacy";
-		const historyInput = legacyCheckpoint
-			? fullInputForBranch({ branch: historyBranch, model: historyModel, tools })
-			: effectiveInputForBranch({
-					branch: historyBranch,
-					model: historyModel,
-					tools,
-					allowCheckpointModelMismatch: true,
-				});
+		const historyInput = effectiveInputForBranch({
+			branch: historyBranch,
+			model: historyModel,
+			tools,
+			allowCheckpointModelMismatch: true,
+		});
 		const rawHistoryInput = fullInputForBranch({ branch: historyBranch, model: historyModel, tools });
-		const piContextInput = legacyCheckpoint
-			? rawHistoryInput
-			: piContextInputForBranch({ branch: historyBranch, model: historyModel, tools });
-		const currentHistoryInput = legacyCheckpoint
-			? fullInputForBranch({ branch: historyBranch, model, tools })
-			: effectiveInputForBranch({
-					branch: historyBranch,
-					model,
-					tools,
-					allowCheckpointModelMismatch: true,
-				});
+		const piContextInput = piContextInputForBranch({ branch: historyBranch, model: historyModel, tools });
+		const currentHistoryInput = effectiveInputForBranch({
+			branch: historyBranch,
+			model,
+			tools,
+			allowCheckpointModelMismatch: true,
+		});
 		const currentRawHistoryInput = fullInputForBranch({ branch: historyBranch, model, tools });
-		const currentPiContextInput = legacyCheckpoint
-			? currentRawHistoryInput
-			: piContextInputForBranch({ branch: historyBranch, model, tools });
+		const currentPiContextInput = piContextInputForBranch({ branch: historyBranch, model, tools });
 		const systemPromptInput = systemPromptInputForModel(model, ctx.getSystemPrompt());
 		const runLegacyMigration = async (): Promise<NativeCompactionDetails> => {
 			if (checkpoint.status !== "legacy" || !requestInput) {
@@ -652,7 +726,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		}
 		if (pending && pending.targetModelKey === modelKey(model)) {
 			const shouldRun = pending.reason === "hash"
-				|| deps.shouldAutoCompact?.({ ctx, model, input: currentHistoryInput }) === true;
+				|| deps.shouldAutoCompact?.({ ctx, model, input: currentHistoryInput, reason: pending.reason }) === true;
 			if (!shouldRun) {
 				pendingBySession.delete(sessionId);
 			} else {
@@ -745,47 +819,15 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		model: Model<any>,
 		ctx: ExtensionContext,
 		requestInput?: ResponseItem[],
-		basePayload?: JsonObject,
 		excludeLastAssistantError = false,
 		signal?: AbortSignal,
 	): Promise<ResponseItem[]> => {
 		if (!isOpenAICodexModel(model)) return [];
+		requestInput = requestInputWithoutFailedRequest(requestInput, activeFailedRequest(rawGetBranch(ctx)));
 		const operationSignal = signal ?? ctx.signal;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const activeTransition = transitionBySession.get(sessionId);
 		if (activeTransition) await activeTransition;
-		const branch = deps.getBranch(ctx);
-		let pending = pendingBySession.get(sessionId);
-		const checkpoint = findNativeCheckpoint(branch);
-		if (!pending && checkpoint.status === "none") {
-			pending = pendingTransitionFromBranch(branch, model, ctx);
-			if (pending) pendingBySession.set(sessionId, pending);
-		}
-		if (pending && pending.targetModelKey !== modelKey(model)) {
-			throw new Error("The pending Codex model transition targets a different model.");
-		}
-		if (pending) {
-			const startGeneration = generation;
-			const transition = runTransition(
-				sessionId,
-				ctx,
-				pending.previousModel,
-				pending.targetModelKey,
-				model,
-				basePayload,
-				startGeneration,
-				requestInput,
-				excludeLastAssistantError,
-				operationSignal,
-			);
-			transitionBySession.set(sessionId, transition);
-			try {
-				await transition;
-			} finally {
-				if (transitionBySession.get(sessionId) === transition) transitionBySession.delete(sessionId);
-			}
-		}
-		await recoverCurrentModel(model, ctx, basePayload, requestInput, true, excludeLastAssistantError, operationSignal);
 		ensureNotAborted(operationSignal);
 		const currentBranch = deps.getBranch(ctx);
 		return effectiveInputForBranch({
@@ -799,6 +841,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 
 	return {
 		clear,
+		recordFailedRequest,
 		selectModel,
 		recoverCurrentModel,
 		prepareRequest,

@@ -6,6 +6,7 @@ import {
 	findNativeCheckpoint,
 	fullInputForBranch,
 	modelKey,
+	FAILED_REQUEST_KIND,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
 	type NativeCompactionDetails,
@@ -64,13 +65,13 @@ function legacyDetails(key: string): Record<string, unknown> {
 	};
 }
 
-function customEntry(data: unknown, id = "checkpoint"): SessionEntry {
+function customEntry(data: unknown, id = "checkpoint", customType = NATIVE_COMPACTION_KIND): SessionEntry {
 	return {
 		id,
 		parentId: null,
 		timestamp: new Date().toISOString(),
 		type: "custom",
-		customType: NATIVE_COMPACTION_KIND,
+		customType,
 		data,
 	} as unknown as SessionEntry;
 }
@@ -103,11 +104,77 @@ function createCoordinator(
 				: details(modelKey(selectedModel)),
 		}),
 		appendCheckpoint: (value) => branch.push(customEntry(value)),
+		appendFailedRequest: (value) => branch.push(customEntry(value, "failed-request", FAILED_REQUEST_KIND)),
 		shouldAutoCompact: shouldAutoCompact ? ({ input }) => shouldAutoCompact(input) : undefined,
 	});
 }
 
 describe("Codex session coordinator", () => {
+	test("does not replay a failed user before a later request", async () => {
+		const currentModel = model("new");
+		const branch = [customEntry(details(modelKey(currentModel))), userEntry("failed", "failed-user")];
+		const coordinator = createCoordinator(branch);
+		const ctx = context([currentModel]);
+		coordinator.recordFailedRequest(ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("failed"),
+		]);
+
+		await expect(coordinator.prepareRequest(currentModel, ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("failed"),
+			userInput("new request"),
+		])).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("new request"),
+		]);
+	});
+
+	test("keeps a failed user as the next retry input", async () => {
+		const currentModel = model("new");
+		const branch = [customEntry(details(modelKey(currentModel))), userEntry("failed", "failed-user")];
+		const coordinator = createCoordinator(branch);
+		const ctx = context([currentModel]);
+		coordinator.recordFailedRequest(ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("failed"),
+		]);
+
+		await expect(coordinator.prepareRequest(currentModel, ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("failed"),
+		])).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("failed"),
+		]);
+	});
+
+	test("removes the nearest failed duplicate, not an older matching user", async () => {
+		const currentModel = model("new");
+		const branch = [
+			customEntry(details(modelKey(currentModel))),
+			userEntry("same", "older"),
+			userEntry("same", "failed-user"),
+		];
+		const coordinator = createCoordinator(branch);
+		const ctx = context([currentModel]);
+		coordinator.recordFailedRequest(ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+		]);
+
+		await expect(coordinator.prepareRequest(currentModel, ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+			userInput("same"),
+			userInput("new"),
+		])).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+			userInput("new"),
+		]);
+	});
+
 	test("skips model-transition compaction when either hash is absent", async () => {
 		const oldModel = model("unknown");
 		const currentModel = model("unknownOther");
@@ -392,18 +459,25 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(2);
 	});
 
-	test("does not replay a malformed current checkpoint", async () => {
+	test("replays full history after a malformed current checkpoint", async () => {
 		const currentModel = model("old");
-		const branch = [customEntry({
-			kind: NATIVE_COMPACTION_KIND,
-			version: NATIVE_COMPACTION_VERSION,
-			strategy: "v2",
-			modelKey: modelKey(currentModel),
-			replacementHistory: [],
-		})];
+		const branch = [
+			userEntry("old"),
+			userEntry("hello"),
+			customEntry({
+				kind: NATIVE_COMPACTION_KIND,
+				version: NATIVE_COMPACTION_VERSION,
+				strategy: "v2",
+				modelKey: modelKey(currentModel),
+				replacementHistory: [],
+			}),
+		];
 		const coordinator = createCoordinator(branch);
 
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("hello")])).rejects.toThrow("malformed");
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("old"), userInput("hello")])).resolves.toEqual([
+			userInput("old"),
+			userInput("hello"),
+		]);
 	});
 
 	test("preserves a persisted current user without duplicating it", async () => {
@@ -423,7 +497,23 @@ describe("Codex session coordinator", () => {
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "transition" }, userInput("current")]);
 	});
 
-	test("prepares explicit compaction after a model transition", async () => {
+	test("does not drop a new user that repeats a preserved user's content", async () => {
+		const currentModel = model("old");
+		const branch = [customEntry({ ...details(modelKey(currentModel)), preservedInput: [userInput("same")] }), userEntry("same", "current")];
+		const coordinator = createCoordinator(branch);
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+			userInput("same"),
+		])).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+			userInput("same"),
+		]);
+	});
+
+	test("manual compaction does not run model-transition compaction", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
 		const branch = [userEntry("history")];
@@ -434,33 +524,23 @@ describe("Codex session coordinator", () => {
 		});
 
 		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
-		await expect(coordinator.prepareCompaction(currentModel, context([oldModel, currentModel]), [userInput("history")])).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "transition" },
-			userInput("history"),
-		]);
-		expect(compactedWith).toEqual([modelKey(oldModel)]);
+		await expect(coordinator.prepareCompaction(currentModel, context([oldModel, currentModel]), [userInput("history")])).resolves.toEqual([]);
+		expect(compactedWith).toEqual([]);
 	});
 
-	test("does not append a canceled explicit transition checkpoint", async () => {
-		const oldModel = model("old");
-		const currentModel = model("new");
-		const branch = [userEntry("history")];
+	test("manual compaction still honors cancellation", async () => {
+		const currentModel = model("current");
 		const controller = new AbortController();
-		const coordinator = createCoordinator(branch, async (selectedModel) => {
-			if (selectedModel === oldModel) controller.abort(new Error("canceled"));
-			return details(modelKey(selectedModel), "canceled");
-		});
+		controller.abort(new Error("canceled"));
+		const coordinator = createCoordinator([userEntry("history")]);
 
-		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
 		await expect(coordinator.prepareCompaction(
 			currentModel,
-			context([oldModel, currentModel]),
+			context([currentModel]),
 			[userInput("history")],
-			undefined,
 			false,
 			controller.signal,
 		)).rejects.toThrow("canceled");
-		expect(branch).toHaveLength(1);
 	});
 
 	test("runs automatic compaction before the provider request", async () => {

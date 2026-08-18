@@ -51,7 +51,7 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`. Missing o
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `remoteCompactionV2` | `true` | Use Codex V2; set `false` only for the legacy V1 endpoint. |
-| `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold. |
+| `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold, capped at 90% of the model context window as in Codex. |
 | `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` counts growth after the current compaction window's prefix. Until a prefix baseline exists, only the context-window hard cap triggers compaction. |
 
 The extension does not probe endpoints at runtime.
@@ -65,7 +65,7 @@ Where Pi exposes the needed lifecycle hooks, this extension follows Codex CLI's 
 - Replays the checkpoint with the active Pi branch tail on later requests.
 - Defers model-transition compaction until the first request after model selection.
 - Runs automatic compaction before a provider request, not after an aborted turn.
-- Retains recent eligible messages, drops old tool/reasoning items, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
+- Retains recent eligible user and agent messages, drops developer/system and old tool/reasoning items, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
 - Retries transient HTTP and stream failures. For eligible model/request failures during a transition, it retries with the newly selected model.
 
 Unsupported providers keep Pi's normal local text summarization.

@@ -1,11 +1,11 @@
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { shouldAutoCompact } from "./scheduler.ts";
 import { autoCompactTokenLimit, loadConfig } from "./config.ts";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
 import { createSessionCoordinator } from "./session-coordinator.ts";
 import {
 	estimateCompactionWindowPrefillTokens,
+	FAILED_REQUEST_KIND,
 	findNativeCheckpoint,
 	fullInputForBranch,
 	isJsonObject,
@@ -57,7 +57,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 			});
 		},
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
-		shouldAutoCompact: ({ ctx, model, input }) => {
+		appendFailedRequest: (details) => pi.appendEntry(FAILED_REQUEST_KIND, details),
+		shouldAutoCompact: ({ ctx, model, input, reason }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			// Pi exposes assistant usage but not Codex's window counters; estimate the stable prefix.
 			const estimatedStablePrefixTokens = approximateTokenCount({
@@ -80,6 +81,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				},
 				limit,
 				scope: config.autoCompactScope,
+				reason,
 			});
 		},
 	});
@@ -107,8 +109,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("before_provider_request", async (event, ctx) => {
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
+		const requestInput = Array.isArray(event.payload.input) ? event.payload.input : undefined;
 		try {
-			const requestInput = Array.isArray(event.payload.input) ? event.payload.input : undefined;
 			const input = await coordinator.prepareRequest(
 				model,
 				ctx,
@@ -120,8 +122,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 			payload.input = input;
 			return payload;
 		} catch (error) {
+			coordinator.recordFailedRequest(ctx, requestInput);
 			ctx.abort();
-			closeOpenAICodexWebSocketSessions(ctx.sessionManager.getSessionId());
 			if (ctx.hasUI) {
 				ctx.ui.notify(`OpenAI Codex request blocked: ${errorMessage(error)}`, "error");
 			}
@@ -147,7 +149,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				model,
 				ctx,
 				requestInput,
-				undefined,
 				event.reason === "overflow" && event.willRetry,
 				event.signal,
 			);
