@@ -185,20 +185,25 @@ function requestTail(
 }
 
 // ponytail: O(history × request) only on the legacy migration fallback; index item IDs if fork transforms make this hot.
-function requestTailAfterKnownHistory(requestInput: ResponseItem[], histories: ResponseItem[][]): ResponseItem[] {
-	let lastKnownRequestIndex = -1;
+function unmatchedRequestItems(requestInput: ResponseItem[], histories: ResponseItem[][]): ResponseItem[] {
+	let bestMatches: number[] = [];
 	for (const history of histories) {
 		let requestIndex = 0;
-		let matchedRequestIndex = -1;
+		const matches: number[] = [];
 		for (const historyItem of history) {
 			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && sameItem(item, historyItem));
 			if (nextIndex < 0) break;
 			requestIndex = nextIndex + 1;
-			matchedRequestIndex = nextIndex;
+			matches.push(nextIndex);
 		}
-		lastKnownRequestIndex = Math.max(lastKnownRequestIndex, matchedRequestIndex);
+		const lastMatch = matches.at(-1) ?? -1;
+		const bestLastMatch = bestMatches.at(-1) ?? -1;
+		if (matches.length > bestMatches.length || (matches.length === bestMatches.length && lastMatch > bestLastMatch)) {
+			bestMatches = matches;
+		}
 	}
-	return requestInput.slice(lastKnownRequestIndex + 1);
+	const matchedIndexes = new Set(bestMatches);
+	return requestInput.filter((_item, index) => !matchedIndexes.has(index));
 }
 
 function resolveModel(ctx: ExtensionContext, key: string): Model<any> | undefined {
@@ -575,7 +580,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			if (checkpoint.status === "legacy") {
 				const migrated = await runLegacyMigration();
 				const preserved = migrated.preservedInput ?? [];
-				let migratedTail = requestTailAfterKnownHistory(requestInput!, [
+				let migratedTail = unmatchedRequestItems(requestInput!, [
 					rawHistoryInput,
 					currentRawHistoryInput,
 					historyInput,

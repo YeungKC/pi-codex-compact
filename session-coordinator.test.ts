@@ -283,6 +283,23 @@ describe("Codex session coordinator", () => {
 		]);
 	});
 
+	test("preserves unmatched transformed items around legacy history", async () => {
+		const currentModel = model("old");
+		const branch = [userEntry("one", "one"), userEntry("two", "two"), customEntry(legacyDetails(modelKey(currentModel)))];
+		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
+			expect(input).toEqual([userInput("one"), userInput("two")]);
+			return details(modelKey(currentModel), "migrated");
+		});
+		const request = [userInput("prefix"), userInput("one"), userInput("middle"), userInput("two"), userInput("new")];
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "migrated" },
+			userInput("prefix"),
+			userInput("middle"),
+			userInput("new"),
+		]);
+	});
+
 	test("uses the legacy checkpoint model before falling back to the current model", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
