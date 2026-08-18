@@ -8,7 +8,8 @@ import {
 import { calculateCost, type Message, type Model, type Usage } from "@earendil-works/pi-ai";
 
 export const NATIVE_COMPACTION_KIND = "openai-codex-native-compaction";
-export const NATIVE_COMPACTION_VERSION = 1;
+export const NATIVE_COMPACTION_VERSION = 2;
+const LEGACY_NATIVE_COMPACTION_VERSION = 1;
 export const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 export const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
 
@@ -117,15 +118,29 @@ export interface NativeCompactionDetails {
 	replacementHistory: ResponseItem[];
 }
 
+export type LegacyNativeCompactionDetails = {
+	kind: typeof NATIVE_COMPACTION_KIND;
+	version: typeof LEGACY_NATIVE_COMPACTION_VERSION;
+	modelKey: string;
+	compHash?: string;
+};
+
 export type NativeCheckpoint = {
 	entryIndex: number;
 	entryId: string;
 	details: NativeCompactionDetails;
 };
 
+export type LegacyNativeCheckpoint = {
+	entryIndex: number;
+	entryId: string;
+	details: LegacyNativeCompactionDetails;
+};
+
 export type CheckpointLookup =
 	| { status: "none" }
 	| { status: "invalid"; entryIndex: number; entryId: string }
+	| { status: "legacy"; checkpoint: LegacyNativeCheckpoint }
 	| { status: "valid"; checkpoint: NativeCheckpoint };
 
 export type RemoteCompactionResult = {
@@ -164,8 +179,10 @@ function isResponseItem(value: unknown): value is ResponseItem {
 	}
 	switch (value.type) {
 		case "message":
-	case "agent_message":
 			return typeof value.role === "string" && (typeof value.content === "string" || Array.isArray(value.content));
+		case "agent_message":
+			return Array.isArray(value.content)
+				&& ((typeof value.author === "string" && typeof value.recipient === "string") || typeof value.role === "string");
 		case "function_call":
 			return typeof value.call_id === "string" && typeof value.name === "string" && typeof value.arguments === "string";
 		case "function_call_output":
@@ -221,6 +238,21 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	};
 }
 
+/** Recognizes the v1 checkpoint without trusting its replacement history. */
+export function parseLegacyNativeCompactionDetails(value: unknown): LegacyNativeCompactionDetails | undefined {
+	if (!isJsonObject(value)) return undefined;
+	if (value.kind !== NATIVE_COMPACTION_KIND || value.version !== LEGACY_NATIVE_COMPACTION_VERSION) return undefined;
+	if (value.strategy === "token-budget") return undefined;
+	if (typeof value.modelKey !== "string" || !Array.isArray(value.replacementHistory)) return undefined;
+	if (value.compHash !== undefined && typeof value.compHash !== "string") return undefined;
+	return {
+		kind: NATIVE_COMPACTION_KIND,
+		version: LEGACY_NATIVE_COMPACTION_VERSION,
+		modelKey: value.modelKey,
+		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
+	};
+}
+
 export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
@@ -238,12 +270,22 @@ export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
 			continue;
 		}
 
+		if (isJsonObject(rawDetails) && rawDetails.strategy === "token-budget") continue;
 		const details = parseNativeCompactionDetails(rawDetails);
-		if (!details) return { status: "invalid", entryIndex: index, entryId: entry.id };
-		return {
-			status: "valid",
-			checkpoint: { entryIndex: index, entryId: entry.id, details },
-		};
+		if (details) {
+			return {
+				status: "valid",
+				checkpoint: { entryIndex: index, entryId: entry.id, details },
+			};
+		}
+		const legacyDetails = parseLegacyNativeCompactionDetails(rawDetails);
+		if (legacyDetails) {
+			return {
+				status: "legacy",
+				checkpoint: { entryIndex: index, entryId: entry.id, details: legacyDetails },
+			};
+		}
+		return { status: "invalid", entryIndex: index, entryId: entry.id };
 	}
 	return { status: "none" };
 }
@@ -480,6 +522,7 @@ export function piContextInputForBranch(params: {
 	tools: ToolInfo[];
 }): ResponseItem[] {
 	const checkpoint = findNativeCheckpoint(params.branch);
+	if (checkpoint.status === "legacy") return fullInputForBranch(params);
 	const remoteCheckpoint = checkpoint.status === "valid";
 	const boundaryEnd = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : params.branch.length;
 	let firstKeptEntryId: string | undefined;
@@ -532,6 +575,9 @@ export function effectiveInputForBranch(params: {
 	const checkpoint = findNativeCheckpoint(branch);
 	if (checkpoint.status === "invalid") {
 		throw new Error("The latest OpenAI Codex native compaction checkpoint is malformed.");
+	}
+	if (checkpoint.status === "legacy") {
+		return fullInputForBranch({ branch, model: params.model, tools: params.tools });
 	}
 	if (checkpoint.status === "valid") {
 		if (
@@ -667,12 +713,6 @@ function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | 
 	if (!Array.isArray(copy.content)) return copy;
 
 	const truncatedContent = copy.content.flatMap((part) => {
-		const imageTokens = imagePartCount(part) * 1_200;
-		if (imageTokens > 0) {
-			if (remainingCharacters < imageTokens * 4) return [];
-			remainingCharacters -= imageTokens * 4;
-			return [part];
-		}
 		if (!isJsonObject(part) || typeof part.text !== "string") return [part];
 		if (remainingCharacters <= 0) return [];
 		const text = truncateTextPrefix(part.text, remainingCharacters);
@@ -763,9 +803,35 @@ function isFinalAnswerAgentMessage(item: ResponseItem): boolean {
 		&& first.text.startsWith("Message Type: FINAL_ANSWER\n");
 }
 
+function isDescendantProgressAgentMessage(item: ResponseItem): boolean {
+	if (item.type !== "agent_message" || !Array.isArray(item.content)) return false;
+	if (typeof item.author !== "string" || typeof item.recipient !== "string") return false;
+	const first = item.content[0];
+	return item.author.startsWith(`${item.recipient}/`)
+		&& isJsonObject(first)
+		&& first.type === "input_text"
+		&& typeof first.text === "string"
+		&& first.text.startsWith("Message Type: MESSAGE\n");
+}
+
+function retainedMessageTokens(item: ResponseItem): number {
+	if (typeof item.content === "string") return Math.ceil(item.content.length / 4);
+	if (!Array.isArray(item.content)) return 0;
+	return item.content.reduce((total, part) => {
+		if (!isJsonObject(part) || (part.type !== "input_text" && part.type !== "output_text") || typeof part.text !== "string") return total;
+		return total + Math.ceil(part.text.length / 4);
+	}, 0);
+}
+
+function retainedItemTokens(item: ResponseItem): number {
+	return item.type === "agent_message" ? approximateTokens(item) : retainedMessageTokens(item);
+}
+
 function retainedByCodex(item: ResponseItem): boolean {
 	if (item.type === "agent_message") {
-		return !isFinalAnswerAgentMessage(item) && approximateTokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
+		return !isDescendantProgressAgentMessage(item)
+			&& !isFinalAnswerAgentMessage(item)
+			&& approximateTokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
 	}
 	if (item.type !== "message" && item.type !== undefined) return false;
 	return item.role === "user" && isRetainedUserMessage(item);
@@ -777,7 +843,7 @@ export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED
 	const retained: ResponseItem[] = [];
 	for (const item of [...items].reverse()) {
 		if (remaining <= 0 || !retainedByCodex(item)) continue;
-		const tokens = approximateTokens(item);
+		const tokens = retainedItemTokens(item);
 		if (tokens <= remaining) {
 			retained.push(cloneItem(item));
 			remaining -= tokens;
@@ -1208,7 +1274,7 @@ async function parseSseResponse(
 		if (event.type === "response.output_item.done" && isResponseItem(event.item) && event.item.type === "compaction") {
 			compactionItems.push(event.item);
 		}
-		if (event.type === "response.completed" || event.type === "response.done") {
+		if (event.type === "response.completed") {
 			completed = true;
 			stopReading = true;
 			usage = isJsonObject(event.response) ? event.response.usage : undefined;
@@ -1413,10 +1479,13 @@ export async function callLegacyRemoteCompaction(params: {
 				await delay(delayMs, params.signal);
 				continue;
 			}
-			let parsed: JsonObject;
+			let parsed: unknown;
 			try {
-				parsed = await response.json() as JsonObject;
+				parsed = await response.json();
 			} catch {
+				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid JSON.");
+			}
+			if (!isJsonObject(parsed)) {
 				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid JSON.");
 			}
 			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {

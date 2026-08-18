@@ -33,7 +33,7 @@ The current upstream snapshot (official `openai/codex` main, checked through 202
 
 3. **V1 request shape**
    - The legacy remote path uses the compact conversation endpoint without the V2 `compaction_trigger` item.
-   - The upstream V1 body carries model, input, instructions, tools, parallel tool calls, optional reasoning/service tier/prompt-cache/text controls. The extension reuses available non-input payload fields and keeps V1 behind explicit local configuration as required by ADR 0001.
+   - The upstream V1 body carries model, input, instructions, tools, parallel tool calls, and available request controls. The extension reuses available non-input payload fields and keeps V1 behind explicit local configuration.
    - V1 is unary JSON. V2 is the streamed Responses path. They do not share the same terminal-event contract.
 
 4. **Retry and transport**
@@ -65,7 +65,7 @@ The current upstream snapshot (official `openai/codex` main, checked through 202
 ### Deliberate differences
 
 - Provider capability routing, Responses Lite, Codex request metadata/turn state, and WebSocket-to-HTTPS fallback are not exposed by the installed Pi 0.84.2 extension seams.
-- Upstream V2 currently preserves media items while charging their text budget conservatively; repeated large media can still grow replacement history. The extension applies a best-effort image weight instead of claiming exact media parity.
+- Upstream V2 preserves eligible media items outside the retained text-token budget. The extension mirrors that retention rule; its separate request and threshold estimates still use a best-effort image weight.
 
 - Capability metadata and Codex's WebSocket-to-HTTPS transport fallback are not exposed by Pi. The extension uses the explicit V1/V2 config and HTTPS `fetch` path.
 - Token counts use bounded JSON-size and image-weight approximations. They are not Codex's internal tokenizer.
@@ -73,7 +73,9 @@ The current upstream snapshot (official `openai/codex` main, checked through 202
 
 ### Adversarial findings fixed in this work
 
-- Cross-model transitions now fail closed when a compaction hash is unavailable. Rebound checkpoints also remove a previous model's `compHash` when the selected model has no comparable hash; a stale hash cannot be carried into a fork rebase.
+- Cross-model transitions now run only when both frozen `comp_hash` values exist and differ. Missing hashes skip only the transition check; rebound checkpoints remove a previous model's hash when the selected model has no comparable hash.
+- Version-1 native checkpoints are recognized as legacy state and migrated by remote-compacting the full branch on the first request. A failed migration is retried on a later request.
+- Model downshift compaction runs at the new model's automatic limit, independently of `comp_hash`.
 - `bodyAfterPrefix` uses Total when Pi has no reliable prefix baseline. The approximate prefix is recorded only as an observable estimate.
 - Compaction bodies preserve provider-supplied tools and tool-choice fields from the authoritative request payload instead of always rebuilding plain function tools.
 - Debug and status error records now expose status/code/retry metadata without persisting raw HTTP/SSE error bodies. Authoritative instructions and provider-supplied tools/tool choice are reused from the request payload.

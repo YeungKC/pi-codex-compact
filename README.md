@@ -10,7 +10,7 @@ In practice, this lets a single Codex session continue through repeated compacti
 
 ## Install
 
-Requires Node.js `>=22.19.0`, Pi `>=0.80.10`, and an `openai-codex` model.
+Requires Node.js `>=22.19.0`, Pi `>=0.84.2`, and an `openai-codex` model.
 
 ```bash
 pi install npm:@yeungkc/pi-codex-compact
@@ -78,7 +78,8 @@ Codex CLI internally owns exact `comp_hash` capability metadata, token accountin
 
 The extension therefore:
 
-- fails closed when the persisted and selected models lack comparable compaction hashes;
+- uses the frozen Codex model hash snapshot; an absent hash skips only hash-transition compaction;
+- migrates version-1 native checkpoints by remote-compacting the full branch on the first request;
 - estimates history, stable system/tool prefix, images, and tool output for automatic compaction;
 - treats the actual pre-provider request as authoritative when a fork has changed Pi's inherited history.
 

@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
 	test("marks authentication failures fail-closed", async () => {
@@ -373,6 +373,29 @@ describe("Codex compaction history", () => {
 				fetchImpl: async () => {
 					calls++;
 					return new Response("{", { status: 200 });
+				},
+			});
+			const failure = promise.catch((error) => error);
+			await vi.runAllTimersAsync();
+			expect(await failure).toMatchObject({ message: expect.stringContaining("invalid JSON") });
+			expect(calls).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("does not retry a null V1 JSON success response", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const promise = callLegacyRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				fetchImpl: async () => {
+					calls++;
+					return new Response("null", { status: 200 });
 				},
 			});
 			const failure = promise.catch((error) => error);
@@ -784,10 +807,33 @@ describe("Codex compaction history", () => {
 
 	test("drops oversized and final-answer agent messages", () => {
 		const result = retainRecentMessages([
-			{ type: "agent_message", content: [{ type: "input_text", text: `Message Type: COMMENTARY\n${"x".repeat(40_000)}` }] },
-			{ type: "agent_message", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\ndone" }] },
+			{ type: "agent_message", author: "a", recipient: "b", content: [{ type: "input_text", text: `Message Type: COMMENTARY\n${"x".repeat(40_000)}` }] },
+			{ type: "agent_message", author: "a", recipient: "b", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\ndone" }] },
 		]);
 		expect(result).toEqual([]);
+	});
+
+	test("drops descendant progress agent messages even when they are small", () => {
+		const result = retainRecentMessages([
+			{ type: "agent_message", author: "root/child", recipient: "root", content: [{ type: "input_text", text: "Message Type: MESSAGE\nprogress" }] },
+		]);
+		expect(result).toEqual([]);
+	});
+
+	test("accepts the wire-shaped AgentMessage in a current checkpoint", () => {
+		const details = parseNativeCompactionDetails({
+			kind: NATIVE_COMPACTION_KIND,
+			version: NATIVE_COMPACTION_VERSION,
+			strategy: "v1",
+			modelKey: "openai-codex:openai-codex-responses:test",
+			replacementHistory: [{
+				type: "agent_message",
+				author: "root",
+				recipient: "root/child",
+				content: [{ type: "input_text", text: "Message Type: COMMENTARY\\nkeep" }],
+			}],
+		});
+		expect(details?.replacementHistory).toHaveLength(1);
 	});
 
 	test("does not share the agent-message limit across items", () => {
@@ -805,11 +851,13 @@ describe("Codex compaction history", () => {
 		expect(result).toHaveLength(1);
 	});
 
-	test("counts images in best-effort token accounting", () => {
+	test("keeps retained images outside Codex's text budget", () => {
 		expect(approximateResponseItemTokens([{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] }])).toBeGreaterThanOrEqual(1_200);
 		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image" }, { type: "input_image" }] }])).toBeGreaterThanOrEqual(2_400);
 		expect(approximateResponseItemTokens([{ type: "function_call_output", output: [{ type: "input_image", image_url: `data:image/png;base64,${"x".repeat(40_000)}` }] }])).toBeLessThan(2_000);
-		expect(retainRecentMessages([{ type: "message", role: "user", content: [{ type: "input_image" }] }], 1_199)).toEqual([]);
+		expect(retainRecentMessages([{ type: "message", role: "user", content: [{ type: "input_image" }] }], 1_199)).toEqual([
+			{ type: "message", role: "user", content: [{ type: "input_image" }] },
+		]);
 	});
 
 	test("truncates an oversized message without throwing", () => {
@@ -934,7 +982,7 @@ describe("Codex compaction history", () => {
 	test("accepts an empty V1 replacement history", () => {
 		const details = parseNativeCompactionDetails({
 			kind: "openai-codex-native-compaction",
-			version: 1,
+			version: NATIVE_COMPACTION_VERSION,
 			strategy: "v1",
 			modelKey: "openai-codex:openai-codex-responses:test",
 			replacementHistory: [],
@@ -945,7 +993,7 @@ describe("Codex compaction history", () => {
 	test("accepts a V1 replacement history without an opaque item", () => {
 		const details = parseNativeCompactionDetails({
 			kind: "openai-codex-native-compaction",
-			version: 1,
+			version: NATIVE_COMPACTION_VERSION,
 			strategy: "v1",
 			modelKey: "openai-codex:openai-codex-responses:test",
 			replacementHistory: [{ type: "message", role: "user", content: [{ type: "input_text", text: "summary" }] }],
@@ -972,26 +1020,43 @@ describe("Codex compaction history", () => {
 	test("accepts a persisted compaction hash", () => {
 		expect(parseNativeCompactionDetails({
 			kind: "openai-codex-native-compaction",
-			version: 1,
+			version: NATIVE_COMPACTION_VERSION,
 			modelKey: "openai-codex:openai-codex-responses:test",
 			compHash: "3000",
 			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
 		})?.compHash).toBe("3000");
 	});
 
-	test("accepts a legacy checkpoint without strategy", () => {
-		expect(parseNativeCompactionDetails({
+	test("recognizes a legacy checkpoint for B1 migration", () => {
+		expect(parseLegacyNativeCompactionDetails({
 			kind: "openai-codex-native-compaction",
 			version: 1,
 			modelKey: "openai-codex:openai-codex-responses:test",
 			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
-		})?.strategy).toBe("v2");
+		})?.modelKey).toBe("openai-codex:openai-codex-responses:test");
 	});
 
-	test("rejects the removed token-budget strategy", () => {
+	test("ignores the removed local token-budget checkpoint", () => {
+		expect(findNativeCheckpoint([{
+			id: "local",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "custom",
+			customType: NATIVE_COMPACTION_KIND,
+			data: {
+				kind: NATIVE_COMPACTION_KIND,
+				version: 1,
+				strategy: "token-budget",
+				modelKey: "openai-codex:openai-codex-responses:test",
+				replacementHistory: [],
+			},
+		}] as never).status).toBe("none");
+	});
+
+	test("rejects the removed token-budget strategy in a current checkpoint", () => {
 		expect(parseNativeCompactionDetails({
 			kind: "openai-codex-native-compaction",
-			version: 1,
+			version: NATIVE_COMPACTION_VERSION,
 			strategy: "token-budget",
 			modelKey: "openai-codex:openai-codex-responses:test",
 			replacementHistory: [],

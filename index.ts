@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { compactionCapability, compactionHash } from "./capabilities.ts";
 import { shouldAutoCompact } from "./scheduler.ts";
 import { autoCompactTokenLimit, loadConfig, type CompactionDebugLevel } from "./config.ts";
@@ -6,8 +7,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
 import { createSessionCoordinator } from "./session-coordinator.ts";
 import {
-	effectiveInputForBranch,
 	findNativeCheckpoint,
+	fullInputForBranch,
 	isJsonObject,
 	isOpenAICodexModel,
 	mergeFeatureHeader,
@@ -198,12 +199,9 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
-		const sessionId = ctx.sessionManager.getSessionId();
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
 		try {
-			const transitionFailure = coordinator.transitionFailure(sessionId, model);
-			if (transitionFailure) throw new Error(transitionFailure);
 			const requestInput = Array.isArray(event.payload.input) ? event.payload.input : undefined;
 			const input = await coordinator.prepareRequest(
 				model,
@@ -218,13 +216,13 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 			return payload;
 		} catch (error) {
 			ctx.abort();
+			closeOpenAICodexWebSocketSessions(ctx.sessionManager.getSessionId());
 			if (ctx.hasUI) {
 				ctx.ui.notify(`OpenAI Codex request blocked: ${errorMessage(error)}`, "error");
 			}
-			const payload: JsonObject = { ...event.payload, input: null };
-			delete payload.messages;
-			delete payload.previous_response_id;
-			return payload;
+			// The abort signal stops Pi's provider call. A synthetic `input: null`
+			// would create a second protocol error.
+			return undefined;
 		}
 	});
 
@@ -238,12 +236,18 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
 		try {
 			const branch = event.branchEntries as SessionEntry[];
-			const input = effectiveInputForBranch({
+			const requestInput = fullInputForBranch({
 				branch,
 				model,
 				tools: pi.getAllTools(),
-				excludeLastAssistantError: event.reason === "overflow" && event.willRetry,
 			});
+			const input = await coordinator.prepareCompaction(
+				model,
+				ctx,
+				requestInput,
+				undefined,
+				event.reason === "overflow" && event.willRetry,
+			);
 			const native = await withCompactionStatus(ctx, () => createNativeCheckpoint({
 				ctx,
 				model,
@@ -254,7 +258,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				activeToolNames: pi.getActiveTools(),
 				debug: debugSink(ctx, config.debug),
 			}));
-			const requestUser = input.findLast((item) => item.role === "user");
+			const requestUser = requestInput.findLast((item) => item.role === "user");
 			const knownUsers = [
 				...native.details.replacementHistory,
 				...(native.details.preservedInput ?? []),
