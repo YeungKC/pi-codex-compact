@@ -1,7 +1,4 @@
 import type { Model } from "@earendil-works/pi-ai";
-import type { CodexCompactionConfig } from "./config.ts";
-
-export type CodexCompactionCapability = "v2" | "v1" | "local";
 
 // Snapshot from codex-rs/models-manager/models.json at the frozen Codex baseline.
 // An absent entry means that Codex has no comparable comp_hash metadata.
@@ -17,13 +14,4 @@ const CODEX_COMPACTION_HASHES: Record<string, string> = {
 export function compactionHash(model: Model<any>): string | undefined {
 	if (model.provider !== "openai-codex" || model.api !== "openai-codex-responses") return undefined;
 	return CODEX_COMPACTION_HASHES[model.id];
-}
-
-/** Mirrors Codex's local provider routing: OpenAI supports remote compaction; other providers do not. */
-export function compactionCapability(
-	model: Model<any>,
-	config: CodexCompactionConfig,
-): CodexCompactionCapability {
-	if (model.provider !== "openai-codex" || model.api !== "openai-codex-responses") return "local";
-	return config.remoteCompactionV2 ? "v2" : "v1";
 }

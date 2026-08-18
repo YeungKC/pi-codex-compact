@@ -9,6 +9,7 @@ import {
 	piContextInputForBranch,
 	systemPromptInputForModel,
 	isOpenAICodexModel,
+	isJsonObject,
 	modelKey,
 	type JsonObject,
 	type NativeCompactionDetails,
@@ -32,7 +33,6 @@ export type SessionCoordinatorDeps = {
 	getBranch: (ctx: ExtensionContext) => SessionEntry[];
 	getAllTools: () => Parameters<typeof effectiveInputForBranch>[0]["tools"];
 	createCheckpoint: CheckpointFactory;
-	withStatus: <T>(ctx: ExtensionContext, operation: () => Promise<T>) => Promise<T>;
 	appendCheckpoint: (details: NativeCompactionDetails) => void;
 	shouldAutoCompact?: (params: { ctx: ExtensionContext; model: Model<any>; input: ResponseItem[] }) => boolean;
 };
@@ -80,7 +80,7 @@ function hasBranchTailAfterCheckpoint(branch: SessionEntry[]): boolean {
 function textContent(value: unknown): string {
 	if (typeof value === "string") return value;
 	if (Array.isArray(value)) return value.map(textContent).join("");
-	if (!isRecord(value)) return "";
+	if (!isJsonObject(value)) return "";
 	if (value.type === "image") {
 		return `[image:${typeof value.mimeType === "string" ? value.mimeType : ""}:${typeof value.data === "string" ? value.data : ""}]`;
 	}
@@ -136,12 +136,8 @@ function rebindCheckpoint(details: NativeCompactionDetails, modelKeyValue: strin
 
 function preserveRequestUser(details: NativeCompactionDetails, requestInput: ResponseItem[]): NativeCompactionDetails {
 	const requestUser = requestInput.findLast((item) => item.role === "user");
-	if (!requestUser || details.replacementHistory.some((item) => sameItem(item, requestUser))) return details;
+	if (!requestUser || details.replacementHistory.some((item) => sameValue(item, requestUser))) return details;
 	return { ...details, preservedInput: [structuredClone(requestUser)] };
-}
-
-function sameItem(left: ResponseItem, right: ResponseItem): boolean {
-	return sameValue(left, right);
 }
 
 function ensureNotAborted(signal?: AbortSignal): void {
@@ -157,15 +153,11 @@ function sameValue(left: unknown, right: unknown): boolean {
 			&& left.length === right.length
 			&& left.every((item, index) => sameValue(item, right[index]));
 	}
-	if (!isRecord(left) || !isRecord(right)) return false;
+	if (!isJsonObject(left) || !isJsonObject(right)) return false;
 	const leftKeys = Object.keys(left);
 	const rightKeys = Object.keys(right);
 	return leftKeys.length === rightKeys.length
 		&& leftKeys.every((key) => Object.hasOwn(right, key) && sameValue(left[key], right[key]));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function requestTail(
@@ -177,7 +169,7 @@ function requestTail(
 	const candidates = prefixes.flatMap((value) => systemPromptInput.length > 0 ? [value, [...systemPromptInput, ...value]] : [value]);
 	for (const prefix of candidates) {
 		if (requestInput.length < prefix.length) continue;
-		if (prefix.every((item, index) => sameItem(item, requestInput[index]!))) {
+		if (prefix.every((item, index) => sameValue(item, requestInput[index]!))) {
 			return requestInput.slice(prefix.length);
 		}
 	}
@@ -195,7 +187,7 @@ function unmatchedRequestItems(
 		let requestIndex = 0;
 		const matches: number[] = [];
 		for (const historyItem of history) {
-			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && sameItem(item, historyItem));
+			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && sameValue(item, historyItem));
 			if (nextIndex < 0) continue;
 			requestIndex = nextIndex + 1;
 			matches.push(nextIndex);
@@ -209,7 +201,7 @@ function unmatchedRequestItems(
 	const matchedIndexes = new Set(bestMatches);
 	const preservedIndexes = new Set<number>();
 	for (const preservedItem of preservedItems) {
-		const preservedIndex = requestInput.findLastIndex((item, index) => !preservedIndexes.has(index) && sameItem(item, preservedItem));
+		const preservedIndex = requestInput.findLastIndex((item, index) => !preservedIndexes.has(index) && sameValue(item, preservedItem));
 		if (preservedIndex >= 0) {
 			preservedIndexes.add(preservedIndex);
 			matchedIndexes.delete(preservedIndex);
@@ -218,7 +210,7 @@ function unmatchedRequestItems(
 	const unmatched = requestInput.filter((_item, index) => !matchedIndexes.has(index));
 	return [
 		...unmatched,
-		...preservedItems.filter((item) => !requestInput.some((requestItem) => sameItem(requestItem, item))),
+		...preservedItems.filter((item) => !requestInput.some((requestItem) => sameValue(requestItem, item))),
 	];
 }
 
@@ -237,9 +229,9 @@ function pendingTransitionFromBranch(
 	const selectedIndex = branch.findLastIndex((entry) =>
 		entry.type === "model_change" && entry.provider === currentModel.provider && entry.modelId === currentModel.id,
 	);
-	if (selectedIndex < 0) return undefined;
-	if (branch.slice(selectedIndex + 1).some((entry) => entry.type === "message" && entry.message.role === "assistant")) return undefined;
-	const previousAssistant = branch.slice(0, selectedIndex).findLast((entry) =>
+	const historyEnd = selectedIndex >= 0 ? selectedIndex : branch.length;
+	if (selectedIndex >= 0 && branch.slice(selectedIndex + 1).some((entry) => entry.type === "message" && entry.message.role === "assistant")) return undefined;
+	const previousAssistant = branch.slice(0, historyEnd).findLast((entry) =>
 		entry.type === "message"
 			&& entry.message.role === "assistant"
 			&& typeof entry.message.provider === "string"
@@ -303,20 +295,20 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			});
 			let native: Awaited<ReturnType<CheckpointFactory>>;
 			try {
-				native = await deps.withStatus(ctx, () => deps.createCheckpoint({
+				native = await deps.createCheckpoint({
 					ctx,
 					model: previousModel,
 					input,
 					basePayload,
 					signal: operationSignal,
-				}));
+				});
 			} catch (firstError) {
 				if (
 					(modelKey(currentModel) === modelKey(previousModel) && compactionHash(currentModel) === compactionHash(previousModel))
 					|| !shouldRetryWithCurrentModel(firstError)
 				) throw firstError;
 				try {
-					native = await deps.withStatus(ctx, () => deps.createCheckpoint({
+					native = await deps.createCheckpoint({
 						ctx,
 						model: currentModel,
 						input: effectiveInputForBranch({
@@ -328,7 +320,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						}),
 						basePayload,
 						signal: operationSignal,
-					}));
+					});
 				} catch {
 					throw firstError;
 				}
@@ -362,13 +354,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
 		const previousModel = resolveModel(ctx, legacy.checkpoint.details.modelKey);
 		const historyModel = previousModel && isOpenAICodexModel(previousModel) ? previousModel : model;
-		const createFor = (selectedModel: Model<any>) => deps.withStatus(ctx, () => deps.createCheckpoint({
+		const createFor = (selectedModel: Model<any>) => deps.createCheckpoint({
 			ctx,
 			model: selectedModel,
 			input: fullInputForBranch({ branch: compactionBranch, model: selectedModel, tools: deps.getAllTools() }),
 			basePayload,
 			signal: operationSignal,
-		}));
+		});
 		let native: Awaited<ReturnType<CheckpointFactory>>;
 		try {
 			native = await createFor(historyModel);
@@ -435,7 +427,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			: (async () => {
 					const branch = deps.getBranch(ctx);
 					const leafId = conversationLeafId(branch);
-					const native = await deps.withStatus(ctx, () => deps.createCheckpoint({
+					const native = await deps.createCheckpoint({
 						ctx,
 						model,
 						input: effectiveInputForBranch({
@@ -447,7 +439,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 						}),
 						basePayload,
 						signal: operationSignal,
-					}));
+					});
 					ensureNotAborted(operationSignal);
 					if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 						throw new Error("The session changed while Codex model-transition compaction was running.");
@@ -605,13 +597,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				return [...migrated.replacementHistory, ...migratedTail];
 			}
 			if (!pending && checkpoint.status === "none") return undefined;
-			const createCheckpointFor = (selectedModel: Model<any>) => deps.withStatus(ctx, () => deps.createCheckpoint({
+			const createCheckpointFor = (selectedModel: Model<any>) => deps.createCheckpoint({
 				ctx,
 				model: selectedModel,
 				input: requestInput!,
 				basePayload,
 				signal: ctx.signal,
-			}));
+			});
 			let native: Awaited<ReturnType<CheckpointFactory>>;
 			try {
 				native = await createCheckpointFor(historyModel);
@@ -709,13 +701,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				) {
 					const startGeneration = generation;
 					const leafId = conversationLeafId(branch);
-					const automaticCompaction = deps.withStatus(ctx, () => deps.createCheckpoint({
+					const automaticCompaction = deps.createCheckpoint({
 						ctx,
 						model,
 						input: currentHistory,
 						basePayload,
 						signal: ctx.signal,
-					})).then((native) => {
+					}).then((native) => {
 						ensureNotAborted(ctx.signal);
 						if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 							throw new Error("The session changed while Codex automatic compaction was running.");

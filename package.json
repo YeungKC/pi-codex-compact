@@ -29,8 +29,7 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.84.2",
-    "@earendil-works/pi-coding-agent": ">=0.84.2",
-    "@earendil-works/pi-tui": ">=0.84.2"
+    "@earendil-works/pi-coding-agent": ">=0.84.2"
   },
   "publishConfig": {
     "access": "public"
@@ -43,16 +42,11 @@
   "files": [
     "index.ts",
     "config.ts",
-    "config.test.ts",
     "capabilities.ts",
     "scheduler.ts",
     "native-compaction.ts",
     "remote-compaction.ts",
     "session-coordinator.ts",
-    "native-compaction.test.ts",
-    "session-coordinator.test.ts",
-    "capabilities.test.ts",
-    "scheduler.test.ts",
     "README.md",
     "LICENSE"
   ],

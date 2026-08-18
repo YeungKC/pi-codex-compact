@@ -89,6 +89,22 @@ function userInput(text: string): ResponseItem {
 	return { role: "user", content: [{ type: "input_text", text }] };
 }
 
+function assistantEntry(selectedModel: Model<any>, id = "assistant"): SessionEntry {
+	return {
+		id,
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		type: "message",
+		message: {
+			role: "assistant",
+			provider: selectedModel.provider,
+			api: selectedModel.api,
+			model: selectedModel.id,
+			content: [{ type: "text", text: "answer" }],
+		},
+	} as unknown as SessionEntry;
+}
+
 function createCoordinator(
 	branch: SessionEntry[] = [],
 	createCheckpoint?: (selectedModel: Model<any>, input: ResponseItem[], basePayload?: Record<string, unknown>) => Promise<NativeCompactionDetails>,
@@ -102,7 +118,6 @@ function createCoordinator(
 				? await createCheckpoint(selectedModel, input, basePayload)
 				: details(modelKey(selectedModel)),
 		}),
-		withStatus: async (_ctx, operation) => operation(),
 		appendCheckpoint: (value) => branch.push(customEntry(value)),
 		shouldAutoCompact: shouldAutoCompact ? ({ input }) => shouldAutoCompact(input) : undefined,
 	});
@@ -137,6 +152,22 @@ describe("Codex session coordinator", () => {
 
 		expect(compactedWith).toEqual([modelKey(oldModel)]);
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, userInput("hello")]);
+	});
+
+	test("recovers a model transition when a resumed session has no model-change entry", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const branch = [assistantEntry(oldModel)];
+		const compactedWith: string[] = [];
+		const coordinator = createCoordinator(branch, async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			return details(modelKey(selectedModel), "resumed");
+		});
+
+		const input = await coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")]);
+
+		expect(compactedWith).toEqual([modelKey(oldModel)]);
+		expect(input).toEqual([{ type: "compaction", encrypted_content: "resumed" }, userInput("hello")]);
 	});
 
 	test("compacts on a context-window downshift only at the auto limit", async () => {

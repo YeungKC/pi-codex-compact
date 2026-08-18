@@ -12,10 +12,8 @@ import {
 	callRemoteCompaction,
 	filterLegacyCompactionHistory,
 	modelKey,
-	approximateResponseItemTokens,
 	approximateTokenCount,
 	markFallbackEligibility,
-	type NativeCompactionDebugSink,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
 	resolveCodexCompactUrl,
@@ -35,7 +33,6 @@ export type NativeCheckpointRequest = {
 	config: CodexCompactionConfig;
 	allTools: Parameters<typeof buildToolPayload>[0];
 	activeToolNames: string[];
-	debug?: NativeCompactionDebugSink;
 };
 
 export type NativeCheckpointResult = {
@@ -54,13 +51,6 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 			new Error(auth.ok ? "OpenAI Codex authentication is unavailable." : auth.error),
 			false,
 		);
-		params.debug?.({
-			phase: "failed",
-			strategy: params.config.remoteCompactionV2 ? "v2" : "v1",
-			model: modelKey(params.model),
-			error: "authentication failed",
-			retryWithCurrentModel: false,
-		});
 		throw error;
 	}
 	const sessionId = params.ctx.sessionManager.getSessionId();
@@ -81,19 +71,6 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		params.model.contextWindow,
 		reservedTokens,
 	);
-	params.debug?.({
-		phase: "input",
-		strategy: params.config.remoteCompactionV2 ? "v2" : "v1",
-		model: modelKey(params.model),
-		inputItems: params.input.length,
-		trimmedInputItems: input.length,
-		estimatedInputTokens: approximateResponseItemTokens(input),
-		reservedTokens,
-		toolCount: Array.isArray(tools) ? tools.length : 0,
-		toolTypes: Array.isArray(tools)
-			? tools.flatMap((tool) => typeof tool === "object" && tool !== null && typeof (tool as { type?: unknown }).type === "string" ? [(tool as { type: string }).type] : [])
-			: [],
-	});
 	const headers = buildCodexHeaders({
 		apiKey: auth.apiKey,
 		headers: auth.headers,
@@ -115,7 +92,6 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 			}),
 			model: params.model,
 			signal: params.signal,
-			onDebug: params.debug,
 		});
 		return {
 			details: {
@@ -144,7 +120,6 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		body,
 		model: params.model,
 		signal: params.signal,
-		onDebug: params.debug,
 	});
 	return {
 		details: {

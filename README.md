@@ -32,20 +32,19 @@ Confirm that Pi registered the package:
 pi list
 ```
 
-Then, in an `openai-codex` session, run `/compact`. A successful remote compaction displays `✓ OpenAI compaction complete`. The checkpoint is stored in the local Pi session JSONL and is replayed on later requests.
+Then, in an `openai-codex` session, run `/compact`. The checkpoint is stored in the local Pi session JSONL and is replayed on later requests.
 
 ## Configuration
 
 No configuration is required. By default, the extension uses Codex remote-compaction V2 and automatically compacts retained history at 90% of the selected model's context window. The current user input is not included in this pre-request threshold check.
 
-Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`, or in a trusted project's `.pi/pi-codex-compact.json`. Pi loads the global file first; valid project settings override it. Missing or invalid fields leave the global or default value in place:
+Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`. Missing or invalid fields leave the defaults in place:
 
 ```json
 {
   "remoteCompactionV2": false,
   "autoCompactTokenLimit": 128000,
-  "autoCompactScope": "total",
-  "debug": "errors"
+  "autoCompactScope": "total"
 }
 ```
 
@@ -54,9 +53,8 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`, or in a t
 | `remoteCompactionV2` | `true` | Use Codex V2; set `false` only for the legacy V1 endpoint. |
 | `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold. |
 | `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` excludes a reliable prefix baseline when Pi exposes one. |
-| `debug` | `"off"` | Persist sanitized compaction diagnostics: `"errors"` records retries/failures; `"verbose"` also records thresholds, requests, responses, and SSE event types. |
 
-The extension does not probe endpoints at runtime. Debug entries never include request input, authorization, tool payloads, or opaque checkpoint content.
+The extension does not probe endpoints at runtime.
 
 ## Behavior
 

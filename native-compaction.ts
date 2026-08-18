@@ -77,37 +77,6 @@ export function isFailClosedCompactionError(message: string): boolean {
 export type JsonObject = Record<string, unknown>;
 export type ResponseItem = JsonObject & { type?: string };
 
-export type NativeCompactionDebugEvent = {
-	phase: "input" | "request" | "response" | "stream" | "retry" | "complete" | "failed" | "threshold" | "transition";
-	strategy?: "v1" | "v2";
-	model?: string;
-	previousModel?: string;
-	previousHashAvailable?: boolean;
-	currentHashAvailable?: boolean;
-	url?: string;
-	attempt?: number;
-	maxAttempts?: number;
-	inputItems?: number;
-	trimmedInputItems?: number;
-	estimatedInputTokens?: number;
-	reservedTokens?: number;
-	toolCount?: number;
-	toolTypes?: string[];
-	activeContextTokens?: number;
-	prefillTokens?: number;
-	limit?: number;
-	scope?: "total" | "bodyAfterPrefix";
-	baselineSource?: "unavailable" | "approximation";
-	decision?: boolean;
-	status?: number;
-	eventType?: string;
-	delayMs?: number;
-	error?: string;
-	retryWithCurrentModel?: boolean;
-};
-
-export type NativeCompactionDebugSink = (event: NativeCompactionDebugEvent) => void;
-
 export interface NativeCompactionDetails {
 	kind: typeof NATIVE_COMPACTION_KIND;
 	version: typeof NATIVE_COMPACTION_VERSION;
@@ -144,13 +113,11 @@ export type CheckpointLookup =
 	| { status: "valid"; checkpoint: NativeCheckpoint };
 
 export type RemoteCompactionResult = {
-	strategy: "v2";
 	compactionItem: ResponseItem;
 	usage?: Usage;
 };
 
 export type LegacyCompactionResult = {
-	strategy: "v1";
 	replacementHistory: ResponseItem[];
 	usage?: Usage;
 };
@@ -502,10 +469,7 @@ export function fullInputForBranch(params: {
 	model: Model<any>;
 	tools: ToolInfo[];
 }): ResponseItem[] {
-	const messages = params.branch
-		.filter((entry) => entry.type !== "compaction")
-		.flatMap((entry) => sessionEntryToContextMessages(entry));
-	return messagesToResponseItems(params.model, convertToLlm(messages), params.tools);
+	return entriesToResponseItems(params.model, params.branch, params.tools);
 }
 
 /** Reconstructs the context Pi sends after a real CompactionEntry. */
@@ -1019,47 +983,6 @@ export function markFallbackEligibility(error: Error, eligible: boolean): Error 
 	return error as Error & { retryWithCurrentModel: boolean };
 }
 
-function emitDebug(sink: NativeCompactionDebugSink | undefined, event: NativeCompactionDebugEvent): void {
-	try {
-		sink?.(event);
-	} catch {}
-}
-
-function debugUrl(url: string): string {
-	try {
-		const parsed = new URL(url);
-		parsed.username = "";
-		parsed.password = "";
-		parsed.search = "";
-		parsed.hash = "";
-		const path = parsed.pathname;
-		const safePath = path.endsWith("/responses/compact")
-			? "/responses/compact"
-			: path.endsWith("/responses")
-				? "/responses"
-				: path.endsWith("/compact")
-					? "/compact"
-					: "/[path-redacted]";
-		return `${parsed.origin}${safePath}`;
-	} catch {
-		return "[invalid-url]";
-	}
-}
-
-export function compactionErrorSummary(error: unknown): string {
-	const object = typeof error === "object" && error !== null ? error as { name?: unknown; message?: unknown; compactionCode?: unknown; retryWithCurrentModel?: unknown } : {};
-	const message = typeof object.message === "string" ? object.message : String(error);
-	const code = typeof object.compactionCode === "string"
-		? object.compactionCode
-		: message.match(/compaction failed \(([^)]+)\)/i)?.[1];
-	const name = typeof object.name === "string" ? object.name : "Error";
-	return [
-		name,
-		code ? `code=${code}` : undefined,
-		object.retryWithCurrentModel === undefined ? undefined : `fallback=${object.retryWithCurrentModel}`,
-	].filter(Boolean).join(" ");
-}
-
 class NonRetryableCompactionError extends Error {}
 class RetryableCompactionStreamError extends Error {}
 
@@ -1168,7 +1091,6 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 async function parseSseResponse(
 	response: Response,
 	signal?: AbortSignal,
-	onDebug?: NativeCompactionDebugSink,
 ): Promise<{ item: ResponseItem; usage?: unknown }> {
 	if (signal?.aborted) throw abortError(signal);
 	if (!response.body) {
@@ -1209,10 +1131,6 @@ async function parseSseResponse(
 				false,
 			);
 		}
-		emitDebug(onDebug, {
-			phase: "stream",
-			eventType: typeof event.type === "string" ? event.type : "[missing-type]",
-		});
 		if (event.type === "error") {
 			const nested = isJsonObject(event.error) ? event.error : {};
 			const code = typeof event.code === "string"
@@ -1347,21 +1265,18 @@ function usageFromResponse(model: Model<any>, value: unknown): Usage | undefined
 	return usage;
 }
 
-export async function callRemoteCompaction(params: {
+async function runRemoteCompaction<T>(params: {
 	url: string;
 	headers: Headers;
 	body: JsonObject;
-	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
-	onDebug?: NativeCompactionDebugSink;
-}): Promise<RemoteCompactionResult> {
+	prefix: string;
+	parse: (response: Response) => Promise<T>;
+}): Promise<T> {
 	const fetchImpl = params.fetchImpl ?? fetch;
-	const url = debugUrl(params.url);
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
-		const attemptNumber = attempt + 1;
-		emitDebug(params.onDebug, { phase: "request", strategy: "v2", url, attempt: attemptNumber, maxAttempts: MAX_REMOTE_RETRIES + 1 });
 		try {
 			const response = await fetchImpl(params.url, {
 				method: "POST",
@@ -1369,45 +1284,48 @@ export async function callRemoteCompaction(params: {
 				body: JSON.stringify(params.body),
 				signal: params.signal,
 			});
-			emitDebug(params.onDebug, { phase: "response", strategy: "v2", url, attempt: attemptNumber, status: response.status });
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
 				const classified = classifyHttpCompactionError(
 					response.status,
 					body || response.statusText,
-					"OpenAI Codex compaction failed",
+					params.prefix,
 				);
 				if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
 				lastError = classified.error;
-				const delayMs = parseRetryDelay(response) ?? 1000 * 2 ** attempt;
-				emitDebug(params.onDebug, { phase: "retry", strategy: "v2", attempt: attemptNumber, delayMs, error: compactionErrorSummary(classified.error), retryWithCurrentModel: classified.error.retryWithCurrentModel });
-				await delay(delayMs, params.signal);
+				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
 				continue;
 			}
-			const parsed = await parseSseResponse(response, params.signal, params.onDebug);
-			emitDebug(params.onDebug, { phase: "complete", strategy: "v2", url, attempt: attemptNumber });
-			return { strategy: "v2", compactionItem: parsed.item, usage: usageFromResponse(params.model, parsed.usage) };
+			return await params.parse(response);
 		} catch (error) {
 			if (params.signal?.aborted) {
-				const aborted = markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
-				emitDebug(params.onDebug, { phase: "failed", strategy: "v2", url, attempt: attemptNumber, error: compactionErrorSummary(aborted), retryWithCurrentModel: false });
-				throw aborted;
+				throw markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
 			}
-			if (error instanceof NonRetryableCompactionError) {
-				emitDebug(params.onDebug, { phase: "failed", strategy: "v2", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as Error & { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
-				throw error;
-			}
+			if (error instanceof NonRetryableCompactionError) throw error;
 			lastError = error;
-			if (attempt === MAX_REMOTE_RETRIES) {
-				emitDebug(params.onDebug, { phase: "failed", strategy: "v2", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
-				throw error;
-			}
-			const delayMs = 1000 * 2 ** attempt;
-				emitDebug(params.onDebug, { phase: "retry", strategy: "v2", attempt: attemptNumber, delayMs, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
-			await delay(delayMs, params.signal);
+			if (attempt === MAX_REMOTE_RETRIES) throw error;
+			await delay(1000 * 2 ** attempt, params.signal);
 		}
 	}
-	throw lastError instanceof Error ? lastError : new Error("OpenAI Codex compaction failed.");
+	throw lastError instanceof Error ? lastError : new Error(params.prefix);
+}
+
+export function callRemoteCompaction(params: {
+	url: string;
+	headers: Headers;
+	body: JsonObject;
+	model: Model<any>;
+	signal?: AbortSignal;
+	fetchImpl?: typeof fetch;
+}): Promise<RemoteCompactionResult> {
+	return runRemoteCompaction({
+		...params,
+		prefix: "OpenAI Codex compaction failed",
+		parse: async (response) => {
+			const parsed = await parseSseResponse(response, params.signal);
+			return { compactionItem: parsed.item, usage: usageFromResponse(params.model, parsed.usage) };
+		},
+	});
 }
 
 export function buildLegacyCompactionRequestBody(params: {
@@ -1443,43 +1361,18 @@ export function resolveCodexCompactUrl(baseUrl?: string): string {
 	return `${resolveCodexResponsesUrl(baseUrl)}/compact`;
 }
 
-export async function callLegacyRemoteCompaction(params: {
+export function callLegacyRemoteCompaction(params: {
 	url: string;
 	headers: Headers;
 	body: JsonObject;
 	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
-	onDebug?: NativeCompactionDebugSink;
 }): Promise<LegacyCompactionResult> {
-	const fetchImpl = params.fetchImpl ?? fetch;
-	const url = debugUrl(params.url);
-	let lastError: unknown;
-	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
-		const attemptNumber = attempt + 1;
-		emitDebug(params.onDebug, { phase: "request", strategy: "v1", url, attempt: attemptNumber, maxAttempts: MAX_REMOTE_RETRIES + 1 });
-		try {
-			const response = await fetchImpl(params.url, {
-				method: "POST",
-				headers: params.headers,
-				body: JSON.stringify(params.body),
-				signal: params.signal,
-			});
-			emitDebug(params.onDebug, { phase: "response", strategy: "v1", url, attempt: attemptNumber, status: response.status });
-			if (!response.ok) {
-				const body = await response.text().catch(() => "");
-				const classified = classifyHttpCompactionError(
-					response.status,
-					body || response.statusText,
-					"OpenAI Codex legacy compaction failed",
-				);
-				if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
-				lastError = classified.error;
-				const delayMs = parseRetryDelay(response) ?? 1000 * 2 ** attempt;
-				emitDebug(params.onDebug, { phase: "retry", strategy: "v1", attempt: attemptNumber, delayMs, error: compactionErrorSummary(classified.error), retryWithCurrentModel: classified.error.retryWithCurrentModel });
-				await delay(delayMs, params.signal);
-				continue;
-			}
+	return runRemoteCompaction({
+		...params,
+		prefix: "OpenAI Codex legacy compaction failed",
+		parse: async (response) => {
 			let parsed: unknown;
 			try {
 				parsed = await response.json();
@@ -1492,34 +1385,12 @@ export async function callLegacyRemoteCompaction(params: {
 			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {
 				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid output.");
 			}
-			const result = {
-				strategy: "v1" as const,
+			return {
 				replacementHistory: parsed.output.map(cloneItem),
 				usage: usageFromResponse(params.model, parsed.usage),
 			};
-			emitDebug(params.onDebug, { phase: "complete", strategy: "v1", url, attempt: attemptNumber });
-			return result;
-		} catch (error) {
-			if (params.signal?.aborted) {
-				const aborted = markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
-				emitDebug(params.onDebug, { phase: "failed", strategy: "v1", url, attempt: attemptNumber, error: compactionErrorSummary(aborted), retryWithCurrentModel: false });
-				throw aborted;
-			}
-			if (error instanceof NonRetryableCompactionError) {
-				emitDebug(params.onDebug, { phase: "failed", strategy: "v1", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as Error & { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
-				throw error;
-			}
-			lastError = error;
-			if (attempt === MAX_REMOTE_RETRIES) {
-				emitDebug(params.onDebug, { phase: "failed", strategy: "v1", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
-				throw error;
-			}
-			const delayMs = 1000 * 2 ** attempt;
-				emitDebug(params.onDebug, { phase: "retry", strategy: "v1", attempt: attemptNumber, delayMs, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
-			await delay(delayMs, params.signal);
-		}
-	}
-	throw lastError instanceof Error ? lastError : new Error("OpenAI Codex legacy compaction failed.");
+		},
+	});
 }
 
 export function stripInputFromPayload(payload: JsonObject): JsonObject {

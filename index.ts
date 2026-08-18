@@ -1,9 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/api/openai-codex-responses";
-import { compactionCapability, compactionHash } from "./capabilities.ts";
 import { shouldAutoCompact } from "./scheduler.ts";
-import { autoCompactTokenLimit, loadConfig, type CompactionDebugLevel } from "./config.ts";
-import { Text } from "@earendil-works/pi-tui";
+import { autoCompactTokenLimit, loadConfig } from "./config.ts";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
 import { createSessionCoordinator } from "./session-coordinator.ts";
 import {
@@ -16,50 +14,15 @@ import {
 	approximateResponseItemTokens,
 	approximateTokenCount,
 	buildToolPayload,
-	compactionErrorSummary,
 	stripInputFromPayload,
-	modelKey,
 	NATIVE_COMPACTION_KIND,
 	type JsonObject,
-	type NativeCompactionDebugEvent,
-	type NativeCompactionDebugSink,
 } from "./native-compaction.ts";
 
-type CompactionStatus = {
-	state: "running" | "complete" | "failed";
-	error?: string;
-};
-
-const COMPACTION_STATUS_KIND = "openai-codex-compaction-status";
-const COMPACTION_DEBUG_KIND = "openai-codex-compaction-debug";
 const LOCAL_MARKER = "OpenAI Codex native compaction checkpoint.";
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-function debugText(event: NativeCompactionDebugEvent): string {
-	const parts = [`◌ Codex compaction ${event.phase}`];
-	if (event.strategy) parts.push(event.strategy);
-	if (event.model) parts.push(event.model);
-	if (event.previousModel) parts.push(`previous=${event.previousModel}`);
-	if (event.previousHashAvailable !== undefined) parts.push(`previousHash=${event.previousHashAvailable}`);
-	if (event.currentHashAvailable !== undefined) parts.push(`currentHash=${event.currentHashAvailable}`);
-	if (event.attempt !== undefined) parts.push(`attempt=${event.attempt}/${event.maxAttempts ?? "?"}`);
-	if (event.status !== undefined) parts.push(`status=${event.status}`);
-	if (event.eventType) parts.push(`event=${event.eventType}`);
-	if (event.delayMs !== undefined) parts.push(`delay=${event.delayMs}ms`);
-	if (event.estimatedInputTokens !== undefined) parts.push(`input≈${event.estimatedInputTokens}`);
-	if (event.reservedTokens !== undefined) parts.push(`reserved≈${event.reservedTokens}`);
-	if (event.toolCount !== undefined) parts.push(`tools=${event.toolCount}`);
-	if (event.toolTypes?.length) parts.push(`toolTypes=${event.toolTypes.join(",")}`);
-	if (event.activeContextTokens !== undefined) parts.push(`active≈${event.activeContextTokens}`);
-	if (event.limit !== undefined) parts.push(`limit=${event.limit}`);
-	if (event.scope) parts.push(`scope=${event.scope}`);
-	if (event.baselineSource) parts.push(`baseline=${event.baselineSource}`);
-	if (event.decision !== undefined) parts.push(`auto=${event.decision}`);
-	if (event.error) parts.push(event.error);
-	return parts.join(" ");
 }
 
 function setFeatureHeader(headers: Record<string, string | null>, includeRemoteCompactionV2: boolean): void {
@@ -76,49 +39,6 @@ function setFeatureHeader(headers: Record<string, string | null>, includeRemoteC
 
 export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
-	pi.registerEntryRenderer<NativeCompactionDebugEvent>(COMPACTION_DEBUG_KIND, (entry, _options, theme) => {
-		return new Text(theme.fg("accent", debugText(entry.data)), 0, 0);
-	});
-
-	pi.registerEntryRenderer<CompactionStatus>(COMPACTION_STATUS_KIND, (entry, _options, theme) => {
-		const data = entry.data;
-		if (data?.state === "running") {
-			return new Text(theme.fg("accent", "◐ OpenAI compaction running…"), 0, 0);
-		}
-		if (data?.state === "complete") {
-			return new Text(theme.fg("success", "✓ OpenAI compaction complete"), 0, 0);
-		}
-		const suffix = data?.error ? `: ${data.error}` : "";
-		return new Text(theme.fg("error", `✗ OpenAI compaction failed${suffix}`), 0, 0);
-	});
-
-	const appendCompactionStatus = (ctx: ExtensionContext, status: CompactionStatus): void => {
-		if (ctx.mode === "tui") pi.appendEntry(COMPACTION_STATUS_KIND, status);
-	};
-
-	const debugSink = (_ctx: ExtensionContext, level: CompactionDebugLevel | undefined): NativeCompactionDebugSink | undefined => {
-		if (!level || level === "off") return undefined;
-		return (event) => {
-			if (level === "errors" && event.phase !== "failed" && event.phase !== "retry") return;
-			pi.appendEntry(COMPACTION_DEBUG_KIND, event);
-		};
-	};
-
-	const withCompactionStatus = async <T>(
-		ctx: ExtensionContext,
-		operation: () => Promise<T>,
-	): Promise<T> => {
-		appendCompactionStatus(ctx, { state: "running" });
-		try {
-			const result = await operation();
-			appendCompactionStatus(ctx, { state: "complete" });
-			return result;
-		} catch (error) {
-			appendCompactionStatus(ctx, { state: "failed", error: compactionErrorSummary(error) });
-			throw error;
-		}
-	};
-
 	const coordinator = createSessionCoordinator({
 		getBranch: (ctx) => ctx.sessionManager.getBranch() as SessionEntry[],
 		getAllTools: () => pi.getAllTools(),
@@ -133,10 +53,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				config,
 				allTools: pi.getAllTools(),
 				activeToolNames: pi.getActiveTools(),
-				debug: debugSink(ctx, config.debug),
 			});
 		},
-		withStatus: withCompactionStatus,
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
 		shouldAutoCompact: ({ ctx, model, input }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
@@ -147,22 +65,11 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 			});
 			const activeContextTokens = approximateResponseItemTokens(input) + estimatedPrefillTokens;
 			const limit = autoCompactTokenLimit(config, model.contextWindow);
-			const decision = shouldAutoCompact({
+			return shouldAutoCompact({
 				status: { activeContextTokens, contextWindow: model.contextWindow },
 				limit,
 				scope: config.autoCompactScope,
 			});
-			debugSink(ctx, config.debug)?.({
-				phase: "threshold",
-				model: modelKey(model),
-				activeContextTokens,
-				prefillTokens: estimatedPrefillTokens,
-				limit,
-				scope: config.autoCompactScope,
-				baselineSource: "unavailable",
-				decision,
-			});
-			return decision;
 		},
 	});
 
@@ -174,14 +81,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("model_select", async (event, ctx) => {
 		await coordinator.selectModel(event, ctx);
-		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
-		debugSink(ctx, config.debug)?.({
-			phase: "transition",
-			model: modelKey(event.model),
-			previousModel: event.previousModel ? modelKey(event.previousModel) : undefined,
-			previousHashAvailable: event.previousModel ? compactionHash(event.previousModel) !== undefined : undefined,
-			currentHashAvailable: compactionHash(event.model) !== undefined,
-		});
 	});
 
 	pi.on("context", (event, ctx) => {
@@ -228,11 +127,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		const model = ctx.model;
-		if (!model) return undefined;
+		if (!model || !isOpenAICodexModel(model)) return undefined;
 		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
-		const capability = compactionCapability(model, config);
-		if (capability === "local") return undefined;
-		if (!isOpenAICodexModel(model)) return undefined;
 
 		try {
 			const branch = event.branchEntries as SessionEntry[];
@@ -249,7 +145,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				event.reason === "overflow" && event.willRetry,
 				event.signal,
 			);
-			const native = await withCompactionStatus(ctx, () => createNativeCheckpoint({
+			const native = await createNativeCheckpoint({
 				ctx,
 				model,
 				input,
@@ -257,8 +153,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				config,
 				allTools: pi.getAllTools(),
 				activeToolNames: pi.getActiveTools(),
-				debug: debugSink(ctx, config.debug),
-			}));
+			});
 			if (event.signal.aborted) return { cancel: true };
 			const requestUser = requestInput.findLast((item) => item.role === "user");
 			const knownUsers = [

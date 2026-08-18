@@ -48,7 +48,7 @@ The current upstream snapshot (official `openai/codex` main, checked through 202
 
 - `session_before_compact` can return a custom `CompactionResult` with `summary`, `firstKeptEntryId`, `tokensBefore`, `usage`, and extension `details`. It receives an `AbortSignal`.
 - `before_provider_request` can replace the provider payload. Its `payload.input` is the authoritative request boundary for forked or transformed requests.
-- Custom session entries do not participate in LLM context. This makes them suitable for sanitized debug records.
+- Custom session entries do not participate in LLM context.
 - Pi's built-in compaction uses a reserve-token threshold and a recent-message budget. It does not expose Codex's tokenizer, canonical BodyAfterPrefix baseline, provider capability metadata, or Codex's internal transport/session metadata.
 
 ## Current extension assessment
@@ -64,10 +64,8 @@ The current upstream snapshot (official `openai/codex` main, checked through 202
 
 ### Deliberate differences
 
-- Provider capability routing, Responses Lite, Codex request metadata/turn state, and WebSocket-to-HTTPS fallback are not exposed by the installed Pi 0.84.2 extension seams.
+- Provider capability metadata, Responses Lite, Codex request metadata/turn state, and WebSocket-to-HTTPS fallback are not exposed by the installed Pi 0.84.2 extension seams. The extension uses explicit V1/V2 configuration and HTTPS `fetch`.
 - Upstream V2 preserves eligible media items outside the retained text-token budget. The extension mirrors that retention rule; its separate request and threshold estimates still use a best-effort image weight.
-
-- Capability metadata and Codex's WebSocket-to-HTTPS transport fallback are not exposed by Pi. The extension uses the explicit V1/V2 config and HTTPS `fetch` path.
 - Token counts use bounded JSON-size and image-weight approximations. They are not Codex's internal tokenizer.
 - Pi stores a custom native checkpoint entry. It is not claimed to be identical to Codex's built-in `ContextCompactionItem` or Pi's built-in `CompactionEntry`.
 
@@ -76,19 +74,9 @@ The current upstream snapshot (official `openai/codex` main, checked through 202
 - Cross-model transitions now run only when both frozen `comp_hash` values exist and differ. Missing hashes skip only the transition check; rebound checkpoints remove a previous model's hash when the selected model has no comparable hash.
 - Version-1 native checkpoints are recognized as legacy state and migrated by remote-compacting the full branch on the first request. A failed migration is retried on a later request.
 - Model downshift compaction runs at the new model's automatic limit, independently of `comp_hash`.
-- `bodyAfterPrefix` uses Total when Pi has no reliable prefix baseline. The approximate prefix is recorded only as an observable estimate.
+- `bodyAfterPrefix` uses Total when Pi has no reliable prefix baseline.
 - Compaction bodies preserve provider-supplied tools and tool-choice fields from the authoritative request payload instead of always rebuilding plain function tools.
-- Debug and status error records now expose status/code/retry metadata without persisting raw HTTP/SSE error bodies. Authoritative instructions and provider-supplied tools/tool choice are reused from the request payload.
-
-### Debug contract
-
-The extension now supports `debug: "off" | "errors" | "verbose"`:
-
-- `off` (default): no diagnostic custom entries.
-- `errors`: record retries and terminal failures.
-- `verbose`: also record threshold decisions, sanitized endpoint/attempt data, HTTP status, SSE event types, input item counts, and approximate token budgets.
-
-Debug records do not contain request input, tool payloads, authorization, URLs with credentials/query data, raw HTTP/SSE error bodies, or opaque checkpoint content. Custom debug entries are session metadata and do not enter LLM context.
+- Authoritative instructions and provider-supplied tools/tool choice are reused from the request payload.
 
 ## Remaining non-parity areas
 
@@ -96,4 +84,4 @@ These are known constraints, not hidden guarantees:
 
 - Exact Codex request metadata and transport selection are unavailable through the Pi extension seam.
 - Exact tokenizer parity and mid-turn continuation are unavailable through Pi.
-- Upstream Codex analytics and rollout trace metadata are not reproduced; verbose local debug entries provide the observable lifecycle data available at the extension boundary.
+- Upstream Codex analytics and rollout trace metadata are not reproduced.

@@ -1,9 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-
-export type CompactionDebugLevel = "off" | "errors" | "verbose";
 
 export type CodexCompactionConfig = {
 	/** Mirrors the remote_compaction_v2 feature gate. */
@@ -11,14 +9,11 @@ export type CodexCompactionConfig = {
 	/** Optional Codex-style auto-compaction limit. */
 	autoCompactTokenLimit?: number;
 	autoCompactScope: "total" | "bodyAfterPrefix";
-	/** Persist sanitized compaction diagnostics in custom session entries. */
-	debug?: CompactionDebugLevel;
 };
 
 const DEFAULT_CONFIG: CodexCompactionConfig = {
 	remoteCompactionV2: true,
 	autoCompactScope: "total",
-	debug: "off",
 };
 
 export function parseConfig(input: unknown): Partial<CodexCompactionConfig> {
@@ -32,14 +27,10 @@ export function parseConfig(input: unknown): Partial<CodexCompactionConfig> {
 		...(value.autoCompactScope === "total" || value.autoCompactScope === "bodyAfterPrefix"
 			? { autoCompactScope: value.autoCompactScope }
 			: {}),
-		...(value.debug === "off" || value.debug === "errors" || value.debug === "verbose"
-			? { debug: value.debug }
-			: {}),
 	};
 }
 
 function readConfig(path: string): Partial<CodexCompactionConfig> {
-	if (!existsSync(path)) return {};
 	try {
 		return parseConfig(JSON.parse(readFileSync(path, "utf8")));
 	} catch {
