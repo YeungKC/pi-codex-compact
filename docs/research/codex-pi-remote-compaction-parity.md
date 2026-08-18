@@ -1,6 +1,6 @@
 # Codex CLI and Pi Remote Compaction Parity
 
-**Research date:** 2026-08-18  
+**Research date:** 2026-08-18
 **Scope:** `Remote compaction`, `Model transition compaction`, `Automatic compaction boundary`, and `Fork request boundary`. Local text summarization and Codex token-budget fresh-context reset are out of scope.
 
 ## Primary sources
