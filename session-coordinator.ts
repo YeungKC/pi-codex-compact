@@ -115,6 +115,15 @@ function preserveCurrentUser(
 		: details;
 }
 
+function rebindCheckpoint(details: NativeCompactionDetails, modelKeyValue: string, compHash: string | undefined): NativeCompactionDetails {
+	const { compHash: _previousHash, ...withoutHash } = details;
+	return {
+		...withoutHash,
+		modelKey: modelKeyValue,
+		...(compHash ? { compHash } : {}),
+	};
+}
+
 function preserveRequestUser(details: NativeCompactionDetails, requestInput: ResponseItem[]): NativeCompactionDetails {
 	const requestUser = requestInput.findLast((item) => item.role === "user");
 	if (!requestUser || details.replacementHistory.some((item) => sameItem(item, requestUser))) return details;
@@ -171,7 +180,7 @@ function pendingTransitionFromBranch(
 	branch: SessionEntry[],
 	currentModel: Model<any>,
 	ctx: ExtensionContext,
-): PendingTransition | undefined {
+): PendingTransition | "unavailable" | undefined {
 	const selectedIndex = branch.findLastIndex((entry) =>
 		entry.type === "model_change" && entry.provider === currentModel.provider && entry.modelId === currentModel.id,
 	);
@@ -190,7 +199,11 @@ function pendingTransitionFromBranch(
 		api: previousAssistant.message.api!,
 		id: previousAssistant.message.model!,
 	}));
-	if (!previousModel || !isOpenAICodexModel(previousModel) || !needsTransitionCompaction(previousModel, currentModel)) return undefined;
+	if (!previousModel || !isOpenAICodexModel(previousModel)) return undefined;
+	const previousHash = compactionHash(previousModel);
+	const currentHash = compactionHash(currentModel);
+	if (modelKey(previousModel) !== modelKey(currentModel) && (previousHash === undefined || currentHash === undefined)) return "unavailable";
+	if (!needsTransitionCompaction(previousModel, currentModel)) return undefined;
 	return { previousModel, targetModelKey: modelKey(currentModel) };
 }
 
@@ -261,11 +274,11 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				}
 			}
 			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) continue;
-			deps.appendCheckpoint({
-				...preserveCurrentUser(native.details, branch, requestInput),
-				modelKey: targetModelKey,
-				compHash: compactionHash(currentModel),
-			});
+			deps.appendCheckpoint(rebindCheckpoint(
+				preserveCurrentUser(native.details, branch, requestInput),
+				targetModelKey,
+				compactionHash(currentModel),
+			));
 			pendingBySession.delete(sessionId);
 			return;
 		}
@@ -307,11 +320,11 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 						throw new Error("The session changed while Codex model-transition compaction was running.");
 					}
-					deps.appendCheckpoint({
-						...preserveCurrentUser(native.details, branch, requestInput),
-						modelKey: modelKey(model),
-						...(currentHash ? { compHash: currentHash } : {}),
-					});
+					deps.appendCheckpoint(rebindCheckpoint(
+						preserveCurrentUser(native.details, branch, requestInput),
+						modelKey(model),
+						currentHash,
+					));
 				})();
 		transitionBySession.set(sessionId, transition);
 		try {
@@ -340,6 +353,19 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		}
 		const pending = pendingBySession.get(sessionId);
 		const transitionPreviousModel = pending?.previousModel ?? previousModel;
+		const previousHash = compactionHash(transitionPreviousModel);
+		const currentHash = compactionHash(event.model);
+		if (
+			modelKey(transitionPreviousModel) !== modelKey(event.model)
+			&& (previousHash === undefined || currentHash === undefined)
+		) {
+			pendingBySession.delete(sessionId);
+			failureBySession.set(sessionId, {
+				modelKey: modelKey(event.model),
+				message: "Codex model transition is unavailable because a compaction hash is missing.",
+			});
+			return;
+		}
 		if (!needsTransitionCompaction(transitionPreviousModel, event.model)) {
 			pendingBySession.delete(sessionId);
 			return;
@@ -366,6 +392,8 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		skipAutomaticCompaction = false,
 	): Promise<ResponseItem[] | undefined> => {
 		const sessionId = ctx.sessionManager.getSessionId();
+		const transitionFailure = failureBySession.get(sessionId);
+		if (transitionFailure?.modelKey === modelKey(model)) throw new Error(transitionFailure.message);
 		let transitionCompactionCompleted = false;
 		const activeTransition = transitionBySession.get(sessionId);
 		if (activeTransition) {
@@ -376,7 +404,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		let pending = pendingBySession.get(sessionId);
 		const checkpoint = findNativeCheckpoint(branchBefore);
 		if (!pending && checkpoint.status === "none") {
-			pending = pendingTransitionFromBranch(branchBefore, model, ctx);
+			const recoveredTransition = pendingTransitionFromBranch(branchBefore, model, ctx);
+			if (recoveredTransition === "unavailable") {
+				const message = "Codex model transition is unavailable because a compaction hash is missing.";
+				failureBySession.set(sessionId, { modelKey: modelKey(model), message });
+				throw new Error(message);
+			}
+			pending = recoveredTransition;
 			if (pending) pendingBySession.set(sessionId, pending);
 		}
 		if (
@@ -425,6 +459,14 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			);
 		} catch (error) {
 			if (!pending && checkpoint.status === "none") return undefined;
+			if (checkpoint.status === "valid" && checkpoint.checkpoint.details.modelKey !== modelKey(model)) {
+				const checkpointModel = resolveModel(ctx, checkpoint.checkpoint.details.modelKey);
+				const checkpointHash = checkpoint.checkpoint.details.compHash ?? (checkpointModel ? compactionHash(checkpointModel) : undefined);
+				const currentHash = compactionHash(model);
+				if (checkpointHash === undefined || currentHash === undefined || checkpointHash !== currentHash) {
+					throw new Error("The latest Codex compaction checkpoint requires model-transition compaction first.");
+				}
+			}
 			const createCheckpointFor = (selectedModel: Model<any>) => deps.withStatus(ctx, () => deps.createCheckpoint({
 				ctx,
 				model: selectedModel,
@@ -446,11 +488,11 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 					throw firstError;
 				}
 			}
-			const details = {
-				...preserveRequestUser(native.details, requestInput!),
-				modelKey: modelKey(model),
-				...(compactionHash(model) ? { compHash: compactionHash(model) } : {}),
-			};
+			const details = rebindCheckpoint(
+				preserveRequestUser(native.details, requestInput!),
+				modelKey(model),
+				compactionHash(model),
+			);
 			deps.appendCheckpoint(details);
 			pendingBySession.delete(sessionId);
 			return [...details.replacementHistory, ...(details.preservedInput ?? [])];

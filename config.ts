@@ -3,32 +3,45 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
+export type CompactionDebugLevel = "off" | "errors" | "verbose";
+
 export type CodexCompactionConfig = {
-	/** Mirrors Codex's remote_compaction_v2 feature gate. */
+	/** Mirrors the remote_compaction_v2 feature gate. */
 	remoteCompactionV2: boolean;
 	/** Optional Codex-style auto-compaction limit. */
 	autoCompactTokenLimit?: number;
 	autoCompactScope: "total" | "bodyAfterPrefix";
+	/** Persist sanitized compaction diagnostics in custom session entries. */
+	debug?: CompactionDebugLevel;
 };
 
 const DEFAULT_CONFIG: CodexCompactionConfig = {
 	remoteCompactionV2: true,
 	autoCompactScope: "total",
+	debug: "off",
 };
+
+export function parseConfig(input: unknown): Partial<CodexCompactionConfig> {
+	if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
+	const value = input as Record<string, unknown>;
+	return {
+		...(typeof value.remoteCompactionV2 === "boolean" ? { remoteCompactionV2: value.remoteCompactionV2 } : {}),
+		...(typeof value.autoCompactTokenLimit === "number" && value.autoCompactTokenLimit > 0
+			? { autoCompactTokenLimit: value.autoCompactTokenLimit }
+			: {}),
+		...(value.autoCompactScope === "total" || value.autoCompactScope === "bodyAfterPrefix"
+			? { autoCompactScope: value.autoCompactScope }
+			: {}),
+		...(value.debug === "off" || value.debug === "errors" || value.debug === "verbose"
+			? { debug: value.debug }
+			: {}),
+	};
+}
 
 function readConfig(path: string): Partial<CodexCompactionConfig> {
 	if (!existsSync(path)) return {};
 	try {
-		const value = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-		return {
-			...(typeof value.remoteCompactionV2 === "boolean" ? { remoteCompactionV2: value.remoteCompactionV2 } : {}),
-			...(typeof value.autoCompactTokenLimit === "number" && value.autoCompactTokenLimit > 0
-				? { autoCompactTokenLimit: value.autoCompactTokenLimit }
-				: {}),
-			...(value.autoCompactScope === "total" || value.autoCompactScope === "bodyAfterPrefix"
-				? { autoCompactScope: value.autoCompactScope }
-				: {}),
-		};
+		return parseConfig(JSON.parse(readFileSync(path, "utf8")));
 	} catch {
 		return {};
 	}

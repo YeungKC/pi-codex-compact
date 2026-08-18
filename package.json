@@ -43,6 +43,7 @@
   "files": [
     "index.ts",
     "config.ts",
+    "config.test.ts",
     "capabilities.ts",
     "scheduler.ts",
     "native-compaction.ts",

@@ -76,6 +76,37 @@ export function isFailClosedCompactionError(message: string): boolean {
 export type JsonObject = Record<string, unknown>;
 export type ResponseItem = JsonObject & { type?: string };
 
+export type NativeCompactionDebugEvent = {
+	phase: "input" | "request" | "response" | "stream" | "retry" | "complete" | "failed" | "threshold" | "transition";
+	strategy?: "v1" | "v2";
+	model?: string;
+	previousModel?: string;
+	previousHashAvailable?: boolean;
+	currentHashAvailable?: boolean;
+	url?: string;
+	attempt?: number;
+	maxAttempts?: number;
+	inputItems?: number;
+	trimmedInputItems?: number;
+	estimatedInputTokens?: number;
+	reservedTokens?: number;
+	toolCount?: number;
+	toolTypes?: string[];
+	activeContextTokens?: number;
+	prefillTokens?: number;
+	limit?: number;
+	scope?: "total" | "bodyAfterPrefix";
+	baselineSource?: "unavailable" | "approximation";
+	decision?: boolean;
+	status?: number;
+	eventType?: string;
+	delayMs?: number;
+	error?: string;
+	retryWithCurrentModel?: boolean;
+};
+
+export type NativeCompactionDebugSink = (event: NativeCompactionDebugEvent) => void;
+
 export interface NativeCompactionDetails {
 	kind: typeof NATIVE_COMPACTION_KIND;
 	version: typeof NATIVE_COMPACTION_VERSION;
@@ -797,26 +828,28 @@ export function buildCompactionRequestBody(params: {
 }): JsonObject {
 	const base = params.basePayload ? cloneItem(params.basePayload) : {};
 	const previousText = isJsonObject(base.text) ? base.text : undefined;
+	const instructions = typeof base.instructions === "string" ? base.instructions : params.instructions;
 	const include = Array.isArray(base.include)
 		? [...new Set([...base.include.filter((value): value is string => typeof value === "string"), "reasoning.encrypted_content"])]
 		: ["reasoning.encrypted_content"];
+	const requestTools = Array.isArray(base.tools) ? base.tools : params.tools;
 
 	const body: JsonObject = {
 		...base,
 		model: params.model.id,
 		store: false,
 		stream: true,
-		instructions: params.instructions,
+		instructions,
 		input: [...params.input.map(cloneItem), { type: "compaction_trigger" }],
-		tool_choice: "auto",
-		parallel_tool_calls: true,
+		tool_choice: Object.hasOwn(base, "tool_choice") ? base.tool_choice : "auto",
+		parallel_tool_calls: typeof base.parallel_tool_calls === "boolean" ? base.parallel_tool_calls : true,
 		include,
 		prompt_cache_key: params.sessionId,
 		text: previousText && typeof previousText.verbosity === "string"
 			? { verbosity: previousText.verbosity }
 			: { verbosity: "low" },
 	};
-	if (params.tools) body.tools = params.tools;
+	if (requestTools) body.tools = requestTools;
 	else delete body.tools;
 	delete body.messages;
 	delete body.previous_response_id;
@@ -889,8 +922,11 @@ export function buildCodexHeaders(params: {
 }
 
 function parseRetryDelay(response: Response): number | undefined {
-	const milliseconds = Number(response.headers.get("retry-after-ms"));
-	if (Number.isFinite(milliseconds) && milliseconds >= 0) return milliseconds;
+	const retryAfterMilliseconds = response.headers.get("retry-after-ms");
+	if (retryAfterMilliseconds !== null) {
+		const milliseconds = Number(retryAfterMilliseconds);
+		if (Number.isFinite(milliseconds) && milliseconds >= 0) return milliseconds;
+	}
 	const retryAfter = response.headers.get("retry-after");
 	if (!retryAfter) return undefined;
 	const seconds = Number(retryAfter);
@@ -913,6 +949,47 @@ function canFallbackForStatus(status: number, body: string): boolean {
 export function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
 	Object.defineProperty(error, "retryWithCurrentModel", { value: eligible, enumerable: false, configurable: true });
 	return error as Error & { retryWithCurrentModel: boolean };
+}
+
+function emitDebug(sink: NativeCompactionDebugSink | undefined, event: NativeCompactionDebugEvent): void {
+	try {
+		sink?.(event);
+	} catch {}
+}
+
+function debugUrl(url: string): string {
+	try {
+		const parsed = new URL(url);
+		parsed.username = "";
+		parsed.password = "";
+		parsed.search = "";
+		parsed.hash = "";
+		const path = parsed.pathname;
+		const safePath = path.endsWith("/responses/compact")
+			? "/responses/compact"
+			: path.endsWith("/responses")
+				? "/responses"
+				: path.endsWith("/compact")
+					? "/compact"
+					: "/[path-redacted]";
+		return `${parsed.origin}${safePath}`;
+	} catch {
+		return "[invalid-url]";
+	}
+}
+
+export function compactionErrorSummary(error: unknown): string {
+	const object = typeof error === "object" && error !== null ? error as { name?: unknown; message?: unknown; compactionCode?: unknown; retryWithCurrentModel?: unknown } : {};
+	const message = typeof object.message === "string" ? object.message : String(error);
+	const code = typeof object.compactionCode === "string"
+		? object.compactionCode
+		: message.match(/compaction failed \(([^)]+)\)/i)?.[1];
+	const name = typeof object.name === "string" ? object.name : "Error";
+	return [
+		name,
+		code ? `code=${code}` : undefined,
+		object.retryWithCurrentModel === undefined ? undefined : `fallback=${object.retryWithCurrentModel}`,
+	].filter(Boolean).join(" ");
 }
 
 class NonRetryableCompactionError extends Error {}
@@ -993,6 +1070,7 @@ function classifyHttpCompactionError(
 	const error = retryable
 		? new Error(`${prefix} (${status}): ${body || "HTTP error"}`)
 		: new NonRetryableCompactionError(`${prefix} (${status}): ${body || "HTTP error"}`);
+	if (code) Object.defineProperty(error, "compactionCode", { value: code, enumerable: false, configurable: true });
 	return { error: markFallbackEligibility(error, fallback), retryable };
 }
 
@@ -1019,7 +1097,11 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-async function parseSseResponse(response: Response, signal?: AbortSignal): Promise<{ item: ResponseItem; usage?: unknown }> {
+async function parseSseResponse(
+	response: Response,
+	signal?: AbortSignal,
+	onDebug?: NativeCompactionDebugSink,
+): Promise<{ item: ResponseItem; usage?: unknown }> {
 	if (signal?.aborted) throw abortError(signal);
 	if (!response.body) {
 		throw markFallbackEligibility(
@@ -1059,6 +1141,10 @@ async function parseSseResponse(response: Response, signal?: AbortSignal): Promi
 				false,
 			);
 		}
+		emitDebug(onDebug, {
+			phase: "stream",
+			eventType: typeof event.type === "string" ? event.type : "[missing-type]",
+		});
 		if (event.type === "error") {
 			const nested = isJsonObject(event.error) ? event.error : {};
 			const code = typeof event.code === "string"
@@ -1200,10 +1286,14 @@ export async function callRemoteCompaction(params: {
 	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
+	onDebug?: NativeCompactionDebugSink;
 }): Promise<RemoteCompactionResult> {
 	const fetchImpl = params.fetchImpl ?? fetch;
+	const url = debugUrl(params.url);
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
+		const attemptNumber = attempt + 1;
+		emitDebug(params.onDebug, { phase: "request", strategy: "v2", url, attempt: attemptNumber, maxAttempts: MAX_REMOTE_RETRIES + 1 });
 		try {
 			const response = await fetchImpl(params.url, {
 				method: "POST",
@@ -1211,6 +1301,7 @@ export async function callRemoteCompaction(params: {
 				body: JSON.stringify(params.body),
 				signal: params.signal,
 			});
+			emitDebug(params.onDebug, { phase: "response", strategy: "v2", url, attempt: attemptNumber, status: response.status });
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
 				const classified = classifyHttpCompactionError(
@@ -1220,19 +1311,32 @@ export async function callRemoteCompaction(params: {
 				);
 				if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
 				lastError = classified.error;
-				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
+				const delayMs = parseRetryDelay(response) ?? 1000 * 2 ** attempt;
+				emitDebug(params.onDebug, { phase: "retry", strategy: "v2", attempt: attemptNumber, delayMs, error: compactionErrorSummary(classified.error), retryWithCurrentModel: classified.error.retryWithCurrentModel });
+				await delay(delayMs, params.signal);
 				continue;
 			}
-			const parsed = await parseSseResponse(response, params.signal);
+			const parsed = await parseSseResponse(response, params.signal, params.onDebug);
+			emitDebug(params.onDebug, { phase: "complete", strategy: "v2", url, attempt: attemptNumber });
 			return { strategy: "v2", compactionItem: parsed.item, usage: usageFromResponse(params.model, parsed.usage) };
 		} catch (error) {
 			if (params.signal?.aborted) {
-				throw markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
+				const aborted = markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
+				emitDebug(params.onDebug, { phase: "failed", strategy: "v2", url, attempt: attemptNumber, error: compactionErrorSummary(aborted), retryWithCurrentModel: false });
+				throw aborted;
 			}
-			if (error instanceof NonRetryableCompactionError) throw error;
+			if (error instanceof NonRetryableCompactionError) {
+				emitDebug(params.onDebug, { phase: "failed", strategy: "v2", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as Error & { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
+				throw error;
+			}
 			lastError = error;
-			if (attempt === MAX_REMOTE_RETRIES) throw error;
-			await delay(1000 * 2 ** attempt, params.signal);
+			if (attempt === MAX_REMOTE_RETRIES) {
+				emitDebug(params.onDebug, { phase: "failed", strategy: "v2", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
+				throw error;
+			}
+			const delayMs = 1000 * 2 ** attempt;
+				emitDebug(params.onDebug, { phase: "retry", strategy: "v2", attempt: attemptNumber, delayMs, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
+			await delay(delayMs, params.signal);
 		}
 	}
 	throw lastError instanceof Error ? lastError : new Error("OpenAI Codex compaction failed.");
@@ -1247,15 +1351,17 @@ export function buildLegacyCompactionRequestBody(params: {
 	sessionId: string;
 }): JsonObject {
 	const base = params.basePayload ? cloneItem(params.basePayload) : {};
+	const requestTools = Array.isArray(base.tools) ? base.tools : params.tools;
+	const instructions = typeof base.instructions === "string" ? base.instructions : params.instructions;
 	const body: JsonObject = {
 		...base,
 		model: params.model.id,
 		input: params.input.map(cloneItem),
-		instructions: params.instructions,
-		parallel_tool_calls: true,
+		instructions,
+		parallel_tool_calls: typeof base.parallel_tool_calls === "boolean" ? base.parallel_tool_calls : true,
 		prompt_cache_key: params.sessionId,
 	};
-	if (params.tools) body.tools = params.tools;
+	if (requestTools) body.tools = requestTools;
 	else delete body.tools;
 	delete body.messages;
 	delete body.previous_response_id;
@@ -1277,10 +1383,14 @@ export async function callLegacyRemoteCompaction(params: {
 	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
+	onDebug?: NativeCompactionDebugSink;
 }): Promise<LegacyCompactionResult> {
 	const fetchImpl = params.fetchImpl ?? fetch;
+	const url = debugUrl(params.url);
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
+		const attemptNumber = attempt + 1;
+		emitDebug(params.onDebug, { phase: "request", strategy: "v1", url, attempt: attemptNumber, maxAttempts: MAX_REMOTE_RETRIES + 1 });
 		try {
 			const response = await fetchImpl(params.url, {
 				method: "POST",
@@ -1288,6 +1398,7 @@ export async function callLegacyRemoteCompaction(params: {
 				body: JSON.stringify(params.body),
 				signal: params.signal,
 			});
+			emitDebug(params.onDebug, { phase: "response", strategy: "v1", url, attempt: attemptNumber, status: response.status });
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
 				const classified = classifyHttpCompactionError(
@@ -1297,7 +1408,9 @@ export async function callLegacyRemoteCompaction(params: {
 				);
 				if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
 				lastError = classified.error;
-				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
+				const delayMs = parseRetryDelay(response) ?? 1000 * 2 ** attempt;
+				emitDebug(params.onDebug, { phase: "retry", strategy: "v1", attempt: attemptNumber, delayMs, error: compactionErrorSummary(classified.error), retryWithCurrentModel: classified.error.retryWithCurrentModel });
+				await delay(delayMs, params.signal);
 				continue;
 			}
 			let parsed: JsonObject;
@@ -1309,18 +1422,31 @@ export async function callLegacyRemoteCompaction(params: {
 			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {
 				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid output.");
 			}
-			return {
-				strategy: "v1",
+			const result = {
+				strategy: "v1" as const,
 				replacementHistory: parsed.output.map(cloneItem),
 				usage: usageFromResponse(params.model, parsed.usage),
 			};
+			emitDebug(params.onDebug, { phase: "complete", strategy: "v1", url, attempt: attemptNumber });
+			return result;
 		} catch (error) {
 			if (params.signal?.aborted) {
-				throw markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
+				const aborted = markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
+				emitDebug(params.onDebug, { phase: "failed", strategy: "v1", url, attempt: attemptNumber, error: compactionErrorSummary(aborted), retryWithCurrentModel: false });
+				throw aborted;
 			}
-			if (error instanceof NonRetryableCompactionError || attempt === MAX_REMOTE_RETRIES) throw error;
+			if (error instanceof NonRetryableCompactionError) {
+				emitDebug(params.onDebug, { phase: "failed", strategy: "v1", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as Error & { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
+				throw error;
+			}
 			lastError = error;
-			await delay(1000 * 2 ** attempt, params.signal);
+			if (attempt === MAX_REMOTE_RETRIES) {
+				emitDebug(params.onDebug, { phase: "failed", strategy: "v1", url, attempt: attemptNumber, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
+				throw error;
+			}
+			const delayMs = 1000 * 2 ** attempt;
+				emitDebug(params.onDebug, { phase: "retry", strategy: "v1", attempt: attemptNumber, delayMs, error: compactionErrorSummary(error), retryWithCurrentModel: (error as { retryWithCurrentModel?: boolean }).retryWithCurrentModel });
+			await delay(delayMs, params.signal);
 		}
 	}
 	throw lastError instanceof Error ? lastError : new Error("OpenAI Codex legacy compaction failed.");

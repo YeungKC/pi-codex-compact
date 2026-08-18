@@ -44,7 +44,8 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`, or in a t
 {
   "remoteCompactionV2": false,
   "autoCompactTokenLimit": 128000,
-  "autoCompactScope": "total"
+  "autoCompactScope": "total",
+  "debug": "errors"
 }
 ```
 
@@ -53,8 +54,9 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`, or in a t
 | `remoteCompactionV2` | `true` | Use Codex V2; set `false` only for the legacy V1 endpoint. |
 | `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold. |
 | `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` excludes a reliable prefix baseline when Pi exposes one. |
+| `debug` | `"off"` | Persist sanitized compaction diagnostics: `"errors"` records retries/failures; `"verbose"` also records thresholds, requests, responses, and SSE event types. |
 
-The extension does not probe endpoints at runtime.
+The extension does not probe endpoints at runtime. This repository includes `.pi/pi-codex-compact.json` with `"debug": "verbose"` for detailed local development diagnostics. Debug entries never include request input, authorization, tool payloads, or opaque checkpoint content.
 
 ## Behavior
 

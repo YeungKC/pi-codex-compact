@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { compactionCapability } from "./capabilities.ts";
+import { compactionCapability, compactionHash } from "./capabilities.ts";
 import { shouldAutoCompact } from "./scheduler.ts";
-import { autoCompactTokenLimit, loadConfig } from "./config.ts";
+import { autoCompactTokenLimit, loadConfig, type CompactionDebugLevel } from "./config.ts";
 import { Text } from "@earendil-works/pi-tui";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
 import { createSessionCoordinator } from "./session-coordinator.ts";
@@ -15,9 +15,13 @@ import {
 	approximateResponseItemTokens,
 	approximateTokenCount,
 	buildToolPayload,
+	compactionErrorSummary,
 	stripInputFromPayload,
+	modelKey,
 	NATIVE_COMPACTION_KIND,
 	type JsonObject,
+	type NativeCompactionDebugEvent,
+	type NativeCompactionDebugSink,
 } from "./native-compaction.ts";
 
 type CompactionStatus = {
@@ -26,10 +30,35 @@ type CompactionStatus = {
 };
 
 const COMPACTION_STATUS_KIND = "openai-codex-compaction-status";
+const COMPACTION_DEBUG_KIND = "openai-codex-compaction-debug";
 const LOCAL_MARKER = "OpenAI Codex native compaction checkpoint.";
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function debugText(event: NativeCompactionDebugEvent): string {
+	const parts = [`◌ Codex compaction ${event.phase}`];
+	if (event.strategy) parts.push(event.strategy);
+	if (event.model) parts.push(event.model);
+	if (event.previousModel) parts.push(`previous=${event.previousModel}`);
+	if (event.previousHashAvailable !== undefined) parts.push(`previousHash=${event.previousHashAvailable}`);
+	if (event.currentHashAvailable !== undefined) parts.push(`currentHash=${event.currentHashAvailable}`);
+	if (event.attempt !== undefined) parts.push(`attempt=${event.attempt}/${event.maxAttempts ?? "?"}`);
+	if (event.status !== undefined) parts.push(`status=${event.status}`);
+	if (event.eventType) parts.push(`event=${event.eventType}`);
+	if (event.delayMs !== undefined) parts.push(`delay=${event.delayMs}ms`);
+	if (event.estimatedInputTokens !== undefined) parts.push(`input≈${event.estimatedInputTokens}`);
+	if (event.reservedTokens !== undefined) parts.push(`reserved≈${event.reservedTokens}`);
+	if (event.toolCount !== undefined) parts.push(`tools=${event.toolCount}`);
+	if (event.toolTypes?.length) parts.push(`toolTypes=${event.toolTypes.join(",")}`);
+	if (event.activeContextTokens !== undefined) parts.push(`active≈${event.activeContextTokens}`);
+	if (event.limit !== undefined) parts.push(`limit=${event.limit}`);
+	if (event.scope) parts.push(`scope=${event.scope}`);
+	if (event.baselineSource) parts.push(`baseline=${event.baselineSource}`);
+	if (event.decision !== undefined) parts.push(`auto=${event.decision}`);
+	if (event.error) parts.push(event.error);
+	return parts.join(" ");
 }
 
 function setFeatureHeader(headers: Record<string, string | null>, includeRemoteCompactionV2: boolean): void {
@@ -45,6 +74,10 @@ function setFeatureHeader(headers: Record<string, string | null>, includeRemoteC
 }
 
 export default function codexCompactionExtension(pi: ExtensionAPI): void {
+
+	pi.registerEntryRenderer<NativeCompactionDebugEvent>(COMPACTION_DEBUG_KIND, (entry, _options, theme) => {
+		return new Text(theme.fg("accent", debugText(entry.data)), 0, 0);
+	});
 
 	pi.registerEntryRenderer<CompactionStatus>(COMPACTION_STATUS_KIND, (entry, _options, theme) => {
 		const data = entry.data;
@@ -62,6 +95,14 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		if (ctx.mode === "tui") pi.appendEntry(COMPACTION_STATUS_KIND, status);
 	};
 
+	const debugSink = (_ctx: ExtensionContext, level: CompactionDebugLevel | undefined): NativeCompactionDebugSink | undefined => {
+		if (!level || level === "off") return undefined;
+		return (event) => {
+			if (level === "errors" && event.phase !== "failed" && event.phase !== "retry") return;
+			pi.appendEntry(COMPACTION_DEBUG_KIND, event);
+		};
+	};
+
 	const withCompactionStatus = async <T>(
 		ctx: ExtensionContext,
 		operation: () => Promise<T>,
@@ -72,7 +113,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 			appendCompactionStatus(ctx, { state: "complete" });
 			return result;
 		} catch (error) {
-			appendCompactionStatus(ctx, { state: "failed", error: errorMessage(error) });
+			appendCompactionStatus(ctx, { state: "failed", error: compactionErrorSummary(error) });
 			throw error;
 		}
 	};
@@ -80,34 +121,47 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	const coordinator = createSessionCoordinator({
 		getBranch: (ctx) => ctx.sessionManager.getBranch() as SessionEntry[],
 		getAllTools: () => pi.getAllTools(),
-		createCheckpoint: ({ ctx, model, input, basePayload, signal }) => createNativeCheckpoint({
-			ctx,
-			model,
-			input,
-			basePayload,
-			signal,
-			config: loadConfig(ctx.cwd, ctx.isProjectTrusted()),
-			allTools: pi.getAllTools(),
-			activeToolNames: pi.getActiveTools(),
-		}),
+		createCheckpoint: ({ ctx, model, input, basePayload, signal }) => {
+			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+			return createNativeCheckpoint({
+				ctx,
+				model,
+				input,
+				basePayload,
+				signal,
+				config,
+				allTools: pi.getAllTools(),
+				activeToolNames: pi.getActiveTools(),
+				debug: debugSink(ctx, config.debug),
+			});
+		},
 		withStatus: withCompactionStatus,
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
 		shouldAutoCompact: ({ ctx, model, input }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			// Pi does not expose Codex's exact usage/prefill split; count the stable prefix approximately.
-			const prefillTokens = approximateTokenCount({
+			const estimatedPrefillTokens = approximateTokenCount({
 				instructions: ctx.getSystemPrompt(),
 				tools: buildToolPayload(pi.getAllTools(), pi.getActiveTools()),
 			});
-			return shouldAutoCompact({
-				status: {
-					activeContextTokens: approximateResponseItemTokens(input) + prefillTokens,
-					contextWindow: model.contextWindow,
-					prefillTokens,
-				},
-				limit: autoCompactTokenLimit(config, model.contextWindow),
+			const activeContextTokens = approximateResponseItemTokens(input) + estimatedPrefillTokens;
+			const limit = autoCompactTokenLimit(config, model.contextWindow);
+			const decision = shouldAutoCompact({
+				status: { activeContextTokens, contextWindow: model.contextWindow },
+				limit,
 				scope: config.autoCompactScope,
 			});
+			debugSink(ctx, config.debug)?.({
+				phase: "threshold",
+				model: modelKey(model),
+				activeContextTokens,
+				prefillTokens: estimatedPrefillTokens,
+				limit,
+				scope: config.autoCompactScope,
+				baselineSource: "unavailable",
+				decision,
+			});
+			return decision;
 		},
 	});
 
@@ -117,7 +171,17 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		coordinator.clear();
 	});
-	pi.on("model_select", (event, ctx) => coordinator.selectModel(event, ctx));
+	pi.on("model_select", async (event, ctx) => {
+		await coordinator.selectModel(event, ctx);
+		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+		debugSink(ctx, config.debug)?.({
+			phase: "transition",
+			model: modelKey(event.model),
+			previousModel: event.previousModel ? modelKey(event.previousModel) : undefined,
+			previousHashAvailable: event.previousModel ? compactionHash(event.previousModel) !== undefined : undefined,
+			currentHashAvailable: compactionHash(event.model) !== undefined,
+		});
+	});
 
 	pi.on("context", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
@@ -167,7 +231,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("session_before_compact", async (event, ctx) => {
 		const model = ctx.model;
 		if (!model) return undefined;
-		const capability = compactionCapability(model, loadConfig(ctx.cwd, ctx.isProjectTrusted()));
+		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+		const capability = compactionCapability(model, config);
 		if (capability === "local") return undefined;
 		if (!isOpenAICodexModel(model)) return undefined;
 
@@ -178,16 +243,16 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				model,
 				tools: pi.getAllTools(),
 				excludeLastAssistantError: event.reason === "overflow" && event.willRetry,
-				allowCheckpointModelMismatch: true,
 			});
 			const native = await withCompactionStatus(ctx, () => createNativeCheckpoint({
 				ctx,
 				model,
 				input,
 				signal: event.signal,
-				config: loadConfig(ctx.cwd, ctx.isProjectTrusted()),
+				config,
 				allTools: pi.getAllTools(),
 				activeToolNames: pi.getActiveTools(),
+				debug: debugSink(ctx, config.debug),
 			}));
 			const requestUser = input.findLast((item) => item.role === "user");
 			const knownUsers = [

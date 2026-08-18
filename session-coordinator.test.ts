@@ -155,6 +155,44 @@ describe("Codex session coordinator", () => {
 		});
 	});
 
+	test("does not carry the previous compaction hash into a hashless fork rebase", async () => {
+		const previousModel = model("openai-codex", "previous", "hash-a");
+		const currentModel = modelWithoutHash("openai-codex", "fork-current");
+		const branch = [
+			checkpointEntry(details(modelKey(previousModel), "old")),
+			{ id: "fork-model", type: "model_change", provider: currentModel.provider, modelId: currentModel.id },
+			{ id: "fork-tail", type: "message", message: { role: "assistant", content: [{ type: "text", text: "tail" }] } },
+		] as unknown as SessionEntry[];
+		const coordinator = createCoordinator(branch, async () => details(modelKey(currentModel), "new"));
+		await expect(coordinator.prepareRequest(currentModel, context([previousModel, currentModel]), [userInput("fork")])).rejects.toThrow(
+			"requires model-transition compaction first",
+		);
+		expect(branch.filter((entry) => entry.type === "custom")).toHaveLength(1);
+	});
+
+	test("fails closed recovering a hashless fork transition", async () => {
+		const previousModel = modelWithoutHash("openai-codex", "previous-fork");
+		const currentModel = modelWithoutHash("openai-codex", "current-fork");
+		const branch = [{
+			id: "old-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "assistant", provider: previousModel.provider, api: previousModel.api, model: previousModel.id, content: [{ type: "text", text: "old" }] },
+		}, {
+			id: "model-change",
+			parentId: "old-assistant",
+			timestamp: new Date().toISOString(),
+			type: "model_change",
+			provider: currentModel.provider,
+			modelId: currentModel.id,
+		}] as unknown as SessionEntry[];
+		const coordinator = createCoordinator(branch);
+		await expect(coordinator.prepareRequest(currentModel, context([previousModel, currentModel]), [userInput("current")])).rejects.toThrow(
+			"compaction hash is missing",
+		);
+	});
+
 	test("blocks a request for the wrong model while a transition is pending", async () => {
 		const coordinator = createCoordinator();
 		const previousModel = model("openai-codex", "previous");
@@ -247,7 +285,7 @@ describe("Codex session coordinator", () => {
 		expect(secondFinished).toBe(true);
 	});
 
-	test("does not transition when either model hash is unavailable", async () => {
+	test("fails closed when a cross-model transition hash is unavailable", async () => {
 		let calls = 0;
 		const coordinator = createCoordinator([], async () => {
 			calls++;
@@ -256,7 +294,9 @@ describe("Codex session coordinator", () => {
 		const previous = modelWithoutHash("openai-codex", "previous");
 		const current = model("openai-codex", "current", "hash-b");
 		await coordinator.selectModel({ model: current, previousModel: previous }, context());
-		await coordinator.prepareRequest(current, context(), [userInput("hello")]);
+		await expect(coordinator.prepareRequest(current, context(), [userInput("hello")])).rejects.toThrow(
+			"compaction hash is missing",
+		);
 		expect(calls).toBe(0);
 	});
 

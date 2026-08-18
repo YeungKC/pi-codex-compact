@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, buildCodexHeaders, buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callLegacyRemoteCompaction, callRemoteCompaction, filterLegacyCompactionHistory, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 describe("Codex compaction history", () => {
 	test("marks authentication failures fail-closed", async () => {
@@ -14,6 +14,20 @@ describe("Codex compaction history", () => {
 			allTools: [],
 			activeToolNames: [],
 		})).rejects.toMatchObject({ retryWithCurrentModel: false });
+	});
+
+	test("preserves provider tools from the authoritative request payload", () => {
+		const body = buildCompactionRequestBody({
+			basePayload: { instructions: "rewritten instructions", tools: [{ type: "custom_tool", name: "grammar_tool" }], tool_choice: { type: "custom" } },
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			input: [],
+			instructions: "instructions",
+			tools: [{ type: "function", name: "wrong-tool" }],
+			sessionId: "session",
+		});
+		expect(body.instructions).toBe("rewritten instructions");
+		expect(body.tools).toEqual([{ type: "custom_tool", name: "grammar_tool" }]);
+		expect(body.tool_choice).toEqual({ type: "custom" });
 	});
 
 	test("uses JSON for V1 and removes a stale V2 feature token", () => {
@@ -69,6 +83,50 @@ describe("Codex compaction history", () => {
 		} finally {
 			vi.unstubAllGlobals();
 		}
+	});
+
+	test("emits sanitized remote debug events", async () => {
+		const events: unknown[] = [];
+		await callRemoteCompaction({
+			url: "https://user:password@example.test/proxy/sk-secret/compact?secret=token",
+			headers: new Headers(),
+			body: {},
+			model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+			onDebug: (event) => events.push(event),
+			fetchImpl: async () => new Response([
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } }),
+		});
+		const encoded = JSON.stringify(events);
+		expect(encoded).toContain("request");
+		expect(encoded).toContain("response.completed");
+		expect(encoded).toContain("https://example.test/compact");
+		expect(encoded).not.toContain("sk-secret");
+		expect(encoded).not.toContain("password");
+		expect(encoded).not.toContain("secret");
+		expect(encoded).not.toContain("opaque");
+	});
+
+	test("does not persist raw HTTP error bodies in debug events", async () => {
+		const events: unknown[] = [];
+		let failure: unknown;
+		try {
+			await callRemoteCompaction({
+				url: "https://example.test/compact",
+				headers: new Headers(),
+				body: {},
+				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never,
+				onDebug: (event) => events.push(event),
+				fetchImpl: async () => new Response(JSON.stringify({ error: { code: "future", message: "tool output Bearer secret" } }), { status: 400 }),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
+		const encoded = JSON.stringify(events);
+		expect(encoded).not.toContain("tool output");
+		expect(encoded).not.toContain("Bearer secret");
 	});
 
 	test("preserves eligible response.failed details for model fallback", async () => {
@@ -211,15 +269,16 @@ describe("Codex compaction history", () => {
 	});
 
 	test("maps HTTP usage errors and transient overloads separately", async () => {
-		for (const [status, body, expectedCalls] of [
-			[429, { error: { type: "usage_limit_reached", message: "try another model" } }, 1],
-			[429, { error: { code: "rate_limit_reached", message: "slow down" } }, 3],
-			[503, { error: { code: "server_is_overloaded", message: "busy" } }, 3],
-		] as const) {
-			let calls = 0;
-			let failure: unknown;
-			try {
-				await callRemoteCompaction({
+		vi.useFakeTimers();
+		try {
+			for (const [status, body, expectedCalls] of [
+				[429, { error: { type: "usage_limit_reached", message: "try another model" } }, 1],
+				[429, { error: { code: "rate_limit_reached", message: "slow down" } }, 3],
+				[503, { error: { code: "server_is_overloaded", message: "busy" } }, 3],
+			] as const) {
+				let calls = 0;
+				let failure: unknown;
+				const promise = callRemoteCompaction({
 					url: "https://example.test/compact",
 					headers: new Headers(),
 					body: {},
@@ -229,11 +288,14 @@ describe("Codex compaction history", () => {
 						return new Response(JSON.stringify(body), { status });
 					},
 				});
-			} catch (error) {
-				failure = error;
+				const settled = promise.then(() => undefined, (error) => { failure = error; });
+				await vi.runAllTimersAsync();
+				await settled;
+				expect(calls).toBe(expectedCalls);
+				expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
 			}
-			expect(calls).toBe(expectedCalls);
-			expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+		} finally {
+			vi.useRealTimers();
 		}
 	});
 
