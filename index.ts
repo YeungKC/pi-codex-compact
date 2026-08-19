@@ -1,5 +1,4 @@
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
 import { shouldAutoCompact } from "./scheduler.ts";
 import { autoCompactTokenLimit, loadConfig } from "./config.ts";
 import { createNativeCheckpoint, type NativeCheckpointRequest } from "./remote-compaction.ts";
@@ -27,10 +26,6 @@ const LOCAL_MARKER = "OpenAI Codex native compaction checkpoint.";
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-function disableUnsupportedLongCacheRetention(model: Model<"openai-codex-responses">): void {
-	model.compat = { ...model.compat, supportsLongCacheRetention: false };
 }
 
 type BlockedAction = "retry" | "new-session" | "cancel";
@@ -92,12 +87,7 @@ function notifyBlocked(
 
 function setFeatureHeader(headers: Record<string, string | null>): void {
 	const existing = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-codex-beta-features");
-	const features = mergeFeatureHeader(existing?.[1]);
-	if (features) {
-		headers[existing?.[0] ?? "x-codex-beta-features"] = features;
-	} else if (existing) {
-		delete headers[existing[0]];
-	}
+	headers[existing?.[0] ?? "x-codex-beta-features"] = mergeFeatureHeader(existing?.[1]);
 }
 
 export default function codexCompactionExtension(pi: ExtensionAPI): void {
@@ -166,13 +156,11 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("turn_start", clearTurnState);
 	pi.on("turn_end", clearTurnState);
 	pi.on("model_select", async (event, ctx) => {
-		if (isOpenAICodexModel(event.model)) disableUnsupportedLongCacheRetention(event.model);
 		await coordinator.selectModel(event, ctx);
 	});
 
 	pi.on("context", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
-		disableUnsupportedLongCacheRetention(ctx.model);
 		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
 		if (checkpoint.status !== "valid") return undefined;
 		return {
@@ -196,6 +184,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("before_provider_request", async (event, ctx) => {
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
+		delete event.payload.prompt_cache_retention;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const requestInput = Array.isArray(event.payload.input) ? event.payload.input : undefined;
 		const basePayload = stripInputFromPayload(event.payload);

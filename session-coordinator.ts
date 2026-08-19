@@ -474,7 +474,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		ctx: ExtensionContext,
 		basePayload?: JsonObject,
 		requestInput?: ResponseItem[],
-		forceDownshift = false,
 		excludeLastAssistantError = false,
 		signal?: AbortSignal,
 	): Promise<void> => {
@@ -494,7 +493,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const hashTransition = hashesDiffer(previousHash, currentHash);
 		const downshift = previousModel ? isModelDownshift(previousModel, model) : false;
 		if (!hashTransition && !downshift) return;
-		if (!hashTransition && !forceDownshift) {
+		if (!hashTransition) {
 			const input = effectiveInputForBranch({
 				branch: branchBeforeCurrentUser(deps.getBranch(ctx), requestInput),
 				model,

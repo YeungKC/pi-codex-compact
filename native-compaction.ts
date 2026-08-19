@@ -1146,11 +1146,7 @@ function classifyHttpCompactionError(
 		|| RETRYABLE_COMPACTION_ERROR_PATTERN.test(body);
 	const malformedClientError = status === 400 && !code && !knownMessage;
 	const unknownCode = Boolean(code) && !isKnownCompactionErrorCode(code) && !isFailClosedCompactionError(machineDetails);
-	const fallback = malformedClientError
-		? false
-		: unknownCode
-			? !isFailClosedCompactionError(machineDetails)
-			: canFallbackForStatus(status, body);
+	const fallback = !malformedClientError && (unknownCode || canFallbackForStatus(status, body));
 	const terminal = malformedClientError
 		|| (unknownCode && !isRetryableStatus(status))
 		|| isFailClosedCompactionError(machineDetails)

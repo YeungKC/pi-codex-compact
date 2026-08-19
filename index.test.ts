@@ -69,12 +69,12 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResu
 	return { handlers, ctx, model, notify, select };
 }
 
-test("disables unsupported long cache retention for Codex", () => {
-	const { handlers, ctx, model } = installExtension();
+test("removes unsupported prompt cache retention from Codex requests", async () => {
+	const { handlers, ctx } = installExtension();
+	const payload = { input: [], prompt_cache_retention: "24h" };
 
-	handlers.get("context")?.({ messages: [] }, ctx);
-
-	expect(model.compat).toMatchObject({ supportsLongCacheRetention: false });
+	await expect(handlers.get("before_provider_request")?.({ payload }, ctx)).resolves.toBe(payload);
+	expect(payload).not.toHaveProperty("prompt_cache_retention");
 });
 
 test("filters Pi compaction summaries after a valid V2 checkpoint", () => {
