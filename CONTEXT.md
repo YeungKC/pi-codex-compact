@@ -34,11 +34,14 @@ An original history item that remains separately visible in replacement history 
 **Compaction compatibility**:
 Whether a model or configuration can continue from an existing native compaction item. Codex represents this with optional `comp_hash`; an absent hash is not evidence of incompatibility.
 
+**Context overflow recovery**:
+A lossy remote-only continuation for `context_length_exceeded`: the newest complete history suffix is remote-compacted, the current request is kept, and older history remains in the event log but is no longer model-visible. Interactive UI offers the user a choice before this loss; without UI, the bounded recovery runs automatically once. It never bypasses authentication, policy, malformed-checkpoint, or protocol protection.
+
 **Model-transition compaction**:
 Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
 
 **Legacy checkpoint**:
-A version-1 native compaction entry written by an earlier extension version. If it explicitly contains a fully valid opaque V2 replacement history, the extension replays that bounded replacement history and removes only Pi's `<summary>` wrapper. Otherwise, the first request migrates it by remote-compacting the full branch; an oversized migration is blocked with an actionable warning instead of sending an inevitably oversized request.
+A version-1 native compaction entry written by an earlier extension version. If it explicitly contains a fully valid opaque V2 replacement history, the extension replays that bounded replacement history and removes only Pi's `<summary>` wrapper. Otherwise, the first request migrates it by remote-compacting the full branch; `context_length_exceeded` uses context overflow recovery instead of permanently blocking the session.
 
 **Malformed checkpoint**:
 A native compaction entry that fails the current schema. It is ignored and the full branch is replayed; a later remote compaction can write a valid replacement instead of permanently blocking the session.

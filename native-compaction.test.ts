@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, isContextWindowCompactionError, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 type RemoteRequest = Parameters<typeof callRemoteCompaction>[0];
 const remoteModel = { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never;
@@ -719,6 +719,37 @@ describe("Codex compaction history", () => {
 			{ type: "function_call_output", output: [{ type: "input_image", image_url: "data:image/png;base64,large" }] },
 		], 100);
 		expect(result[0]?.output).toBe("Output exceeded the available model context and was truncated");
+	});
+
+	test("limits suffix recovery to context-window errors", () => {
+		expect(isContextWindowCompactionError(new Error("context_length_exceeded"))).toBe(true);
+		expect(isContextWindowCompactionError(new Error("policy violation in context window"))).toBe(false);
+		expect(isContextWindowCompactionError(new Error("invalid_prompt: context window"))).toBe(false);
+		expect(isContextWindowCompactionError(new Error("context window exceeded"))).toBe(false);
+		const policyError = new Error("policy violation");
+		Object.defineProperty(policyError, "compactionCode", { value: "context_length_exceeded" });
+		expect(isContextWindowCompactionError(policyError)).toBe(false);
+		expect(isContextWindowCompactionError(new Error("auth failure context_length_exceeded"))).toBe(false);
+		expect(isContextWindowCompactionError(new Error("policy denied context_length_exceeded"))).toBe(false);
+		const invalidPromptError = new Error("invalid_prompt: context_length_exceeded");
+		Object.defineProperty(invalidPromptError, "compactionCode", { value: "context_length_exceeded" });
+		expect(isContextWindowCompactionError(invalidPromptError)).toBe(false);
+	});
+
+	test("keeps the newest complete user turn for overflow recovery", () => {
+		const result = latestRemoteCompactionSuffix([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },
+			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "old answer" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "new" }] },
+			{ type: "function_call", call_id: "call", name: "shell", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call", output: "new result" },
+		], 1_000);
+
+		expect(result).toEqual([
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "new" }] },
+			{ type: "function_call", call_id: "call", name: "shell", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call", output: "new result" },
+		]);
 	});
 
 	test("trims the newest function output first", () => {

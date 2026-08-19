@@ -13,11 +13,13 @@ import {
 	mergeFeatureHeader,
 	removeFeatureHeader,
 	approximateResponseItemTokens,
+	isContextWindowCompactionError,
 	approximateTokenCount,
 	buildToolPayload,
 	stripInputFromPayload,
 	NATIVE_COMPACTION_KIND,
 	type JsonObject,
+	type ResponseItem,
 } from "./native-compaction.ts";
 
 const LOCAL_MARKER = "OpenAI Codex native compaction checkpoint.";
@@ -34,6 +36,46 @@ function sanitizeCodexPayload(payload: JsonObject): JsonObject {
 
 function isLegacyMigrationLimit(message: string): boolean {
 	return message.startsWith("OpenAI Codex legacy compaction checkpoint cannot be migrated");
+}
+
+type BlockedAction = "suffix" | "retry" | "new-session" | "cancel";
+
+async function chooseBlockedAction(
+	ctx: { hasUI: boolean; signal?: AbortSignal; ui: { select(title: string, options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined> } },
+	error: unknown,
+	allowSuffix: boolean,
+	signal?: AbortSignal,
+): Promise<BlockedAction> {
+	const message = errorMessage(error);
+	const canUseSuffix = allowSuffix && isContextWindowCompactionError(error);
+	if (!ctx.hasUI) {
+		console.warn(`OpenAI Codex request blocked: ${message}`);
+		return canUseSuffix ? "suffix" : "cancel";
+	}
+	const options = canUseSuffix
+		? ["Continue with less history", "Retry", "Start a new session", "Cancel"]
+		: ["Retry", "Start a new session", "Cancel"];
+	let choice: string | undefined;
+	try {
+		choice = await ctx.ui.select("OpenAI Codex request blocked", options, { signal: signal ?? ctx.signal });
+	} catch {
+		return "cancel";
+	}
+	if (choice === "Continue with less history") return "suffix";
+	if (choice === "Retry") return "retry";
+	if (choice === "Start a new session") return "new-session";
+	return "cancel";
+}
+
+function notifyBlocked(
+	ctx: { hasUI: boolean; ui: { notify(message: string, type?: "info" | "warning" | "error"): void } },
+	error: unknown,
+	action: BlockedAction = "cancel",
+): void {
+	if (!ctx.hasUI) return;
+	const message = errorMessage(error);
+	const nextStep = action === "new-session" ? " Start a new session to continue." : "";
+	ctx.ui.notify(`OpenAI Codex request blocked: ${message}.${nextStep}`, isLegacyMigrationLimit(message) ? "warning" : "error");
 }
 
 function setFeatureHeader(headers: Record<string, string | null>, includeRemoteCompactionV2: boolean): void {
@@ -164,27 +206,39 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		const requestInput = Array.isArray(sanitizedPayload.input) ? sanitizedPayload.input : undefined;
 		const basePayload = stripInputFromPayload(sanitizedPayload);
 		basePayloadBySession.set(sessionId, basePayload);
-		try {
-			const input = await coordinator.prepareRequest(
-				model,
-				ctx,
-				requestInput,
-				basePayload,
-			);
-			if (!input) return sanitizedPayload;
-			const payload = stripInputFromPayload(sanitizedPayload);
-			payload.input = input;
-			return payload;
-		} catch (error) {
-			coordinator.recordFailedRequest(ctx, requestInput);
-			ctx.abort();
-			if (ctx.hasUI) {
-				const message = errorMessage(error);
-				ctx.ui.notify(`OpenAI Codex request blocked: ${message}`, isLegacyMigrationLimit(message) ? "warning" : "error");
+		let recovery: "context-overflow" | undefined;
+		for (;;) {
+			try {
+				const input = await coordinator.prepareRequest(
+					model,
+					ctx,
+					requestInput,
+					basePayload,
+					false,
+					recovery,
+				);
+				if (!input) return sanitizedPayload;
+				const payload = stripInputFromPayload(sanitizedPayload);
+				payload.input = input;
+				return payload;
+			} catch (error) {
+				if (ctx.signal?.aborted) return undefined;
+				const action = await chooseBlockedAction(ctx, error, recovery === undefined, ctx.signal);
+				if (action === "suffix") {
+					recovery = "context-overflow";
+					continue;
+				}
+				if (action === "retry") {
+					recovery = undefined;
+					continue;
+				}
+				coordinator.recordFailedRequest(ctx, requestInput);
+				ctx.abort();
+				notifyBlocked(ctx, error, action);
+				// The abort signal stops Pi's provider call. A synthetic `input: null`
+				// would create a second protocol error.
+				return undefined;
 			}
-			// The abort signal stops Pi's provider call. A synthetic `input: null`
-			// would create a second protocol error.
-			return undefined;
 		}
 	});
 
@@ -193,60 +247,77 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		if (!model || !isOpenAICodexModel(model)) return undefined;
 		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 
-		try {
-			const branch = event.branchEntries as SessionEntry[];
-			const requestInput = fullInputForBranch({
-				branch,
-				model,
-				tools: pi.getAllTools(),
-			});
-			const input = await coordinator.prepareCompaction(
-				model,
-				ctx,
-				requestInput,
-				event.reason === "overflow" && event.willRetry,
-				event.signal,
-			);
-			const sessionId = ctx.sessionManager.getSessionId();
-			const native = await createNativeCheckpoint({
-				ctx,
-				model,
-				input,
-				basePayload: basePayloadBySession.get(sessionId),
-				turnState: turnStateBySession.get(sessionId),
-				onTurnState: (state) => rememberTurnState(sessionId, state),
-				signal: event.signal,
-				config,
-				allTools: pi.getAllTools(),
-				activeToolNames: pi.getActiveTools(),
-			});
-			if (event.signal.aborted) return { cancel: true };
-			const requestUser = requestInput.findLast((item) => item.role === "user");
-			const knownUsers = [
-				...native.details.replacementHistory,
-				...(native.details.preservedInput ?? []),
-			];
-			const details = requestUser && !knownUsers.some((item) =>
-				item.role === "user" && JSON.stringify(item.content) === JSON.stringify(requestUser.content)
-			)
-				? { ...native.details, preservedInput: [...(native.details.preservedInput ?? []), structuredClone(requestUser)] }
-				: native.details;
-
-			return {
-				compaction: {
-					summary: LOCAL_MARKER,
-					firstKeptEntryId: event.preparation.firstKeptEntryId,
-					tokensBefore: event.preparation.tokensBefore,
-					usage: native.usage,
-					details,
-				},
-			};
-		} catch (error) {
-			if (!event.signal.aborted && ctx.hasUI) {
-				ctx.ui.notify(`OpenAI Codex native compaction failed: ${errorMessage(error)}`, "error");
+		const branch = event.branchEntries as SessionEntry[];
+		const requestInput = fullInputForBranch({
+			branch,
+			model,
+			tools: pi.getAllTools(),
+		});
+		const sessionId = ctx.sessionManager.getSessionId();
+		const excludeLastAssistantError = event.reason === "overflow" && event.willRetry;
+		let recovery: "context-overflow" | undefined;
+		let native: Awaited<ReturnType<typeof createNativeCheckpoint>> | undefined;
+		let input: ResponseItem[] | undefined;
+		for (;;) {
+			try {
+				input = await coordinator.prepareCompaction(
+					model,
+					ctx,
+					requestInput,
+					excludeLastAssistantError,
+					event.signal,
+					recovery,
+					basePayloadBySession.get(sessionId),
+				);
+				native = await createNativeCheckpoint({
+					ctx,
+					model,
+					input,
+					basePayload: basePayloadBySession.get(sessionId),
+					turnState: turnStateBySession.get(sessionId),
+					onTurnState: (state) => rememberTurnState(sessionId, state),
+					signal: event.signal,
+					config,
+					allTools: pi.getAllTools(),
+					activeToolNames: pi.getActiveTools(),
+				});
+				break;
+			} catch (error) {
+				if (event.signal.aborted) return { cancel: true };
+				const action = await chooseBlockedAction(ctx, error, recovery === undefined, event.signal);
+				if (action === "suffix") {
+					recovery = "context-overflow";
+					continue;
+				}
+				if (action === "retry") {
+					recovery = undefined;
+					continue;
+				}
+				if (!event.signal.aborted) notifyBlocked(ctx, error, action);
+				return { cancel: true };
 			}
-			return { cancel: true };
 		}
+		if (event.signal.aborted || !native || !input) return { cancel: true };
+		const requestUser = requestInput.findLast((item) => item.role === "user");
+		const knownUsers = [
+			...native.details.replacementHistory,
+			...(native.details.preservedInput ?? []),
+		];
+		const details = requestUser && !knownUsers.some((item) =>
+			item.role === "user" && JSON.stringify(item.content) === JSON.stringify(requestUser.content)
+		)
+			? { ...native.details, preservedInput: [...(native.details.preservedInput ?? []), structuredClone(requestUser)] }
+			: native.details;
+
+		return {
+			compaction: {
+				summary: LOCAL_MARKER,
+				firstKeptEntryId: event.preparation.firstKeptEntryId,
+				tokensBefore: event.preparation.tokensBefore,
+				usage: native.usage,
+				details,
+			},
+		};
 	});
 
 }

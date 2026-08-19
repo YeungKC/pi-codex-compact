@@ -14,6 +14,7 @@ import {
 	modelKey,
 	approximateCompactionRequestTokens,
 	approximateTokenCount,
+	markContextOverflowRecovery,
 	markFallbackEligibility,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
@@ -103,9 +104,9 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		tools,
 		includeTrigger: params.config.remoteCompactionV2,
 	}) > params.model.contextWindow) {
-		throw markFallbackEligibility(new Error(
+		throw markContextOverflowRecovery(new Error(
 			`OpenAI Codex compaction input exceeds this model's ${params.model.contextWindow} token context window after tool-output trimming.`,
-		), false);
+		));
 	}
 	const headers = buildCodexHeaders({
 		apiKey: auth.apiKey,

@@ -329,6 +329,39 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(0);
 	});
 
+	test("recovers a context overflow with the newest complete history turn", async () => {
+		const currentModel = model("old", "openai-codex", 100);
+		const oldText = "old ".repeat(100);
+		const newText = "new ".repeat(5);
+		const branch = [userEntry(oldText), userEntry(newText)];
+		let compactedInput: ResponseItem[] | undefined;
+		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
+			compactedInput = input;
+			return details(modelKey(currentModel), "recovered");
+		});
+		const toolOutput = { type: "function_call_output", call_id: "call", output: "tool result" };
+		const request = [userInput(oldText), userInput(newText), userInput("current"), toolOutput];
+
+		await expect(coordinator.prepareRequest(
+			currentModel,
+			context([currentModel]),
+			request,
+			undefined,
+			false,
+			"context-overflow",
+		)).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "recovered" },
+			userInput("current"),
+			toolOutput,
+		]);
+		expect(compactedInput).toEqual([userInput(newText)]);
+		expect(effectiveInputForBranch({ branch, model: currentModel, tools: [] })).toEqual([
+			{ type: "compaction", encrypted_content: "recovered" },
+			userInput("current"),
+			toolOutput,
+		]);
+	});
+
 	test("does not infer a missing persisted hash from the checkpoint model", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");

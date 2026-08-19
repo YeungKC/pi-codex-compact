@@ -22,9 +22,10 @@ function legacyEntry(): SessionEntry {
 	} as unknown as SessionEntry;
 }
 
-function installExtension(branch: SessionEntry[] = [], hasUI = false) {
+function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResult?: string) {
 	const handlers = new Map<string, Handler>();
 	const notify = vi.fn();
+	const select = vi.fn(async () => selectResult);
 	const model = {
 		provider: "openai-codex",
 		api: "openai-codex-responses",
@@ -40,7 +41,7 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false) {
 		cwd: process.cwd(),
 		isProjectTrusted: () => true,
 		hasUI,
-		ui: { notify },
+		ui: { notify, select },
 		abort: vi.fn(),
 		signal: new AbortController().signal,
 		model,
@@ -62,7 +63,7 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false) {
 		getActiveTools: () => [],
 		appendEntry: vi.fn(),
 	} as never);
-	return { handlers, ctx, model, notify };
+	return { handlers, ctx, model, notify, select };
 }
 
 test("filters Pi compaction summaries before legacy checkpoint migration", () => {
@@ -115,6 +116,19 @@ test("removes unsupported prompt cache retention from Codex requests", async () 
 		payload: { model: "gpt", input: [], prompt_cache_retention: "24h" },
 	}, ctx);
 	expect(notify).toHaveBeenCalledTimes(1);
+});
+
+test("offers a UI action before blocking a failed Codex request", async () => {
+	const { handlers, ctx, select } = installExtension([legacyEntry()], true, "Cancel");
+
+	await handlers.get("before_provider_request")?.({ payload: {} }, ctx);
+
+	expect(select).toHaveBeenCalledWith(
+		"OpenAI Codex request blocked",
+		["Retry", "Start a new session", "Cancel"],
+		{ signal: ctx.signal },
+	);
+	expect(ctx.abort).toHaveBeenCalled();
 });
 
 test("removes unsupported prompt cache retention even when request preparation aborts", async () => {

@@ -20,7 +20,7 @@ const V2_COMPACTION_IDLE_TIMEOUT_MS = 300_000;
 const V1_COMPACTION_IDLE_TIMEOUT_MS = V2_COMPACTION_IDLE_TIMEOUT_MS * 4;
 export const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
-const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?violation|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|authentication[_ -]?error|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing)/i;
+const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?(?:violation|denied|failure|failed)|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failure|failed|denied|error)|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing)/i;
 const NON_RETRYABLE_FALLBACK_ERROR_CODES = new Set([
 	"context_length_exceeded",
 	"context_window_exceeded",
@@ -69,6 +69,19 @@ const RETRYABLE_COMPACTION_ERROR_PATTERN = /(?:server[_ -]?(?:error|(?:is[_ -]?)
 
 export function isFailClosedCompactionError(message: string): boolean {
 	return FAIL_CLOSED_ERROR_PATTERN.test(message);
+}
+
+export function isContextWindowCompactionError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	if (isFailClosedCompactionError(message) || /invalid_prompt/i.test(message)) return false;
+	if (typeof error === "object" && error !== null && "contextOverflowRecovery" in error) {
+		return (error as { contextOverflowRecovery?: unknown }).contextOverflowRecovery === true;
+	}
+	if (typeof error === "object" && error !== null && "compactionCode" in error) {
+		const code = (error as { compactionCode?: unknown }).compactionCode;
+		return code === "context_length_exceeded" || code === "context_window_exceeded";
+	}
+	return /(?:context_length_exceeded|context_window_exceeded)/i.test(message);
 }
 
 export type JsonObject = Record<string, unknown>;
@@ -924,6 +937,27 @@ function retainedMessageGroups(items: ResponseItem[]): RetainedMessageGroup[] {
 	return groups;
 }
 
+/** Keeps the newest complete user turn for a confirmed overflow recovery. */
+export function latestRemoteCompactionSuffix(
+	items: ResponseItem[],
+	maxTokens: number,
+	reservedTokens = 0,
+): ResponseItem[] {
+	const source = items.map(cloneItem);
+	const budget = Math.max(0, maxTokens - reservedTokens);
+	const userStarts = source.flatMap((item, index) => item.role === "user" ? [index] : []);
+	if (userStarts.length === 0) return [];
+	const candidateStart = userStarts.at(-1)!;
+	const candidate = trimFunctionCallHistoryToFitContextWindow(source.slice(candidateStart), maxTokens, reservedTokens);
+	if (approximateResponseItemTokens(candidate) > budget) return [];
+	if (candidateStart === 0 && userStarts.length === 1 && JSON.stringify(candidate) === JSON.stringify(source)) return [];
+	if (candidateStart > 1 && (source[candidateStart - 1]?.type === "compaction" || source[candidateStart - 1]?.type === "context_compaction")) {
+		const withCheckpoint = trimFunctionCallHistoryToFitContextWindow(source.slice(candidateStart - 1), maxTokens, reservedTokens);
+		if (approximateResponseItemTokens(withCheckpoint) <= budget) return withCheckpoint;
+	}
+	return candidate;
+}
+
 function retainedByCodex(item: ResponseItem): boolean {
 	if (item.type === "agent_message") {
 		return !isDescendantProgressAgentMessage(item)
@@ -1116,6 +1150,11 @@ function canFallbackForStatus(status: number, body: string): boolean {
 export function markFallbackEligibility(error: Error, eligible: boolean): Error & { retryWithCurrentModel: boolean } {
 	Object.defineProperty(error, "retryWithCurrentModel", { value: eligible, enumerable: false, configurable: true });
 	return error as Error & { retryWithCurrentModel: boolean };
+}
+
+export function markContextOverflowRecovery(error: Error): Error & { contextOverflowRecovery: boolean; retryWithCurrentModel: boolean } {
+	Object.defineProperty(error, "contextOverflowRecovery", { value: true, enumerable: false, configurable: true });
+	return markFallbackEligibility(error, false) as Error & { contextOverflowRecovery: boolean; retryWithCurrentModel: boolean };
 }
 
 class NonRetryableCompactionError extends Error {}

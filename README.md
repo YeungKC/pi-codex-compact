@@ -68,6 +68,7 @@ Where Pi exposes the needed lifecycle hooks, this extension follows Codex CLI's 
 - Reuses Codex request settings for manual compaction and forwards the server's sticky turn state only within the active turn.
 - Retains recent eligible user and agent messages, drops standalone developer/system and old tool/reasoning items, keeps an attached generated image-resize notice with its retained source, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
 - Retries transient HTTP and stream failures. For eligible model/request failures during a transition, it retries with the newly selected model.
+- Offers an operation choice when a Codex request is blocked; only `context_length_exceeded` can continue by remote-compacting a newer history suffix.
 
 Unsupported providers keep Pi's normal local text summarization.
 
@@ -78,7 +79,7 @@ Codex CLI internally owns exact `comp_hash` capability metadata, token accountin
 The extension therefore:
 
 - uses the frozen Codex model hash snapshot; an absent hash skips only hash-transition compaction;
-- migrates version-1 native checkpoints by remote-compacting the full branch on the first request, without replaying Pi's old prose compaction summary;
+- replays a verifiable version-1 V2 checkpoint directly; otherwise migrates the full branch on the first request without replaying Pi's old prose compaction summary, and uses a bounded remote suffix recovery for `context_length_exceeded`;
 - estimates history, the current compaction-window prefix, images, and tool output for automatic compaction;
 - treats the actual pre-provider request as authoritative when a fork has changed Pi's inherited history.
 
