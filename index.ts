@@ -39,33 +39,28 @@ function isLegacyMigrationLimit(message: string): boolean {
 	return message.startsWith("OpenAI Codex legacy compaction checkpoint cannot be migrated");
 }
 
-type BlockedAction = "suffix" | "retry" | "new-session" | "cancel";
+type BlockedAction = "retry" | "new-session" | "cancel";
 
 async function chooseBlockedAction(
 	ctx: { hasUI: boolean; signal?: AbortSignal; ui: { select(title: string, options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined> } },
 	error: unknown,
-	allowSuffix: boolean,
 	signal?: AbortSignal,
 ): Promise<BlockedAction> {
 	const message = errorMessage(error);
-	const canUseSuffix = allowSuffix && isContextWindowCompactionError(error);
-	const canRetry = isRetryableCompactionError(error) && !canUseSuffix;
+	const canRetry = isRetryableCompactionError(error);
 	if (!ctx.hasUI) {
 		console.warn(`OpenAI Codex request blocked: ${message}`);
-		return canUseSuffix ? "suffix" : "cancel";
+		return "cancel";
 	}
-	const options = canUseSuffix
-		? ["Continue with less history", "Start a new session", "Cancel"]
-		: canRetry
-			? ["Retry", "Start a new session", "Cancel"]
-			: ["Start a new session", "Cancel"];
+	const options = canRetry
+		? ["Retry", "Start a new session", "Cancel"]
+		: ["Start a new session", "Cancel"];
 	let choice: string | undefined;
 	try {
 		choice = await ctx.ui.select("OpenAI Codex request blocked", options, { signal: signal ?? ctx.signal });
 	} catch {
 		return "cancel";
 	}
-	if (choice === "Continue with less history") return "suffix";
 	if (choice === "Retry") return "retry";
 	if (choice === "Start a new session") return "new-session";
 	return "cancel";
@@ -227,11 +222,11 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				return payload;
 			} catch (error) {
 				if (ctx.signal?.aborted) return undefined;
-				const action = await chooseBlockedAction(ctx, error, recovery === undefined, ctx.signal);
-				if (action === "suffix") {
+				if (recovery === undefined && isContextWindowCompactionError(error)) {
 					recovery = "context-overflow";
 					continue;
 				}
+				const action = await chooseBlockedAction(ctx, error, ctx.signal);
 				if (action === "retry") {
 					recovery = undefined;
 					continue;
@@ -288,11 +283,11 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				break;
 			} catch (error) {
 				if (event.signal.aborted) return { cancel: true };
-				const action = await chooseBlockedAction(ctx, error, recovery === undefined, event.signal);
-				if (action === "suffix") {
+				if (recovery === undefined && isContextWindowCompactionError(error)) {
 					recovery = "context-overflow";
 					continue;
 				}
+				const action = await chooseBlockedAction(ctx, error, event.signal);
 				if (action === "retry") {
 					recovery = undefined;
 					continue;

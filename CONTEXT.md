@@ -35,7 +35,7 @@ An original history item that remains separately visible in replacement history 
 Whether a model or configuration can continue from an existing native compaction item. Codex represents this with optional `comp_hash`; an absent hash is not evidence of incompatibility.
 
 **Context overflow recovery**:
-A lossy remote-only continuation for `context_length_exceeded`: the newest complete history suffix is remote-compacted, the current request is kept, and older history remains in the event log but is no longer model-visible. Interactive UI offers the user a choice before this loss; without UI, the bounded recovery runs automatically once. It never bypasses authentication, policy, malformed-checkpoint, or protocol protection.
+A lossy remote-only continuation for `context_length_exceeded`: the newest complete history suffix is remote-compacted, the current request is kept, and older history remains in the event log but is no longer model-visible. The bounded recovery runs automatically once because reducing the visible history is the only same-model continuation; if no complete suffix fits, the UI offers starting a new session or cancelling. It never bypasses authentication, policy, malformed-checkpoint, or protocol protection.
 
 **Model-transition compaction**:
 Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
