@@ -870,6 +870,47 @@ describe("Codex compaction history", () => {
 		})?.modelKey).toBe("openai-codex:openai-codex-responses:test");
 	});
 
+	test("upgrades a valid legacy V2 checkpoint without replaying Pi's summary", () => {
+		const details = parseLegacyNativeCompactionDetails({
+			kind: "openai-codex-native-compaction",
+			version: 1,
+			strategy: "v2",
+			modelKey: "openai-codex:openai-codex-responses:test",
+			replacementHistory: [
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: "The conversation history before this point was compacted into the following summary:\n\n<summary>\nOLD SUMMARY\n</summary>" }],
+				},
+				{ type: "message", role: "user", content: [{ type: "input_text", text: "keep" }] },
+				{ type: "compaction", encrypted_content: "opaque" },
+			],
+		});
+
+		expect(details).toMatchObject({
+			strategy: "v2",
+			replacementHistory: [
+				{ type: "message", role: "user", content: [{ type: "input_text", text: "keep" }] },
+				{ type: "compaction", encrypted_content: "opaque" },
+			],
+		});
+	});
+
+	test("does not remove a literal user message that quotes the Pi summary prefix", () => {
+		const details = parseLegacyNativeCompactionDetails({
+			kind: "openai-codex-native-compaction",
+			version: 1,
+			strategy: "v2",
+			modelKey: "openai-codex:openai-codex-responses:test",
+			replacementHistory: [
+				{ type: "message", role: "user", content: [{ type: "input_text", text: "The conversation history before this point was compacted into the following summary:\nI quoted this literally." }] },
+				{ type: "compaction", encrypted_content: "opaque" },
+			],
+		});
+
+		expect(details?.replacementHistory).toHaveLength(2);
+	});
+
 	test("ignores the removed local token-budget checkpoint", () => {
 		expect(findNativeCheckpoint([{
 			id: "local",

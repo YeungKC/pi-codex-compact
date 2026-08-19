@@ -26,6 +26,16 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function sanitizeCodexPayload(payload: JsonObject): JsonObject {
+	const sanitized = structuredClone(payload);
+	delete sanitized.prompt_cache_retention;
+	return sanitized;
+}
+
+function isLegacyMigrationLimit(message: string): boolean {
+	return message.startsWith("OpenAI Codex legacy compaction checkpoint cannot be migrated");
+}
+
 function setFeatureHeader(headers: Record<string, string | null>, includeRemoteCompactionV2: boolean): void {
 	const existing = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-codex-beta-features");
 	const features = includeRemoteCompactionV2
@@ -41,6 +51,7 @@ function setFeatureHeader(headers: Record<string, string | null>, includeRemoteC
 export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	const basePayloadBySession = new Map<string, JsonObject>();
 	const turnStateBySession = new Map<string, string>();
+	const warnedUnsupportedPayloadBySession = new Set<string>();
 	const rememberTurnState = (sessionId: string, state: string): void => {
 		if (!turnStateBySession.has(sessionId)) turnStateBySession.set(sessionId, state);
 	};
@@ -66,6 +77,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		},
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
 		appendFailedRequest: (details) => pi.appendEntry(FAILED_REQUEST_KIND, details),
+		includeCompactionTrigger: (ctx) => loadConfig(ctx.cwd, ctx.isProjectTrusted()).remoteCompactionV2,
 		shouldAutoCompact: ({ ctx, model, input, reason }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			// Pi exposes assistant usage but not Codex's window counters; estimate the stable prefix.
@@ -94,14 +106,18 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	const clear = () => {
+	const clearTransient = () => {
 		coordinator.clear();
 		basePayloadBySession.clear();
 		turnStateBySession.clear();
 	};
+	const clear = () => {
+		clearTransient();
+		warnedUnsupportedPayloadBySession.clear();
+	};
 	pi.on("session_start", clear);
 	pi.on("session_shutdown", clear);
-	pi.on("session_tree", clear);
+	pi.on("session_tree", clearTransient);
 	const clearTurnState = (_event: unknown, ctx: { sessionManager: { getSessionId(): string } }) => {
 		turnStateBySession.delete(ctx.sessionManager.getSessionId());
 	};
@@ -136,9 +152,18 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("before_provider_request", async (event, ctx) => {
 		const model = ctx.model;
 		if (!isOpenAICodexModel(model) || !isJsonObject(event.payload)) return undefined;
-		const requestInput = Array.isArray(event.payload.input) ? event.payload.input : undefined;
-		const basePayload = stripInputFromPayload(event.payload);
-		basePayloadBySession.set(ctx.sessionManager.getSessionId(), basePayload);
+		const sanitizedPayload = sanitizeCodexPayload(event.payload);
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (Object.hasOwn(event.payload, "prompt_cache_retention")) {
+			delete event.payload.prompt_cache_retention;
+			if (ctx.hasUI && !warnedUnsupportedPayloadBySession.has(sessionId)) {
+				warnedUnsupportedPayloadBySession.add(sessionId);
+				ctx.ui.notify("OpenAI Codex does not support prompt_cache_retention; the setting was ignored.", "warning");
+			}
+		}
+		const requestInput = Array.isArray(sanitizedPayload.input) ? sanitizedPayload.input : undefined;
+		const basePayload = stripInputFromPayload(sanitizedPayload);
+		basePayloadBySession.set(sessionId, basePayload);
 		try {
 			const input = await coordinator.prepareRequest(
 				model,
@@ -146,15 +171,16 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				requestInput,
 				basePayload,
 			);
-			if (!input) return undefined;
-			const payload = stripInputFromPayload(event.payload);
+			if (!input) return sanitizedPayload;
+			const payload = stripInputFromPayload(sanitizedPayload);
 			payload.input = input;
 			return payload;
 		} catch (error) {
 			coordinator.recordFailedRequest(ctx, requestInput);
 			ctx.abort();
 			if (ctx.hasUI) {
-				ctx.ui.notify(`OpenAI Codex request blocked: ${errorMessage(error)}`, "error");
+				const message = errorMessage(error);
+				ctx.ui.notify(`OpenAI Codex request blocked: ${message}`, isLegacyMigrationLimit(message) ? "warning" : "error");
 			}
 			// The abort signal stops Pi's provider call. A synthetic `input: null`
 			// would create a second protocol error.

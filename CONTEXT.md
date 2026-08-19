@@ -38,7 +38,7 @@ Whether a model or configuration can continue from an existing native compaction
 Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
 
 **Legacy checkpoint**:
-A version-1 native compaction entry written by an earlier extension version. The first request migrates it by remote-compacting the full branch instead of replaying its stored replacement history or Pi's prose compaction summary.
+A version-1 native compaction entry written by an earlier extension version. If it explicitly contains a fully valid opaque V2 replacement history, the extension replays that bounded replacement history and removes only Pi's `<summary>` wrapper. Otherwise, the first request migrates it by remote-compacting the full branch; an oversized migration is blocked with an actionable warning instead of sending an inevitably oversized request.
 
 **Malformed checkpoint**:
 A native compaction entry that fails the current schema. It is ignored and the full branch is replayed; a later remote compaction can write a valid replacement instead of permanently blocking the session.

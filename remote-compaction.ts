@@ -12,6 +12,7 @@ import {
 	callRemoteCompaction,
 	filterLegacyCompactionHistory,
 	modelKey,
+	approximateCompactionRequestTokens,
 	approximateTokenCount,
 	markFallbackEligibility,
 	NATIVE_COMPACTION_KIND,
@@ -96,6 +97,16 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		params.model.contextWindow,
 		reservedTokens,
 	);
+	if (approximateCompactionRequestTokens({
+		input,
+		instructions,
+		tools,
+		includeTrigger: params.config.remoteCompactionV2,
+	}) > params.model.contextWindow) {
+		throw markFallbackEligibility(new Error(
+			`OpenAI Codex compaction input exceeds this model's ${params.model.contextWindow} token context window after tool-output trimming.`,
+		), false);
+	}
 	const headers = buildCodexHeaders({
 		apiKey: auth.apiKey,
 		headers: auth.headers,

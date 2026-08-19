@@ -60,9 +60,26 @@ function legacyDetails(key: string): Record<string, unknown> {
 	return {
 		kind: NATIVE_COMPACTION_KIND,
 		version: 1,
-		strategy: "v2",
+		strategy: "v1",
 		modelKey: key,
 		replacementHistory: [{ type: "compaction", encrypted_content: "old" }],
+	};
+}
+
+function legacyV2Details(key: string): Record<string, unknown> {
+	return {
+		kind: NATIVE_COMPACTION_KIND,
+		version: 1,
+		strategy: "v2",
+		modelKey: key,
+		replacementHistory: [
+			{
+				type: "message",
+				role: "user",
+				content: [{ type: "input_text", text: "The conversation history before this point was compacted into the following summary:\n\n<summary>\nOLD SUMMARY\n</summary>" }],
+			},
+			{ type: "compaction", encrypted_content: "old" },
+		],
 	};
 }
 
@@ -327,6 +344,21 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(0);
 	});
 
+	test("replays a valid legacy V2 checkpoint without a migration request", async () => {
+		const currentModel = model("old");
+		const branch = [userEntry("old history"), customEntry(legacyV2Details(modelKey(currentModel)))];
+		const coordinator = createCoordinator(branch, async () => {
+			throw new Error("legacy V2 checkpoint should not be migrated");
+		});
+		const request = [
+			{ type: "compaction", encrypted_content: "old" },
+			userInput("new request"),
+		];
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual(request);
+		expect(findNativeCheckpoint(branch).status).toBe("valid");
+	});
+
 	test("migrates a legacy checkpoint from the full branch on first request", async () => {
 		const currentModel = model("old");
 		const branch = [userEntry("old history"), customEntry(legacyDetails(modelKey(currentModel)))];
@@ -342,6 +374,23 @@ describe("Codex session coordinator", () => {
 		expect(compactedInput).toEqual([userInput("old history")]);
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "migrated" }, userInput("new request")]);
 		expect(findNativeCheckpoint(branch).status).toBe("valid");
+	});
+
+	test("blocks an oversized legacy migration before sending the full branch", async () => {
+		const currentModel = model("old", "openai-codex", 100);
+		const branch = [
+			userEntry("x".repeat(300)),
+			customEntry(legacyDetails(modelKey(currentModel))),
+		];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details(modelKey(currentModel), "unexpected");
+		});
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel], "s".repeat(200)), [userInput("new request")]))
+			.rejects.toThrow(/legacy compaction checkpoint cannot be migrated.*above this model's/);
+		expect(calls).toBe(0);
 	});
 
 	test("migrates legacy state even when Pi changes the request prefix", async () => {

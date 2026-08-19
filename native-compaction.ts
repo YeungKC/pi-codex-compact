@@ -95,6 +95,8 @@ export type LegacyNativeCompactionDetails = {
 	version: typeof LEGACY_NATIVE_COMPACTION_VERSION;
 	modelKey: string;
 	compHash?: string;
+	strategy?: "v2";
+	replacementHistory?: ResponseItem[];
 };
 
 export type NativeCheckpoint = {
@@ -219,18 +221,40 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	};
 }
 
-/** Recognizes the v1 checkpoint without trusting its replacement history. */
+const LEGACY_COMPACTION_SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+const LEGACY_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+
+function isLegacyCompactionSummary(item: ResponseItem): boolean {
+	if ((item.type !== "message" && item.type !== undefined) || item.role !== "user") return false;
+	const text = contentText(item.content).trimStart();
+	return text.startsWith(LEGACY_COMPACTION_SUMMARY_PREFIX) && text.trimEnd().endsWith(LEGACY_COMPACTION_SUMMARY_SUFFIX);
+}
+
+/** Recognizes v1 checkpoints and upgrades only a fully verifiable old V2 history. */
 export function parseLegacyNativeCompactionDetails(value: unknown): LegacyNativeCompactionDetails | undefined {
 	if (!isJsonObject(value)) return undefined;
 	if (value.kind !== NATIVE_COMPACTION_KIND || value.version !== LEGACY_NATIVE_COMPACTION_VERSION) return undefined;
 	if (value.strategy === "token-budget") return undefined;
 	if (typeof value.modelKey !== "string" || !Array.isArray(value.replacementHistory)) return undefined;
 	if (value.compHash !== undefined && typeof value.compHash !== "string") return undefined;
+
+	const replacementHistory = value.replacementHistory.filter(isResponseItem);
+	const canUpgradeV2 = value.strategy === "v2"
+		&& replacementHistory.length === value.replacementHistory.length
+		&& replacementHistory.filter((item) => item.type === "compaction").length === 1
+		&& replacementHistory.at(-1)?.type === "compaction"
+		&& typeof replacementHistory.at(-1)?.encrypted_content === "string";
 	return {
 		kind: NATIVE_COMPACTION_KIND,
 		version: LEGACY_NATIVE_COMPACTION_VERSION,
 		modelKey: value.modelKey,
 		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
+		...(canUpgradeV2
+			? {
+				strategy: "v2" as const,
+				replacementHistory: replacementHistory.filter((item) => !isLegacyCompactionSummary(item)).map(cloneItem),
+			}
+			: {}),
 	};
 }
 
@@ -261,6 +285,23 @@ export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
 		}
 		const legacyDetails = parseLegacyNativeCompactionDetails(rawDetails);
 		if (legacyDetails) {
+			if (legacyDetails.strategy === "v2" && legacyDetails.replacementHistory) {
+				return {
+					status: "valid",
+					checkpoint: {
+						entryIndex: index,
+						entryId: entry.id,
+						details: {
+							kind: NATIVE_COMPACTION_KIND,
+							version: NATIVE_COMPACTION_VERSION,
+							strategy: "v2",
+							modelKey: legacyDetails.modelKey,
+							...(legacyDetails.compHash ? { compHash: legacyDetails.compHash } : {}),
+							replacementHistory: legacyDetails.replacementHistory,
+						},
+					},
+				};
+			}
 			return {
 				status: "legacy",
 				checkpoint: { entryIndex: index, entryId: entry.id, details: legacyDetails },
@@ -670,6 +711,19 @@ function approximateTokens(item: ResponseItem): number {
 
 export function approximateResponseItemTokens(items: ResponseItem[]): number {
 	return items.reduce((total, item) => total + approximateTokens(item), 0);
+}
+
+export function approximateCompactionRequestTokens(params: {
+	input: ResponseItem[];
+	instructions: string;
+	tools?: unknown[];
+	includeTrigger: boolean;
+}): number {
+	return approximateResponseItemTokens(params.input) + approximateTokenCount({
+		instructions: params.instructions,
+		tools: params.tools,
+		...(params.includeTrigger ? { input: [{ type: "compaction_trigger" }] } : {}),
+	});
 }
 
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT = "Output exceeded the available model context and was truncated";

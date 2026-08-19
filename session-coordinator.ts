@@ -12,6 +12,9 @@ import {
 	isOpenAICodexModel,
 	isJsonObject,
 	modelKey,
+	markFallbackEligibility,
+	approximateCompactionRequestTokens,
+	trimFunctionCallHistoryToFitContextWindow,
 	type FailedRequestDetails,
 	type JsonObject,
 	type NativeCompactionDetails,
@@ -37,6 +40,7 @@ export type SessionCoordinatorDeps = {
 	createCheckpoint: CheckpointFactory;
 	appendCheckpoint: (details: NativeCompactionDetails) => void;
 	appendFailedRequest?: (details: FailedRequestDetails) => void;
+	includeCompactionTrigger?: (ctx: ExtensionContext) => boolean;
 	shouldAutoCompact?: (params: {
 		ctx: ExtensionContext;
 		model: Model<any>;
@@ -73,6 +77,12 @@ function shouldRetryWithCurrentModel(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
 	if (isFailClosedCompactionError(message) || /(?:auth|account|invalid compaction)/i.test(message)) return false;
 	return /(?:\b(?:400|403|408|409|429|5\d\d)\b|invalid request|unexpected status|context window|context_length_exceeded|invalid_prompt|usage limit|server overloaded|internal server|retry limit)/i.test(message);
+}
+
+function oversizedLegacyMigrationError(model: Model<any>, estimatedTokens: number): Error {
+	return markFallbackEligibility(new Error(
+		`OpenAI Codex legacy compaction checkpoint cannot be migrated because the full compaction request is estimated at ${estimatedTokens} tokens, above this model's ${model.contextWindow} token context window. Start a new session or switch to a larger-context Codex model.`,
+	), false);
 }
 
 function conversationLeafId(branch: SessionEntry[]): string | undefined {
@@ -473,13 +483,35 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
 		const previousModel = resolveModel(ctx, legacy.checkpoint.details.modelKey);
 		const historyModel = previousModel && isOpenAICodexModel(previousModel) ? previousModel : model;
-		const createFor = (selectedModel: Model<any>) => deps.createCheckpoint({
-			ctx,
-			model: selectedModel,
-			input: fullInputForBranch({ branch: compactionBranch, model: selectedModel, tools: deps.getAllTools() }),
-			basePayload,
-			signal: operationSignal,
-		});
+		const createFor = async (selectedModel: Model<any>) => {
+			const input = fullInputForBranch({ branch: compactionBranch, model: selectedModel, tools: deps.getAllTools() });
+			const instructions = typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt();
+			const tools = Array.isArray(basePayload?.tools) ? basePayload.tools : deps.getAllTools();
+			const includeTrigger = deps.includeCompactionTrigger?.(ctx) ?? true;
+			const reservedTokens = approximateCompactionRequestTokens({
+				input: [],
+				instructions,
+				tools,
+				includeTrigger,
+			});
+			const trimmedInput = trimFunctionCallHistoryToFitContextWindow(input, selectedModel.contextWindow, reservedTokens);
+			const estimatedTokens = approximateCompactionRequestTokens({
+				input: trimmedInput,
+				instructions,
+				tools,
+				includeTrigger,
+			});
+			if (estimatedTokens > selectedModel.contextWindow) {
+				throw oversizedLegacyMigrationError(selectedModel, estimatedTokens);
+			}
+			return deps.createCheckpoint({
+				ctx,
+				model: selectedModel,
+				input,
+				basePayload,
+				signal: operationSignal,
+			});
+		};
 		let native: Awaited<ReturnType<CheckpointFactory>>;
 		try {
 			native = await createFor(historyModel);
