@@ -696,12 +696,12 @@ export function trimFunctionCallHistoryToFitContextWindow(
 	const inputBudget = Math.max(0, maxTokens - reservedTokens);
 	let excess = approximateResponseItemTokens(result) - inputBudget;
 	if (excess <= 0) return result;
-	for (let index = result.length - 1; index >= 0 && excess > 0; index--) {
-		const item = result[index]!;
-		const rewritten = truncateFunctionOutput(item);
+	for (const group of retainedMessageGroups(result).reverse()) {
+		if (excess <= 0) break;
+		const rewritten = truncateFunctionOutput(group.source);
 		if (!rewritten) break;
-		const current = approximateTokens(item);
-		result[index] = rewritten;
+		const current = approximateTokens(group.source);
+		result[group.sourceIndex] = rewritten;
 		excess -= current - approximateTokens(rewritten);
 	}
 	return result;
@@ -842,6 +842,7 @@ const IMAGE_RESIZE_NOTICE_END = "</image_resize_notice>";
 
 type RetainedMessageGroup = {
 	source: ResponseItem;
+	sourceIndex: number;
 	notice?: ResponseItem;
 };
 
@@ -860,10 +861,10 @@ function retainedMessageGroups(items: ResponseItem[]): RetainedMessageGroup[] {
 		const source = items[index]!;
 		const notice = items[index + 1];
 		if (notice && isImageResizeNotice(notice)) {
-			groups.push({ source, notice });
+			groups.push({ source, sourceIndex: index, notice });
 			index++;
 		} else {
-			groups.push({ source });
+			groups.push({ source, sourceIndex: index });
 		}
 	}
 	return groups;

@@ -696,6 +696,24 @@ describe("Codex compaction history", () => {
 		expect(result[0]?.output).toBe("Output exceeded the available model context and was truncated");
 	});
 
+	test("rewrites oversized output before its attached image resize notice", () => {
+		const notice = {
+			type: "message",
+			role: "developer",
+			content: [{
+				type: "input_text",
+				text: "<image_resize_notice>tool output resized</image_resize_notice>",
+			}],
+		};
+		const result = trimFunctionCallHistoryToFitContextWindow([
+			{ type: "function_call_output", call_id: "call", output: "x".repeat(1_000) },
+			notice,
+		], 10);
+
+		expect(result[0]?.output).toBe("Output exceeded the available model context and was truncated");
+		expect(result[1]).toEqual(notice);
+	});
+
 	test("replaces image-bearing function output with Codex's truncation marker", () => {
 		const result = trimFunctionCallHistoryToFitContextWindow([
 			{ type: "function_call_output", output: [{ type: "input_image", image_url: "data:image/png;base64,large" }] },
