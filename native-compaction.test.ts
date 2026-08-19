@@ -437,6 +437,48 @@ describe("Codex compaction history", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	test("aborts a timed-out request before retrying", async () => {
+		vi.useFakeTimers();
+		let attempts = 0;
+		let firstActive = false;
+		let firstAborted = false;
+		let firstAbortReason: unknown;
+		const pending = callRemoteCompaction(remoteRequest({
+			fetchImpl: async (_url, init) => {
+				attempts++;
+				if (attempts === 1) {
+					firstActive = true;
+					const signal = init?.signal;
+					if (!signal) throw new Error("missing abort signal");
+					await new Promise<never>((_resolve, reject) => {
+						signal.addEventListener("abort", () => {
+							firstAborted = true;
+							firstActive = false;
+							firstAbortReason = signal.reason;
+							reject(signal.reason);
+						}, { once: true });
+					});
+				}
+				return new Response("", { status: 400 });
+			},
+		}));
+		const outcome = pending.then(() => undefined, error => error);
+
+		await vi.advanceTimersByTimeAsync(300_000);
+		expect(firstAbortReason).toMatchObject({
+			message: "OpenAI Codex compaction request timed out.",
+			retryWithCurrentModel: false,
+		});
+		expect(firstAborted).toBe(true);
+		expect(firstActive).toBe(false);
+		expect(attempts).toBe(1);
+
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(await outcome).toMatchObject({ retryWithCurrentModel: false });
+		expect(attempts).toBe(2);
+		expect(firstActive).toBe(false);
+	});
+
 	test("counts opaque reasoning and compaction payloads", () => {
 		const opaque = "x".repeat(4_000);
 		expect(approximateResponseItemTokens([{ type: "reasoning", encrypted_content: opaque }])).toBeGreaterThan(500);
@@ -532,6 +574,30 @@ describe("Codex compaction history", () => {
 		expect(JSON.stringify(result)).toContain("kept");
 		expect(JSON.stringify(result)).toContain("tail");
 		expect(JSON.stringify(result)).not.toContain("old");
+	});
+
+	test("replays the full branch when a native checkpoint is malformed", () => {
+		const branch = [
+			{ id: "old", type: "message", message: { role: "user", content: "old" } },
+			{ id: "kept", type: "message", message: { role: "user", content: "kept" } },
+			{ id: "malformed", type: "compaction", firstKeptEntryId: "kept", details: {
+				kind: NATIVE_COMPACTION_KIND,
+				version: NATIVE_COMPACTION_VERSION,
+				modelKey: "openai-codex:openai-codex-responses:gpt",
+				replacementHistory: [],
+			} },
+			{ id: "tail", type: "message", message: { role: "user", content: "tail" } },
+		] as never;
+		const result = piContextInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", reasoning: true } as never,
+			tools: [],
+		});
+		expect(result).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "old" }] },
+			{ role: "user", content: [{ type: "input_text", text: "kept" }] },
+			{ role: "user", content: [{ type: "input_text", text: "tail" }] },
+		]);
 	});
 
 	test("keeps Pi's compaction summary before retained entries", () => {

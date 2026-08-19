@@ -93,6 +93,44 @@ test("filters Pi compaction summaries after a valid V2 checkpoint", () => {
 	expect(result).toEqual({ messages: [{ role: "user", content: [{ type: "text", text: "keep" }] }] });
 });
 
+test("replays the full branch when a native checkpoint is malformed", () => {
+	const branch = [
+		{ id: "old", type: "message", message: { role: "user", content: [{ type: "text", text: "old" }] } },
+		{ id: "kept", type: "message", message: { role: "user", content: [{ type: "text", text: "kept" }] } },
+		{
+			id: "malformed",
+			parentId: "kept",
+			timestamp: new Date().toISOString(),
+			type: "compaction",
+			summary: "OLD SUMMARY",
+			firstKeptEntryId: "kept",
+			tokensBefore: 123,
+			details: {
+				kind: NATIVE_COMPACTION_KIND,
+				version: 2,
+				strategy: "v2",
+				modelKey: "openai-codex:openai-codex-responses:gpt",
+				replacementHistory: [],
+			},
+		},
+		{ id: "tail", type: "message", message: { role: "user", content: [{ type: "text", text: "tail" }] } },
+	] as never;
+	const { handlers, ctx } = installExtension(branch);
+
+	const result = handlers.get("context")?.(
+		{ messages: [{ role: "compactionSummary", content: [{ type: "text", text: "OLD SUMMARY" }] }] },
+		ctx,
+	);
+
+	expect(result).toEqual({
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "old" }] },
+			{ role: "user", content: [{ type: "text", text: "kept" }] },
+			{ role: "user", content: [{ type: "text", text: "tail" }] },
+		],
+	});
+});
+
 test("clears turn state when navigating to another session-tree leaf", () => {
 	const { handlers, ctx } = installExtension();
 	handlers.get("after_provider_response")?.({ headers: { "x-codex-turn-state": "active" } }, ctx);

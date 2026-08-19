@@ -1,4 +1,4 @@
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { shouldAutoCompact } from "./scheduler.ts";
 import { autoCompactTokenLimit, loadConfig } from "./config.ts";
 import { createNativeCheckpoint, type NativeCheckpointRequest } from "./remote-compaction.ts";
@@ -156,7 +156,13 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
 	pi.on("context", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
-		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
+		const branch = ctx.sessionManager.getBranch() as SessionEntry[];
+		const checkpoint = findNativeCheckpoint(branch);
+		if (checkpoint.status === "invalid") {
+			return {
+				messages: branch.flatMap((entry) => entry.type === "compaction" ? [] : sessionEntryToContextMessages(entry)),
+			};
+		}
 		if (checkpoint.status !== "valid") return undefined;
 		return {
 			messages: event.messages.filter((message) => message.role !== "compactionSummary"),

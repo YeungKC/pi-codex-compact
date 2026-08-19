@@ -36,9 +36,9 @@ Then, in an `openai-codex` session, run `/compact`. The checkpoint is stored in 
 
 ## Configuration
 
-No configuration is required. The extension uses Codex remote-compaction V2 and automatically compacts retained history at 90% of the selected model's context window. The current user input is not included in this pre-request threshold check.
+No configuration is required. The extension uses Codex remote-compaction V2 and automatically compacts retained history at 90% of the selected model's context window.
 
-Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`. Missing or invalid fields leave the defaults in place:
+Optional global configuration belongs in Pi's agent directory (normally `~/.pi/agent/pi-codex-compact.json`). When the current project is trusted, `.pi/pi-codex-compact.json` in that project is loaded afterward and overrides matching global settings; project configuration is ignored for untrusted projects. Missing or invalid fields are ignored:
 
 ```json
 {
@@ -90,7 +90,7 @@ pi update npm:@yeungkc/pi-codex-compact
 pi uninstall npm:@yeungkc/pi-codex-compact
 ```
 
-Removing the package does not delete existing Pi session JSONL files or their native checkpoints. Remove `~/.pi/agent/pi-codex-compact.json` separately if it is no longer wanted.
+Removing the package does not delete existing Pi session JSONL files or their native checkpoints. Remove the global configuration file from Pi's agent directory (`~/.pi/agent/pi-codex-compact.json` by default) separately if it is no longer wanted.
 
 ## Development
 

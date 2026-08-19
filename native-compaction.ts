@@ -489,6 +489,7 @@ export function piContextInputForBranch(params: {
 	tools: ToolInfo[];
 }): ResponseItem[] {
 	const checkpoint = findNativeCheckpoint(params.branch);
+	if (checkpoint.status === "invalid") return fullInputForBranch(params);
 	const remoteCheckpoint = checkpoint.status === "valid";
 	const boundaryEnd = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : params.branch.length;
 	let firstKeptEntryId: string | undefined;
@@ -1171,13 +1172,18 @@ async function withCompactionTimeout<T>(
 	operation: Promise<T> | (() => Promise<T>),
 	timeoutMs: number,
 	message: string,
+	onTimeout?: (error: Error) => void,
 ): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeoutError = markFallbackEligibility(
+		markCompactionRetry(new Error(message), "explicit"),
+		false,
+	);
 	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(markFallbackEligibility(
-			markCompactionRetry(new Error(message), "explicit"),
-			false,
-		)), timeoutMs);
+		timer = setTimeout(() => {
+			reject(timeoutError);
+			onTimeout?.(timeoutError);
+		}, timeoutMs);
 	});
 	try {
 		return await Promise.race([typeof operation === "function" ? operation() : operation, timeout]);
@@ -1393,30 +1399,40 @@ async function runRemoteCompaction<T>(params: {
 	const fetchImpl = params.fetchImpl ?? fetch;
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
+		const attemptController = new AbortController();
+		const relayAbort = () => attemptController.abort(params.signal?.reason);
+		if (params.signal?.aborted) attemptController.abort(params.signal.reason);
+		else params.signal?.addEventListener("abort", relayAbort, { once: true });
 		try {
-			const response = await withCompactionTimeout(
-				fetchImpl(params.url, {
-					method: "POST",
-					headers: params.headers,
-					body: JSON.stringify(params.body),
-					signal: params.signal,
-				}),
-				params.idleTimeoutMs,
-				"OpenAI Codex compaction request timed out.",
-			);
-			if (!response.ok) {
-				const body = await response.text().catch(() => "");
-				const classified = classifyHttpCompactionError(
-					response.status,
-					body || response.statusText,
-					params.prefix,
+			try {
+				const response = await withCompactionTimeout(
+					() => fetchImpl(params.url, {
+						method: "POST",
+						headers: params.headers,
+						body: JSON.stringify(params.body),
+						signal: attemptController.signal,
+					}),
+					params.idleTimeoutMs,
+					"OpenAI Codex compaction request timed out.",
+					(error) => attemptController.abort(error),
 				);
-				if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
-				lastError = classified.error;
-				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
-				continue;
+				if (!response.ok) {
+					const body = await response.text().catch(() => "");
+					const classified = classifyHttpCompactionError(
+						response.status,
+						body || response.statusText,
+						params.prefix,
+					);
+					if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
+					lastError = classified.error;
+					await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
+					continue;
+				}
+				return await params.parse(response, params.idleTimeoutMs);
+			} finally {
+				params.signal?.removeEventListener("abort", relayAbort);
+				attemptController.abort();
 			}
-			return await params.parse(response, params.idleTimeoutMs);
 		} catch (error) {
 			const classified = error instanceof Error ? error : new Error(String(error));
 			if (params.signal?.aborted) {

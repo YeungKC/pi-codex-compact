@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type CodexCompactionConfig = {
 	/** Optional Codex-style auto-compaction limit. */
@@ -35,7 +34,7 @@ function readConfig(path: string): Partial<CodexCompactionConfig> {
 }
 
 export function loadConfig(cwd: string, trusted: boolean): CodexCompactionConfig {
-	const global = readConfig(join(homedir(), CONFIG_DIR_NAME, "agent", "pi-codex-compact.json"));
+	const global = readConfig(join(getAgentDir(), "pi-codex-compact.json"));
 	const project = trusted ? readConfig(join(cwd, CONFIG_DIR_NAME, "pi-codex-compact.json")) : {};
 	return { ...DEFAULT_CONFIG, ...global, ...project };
 }
