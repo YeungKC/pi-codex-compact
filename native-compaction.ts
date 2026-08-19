@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
 	convertToLlm,
 	sessionEntryToContextMessages,
@@ -77,10 +78,9 @@ export function isContextWindowCompactionError(error: unknown): boolean {
 	if (typeof error === "object" && error !== null && "contextOverflowRecovery" in error) {
 		return (error as { contextOverflowRecovery?: unknown }).contextOverflowRecovery === true;
 	}
-	if (typeof error === "object" && error !== null && "compactionCode" in error) {
-		const code = (error as { compactionCode?: unknown }).compactionCode;
-		return code === "context_length_exceeded" || code === "context_window_exceeded";
-	}
+	const code = compactionErrorCode(error);
+	if (code !== undefined) return code === "context_length_exceeded" || code === "context_window_exceeded";
+	if (compactionRetry(error) !== undefined) return false;
 	return /(?:context_length_exceeded|context_window_exceeded)/i.test(message);
 }
 
@@ -155,10 +155,6 @@ export function modelKey(model: Pick<Model<any>, "provider" | "api" | "id">): st
 	return `${model.provider}:${model.api}:${model.id}`;
 }
 
-function cloneItem<T>(value: T): T {
-	return structuredClone(value);
-}
-
 function isResponseItem(value: unknown): value is ResponseItem {
 	if (!isJsonObject(value)) return false;
 	if (typeof value.type !== "string") {
@@ -229,8 +225,8 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 		strategy,
 		modelKey: value.modelKey,
 		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
-		...(preservedInput ? { preservedInput: preservedInput.map(cloneItem) } : {}),
-		replacementHistory: replacementHistory.map(cloneItem),
+		...(preservedInput ? { preservedInput: preservedInput.map((item) => structuredClone(item)) } : {}),
+		replacementHistory: replacementHistory.map((item) => structuredClone(item)),
 	};
 }
 
@@ -265,7 +261,7 @@ export function parseLegacyNativeCompactionDetails(value: unknown): LegacyNative
 		...(canUpgradeV2
 			? {
 				strategy: "v2" as const,
-				replacementHistory: replacementHistory.filter((item) => !isLegacyCompactionSummary(item)).map(cloneItem),
+				replacementHistory: replacementHistory.filter((item) => !isLegacyCompactionSummary(item)).map((item) => structuredClone(item)),
 			}
 			: {}),
 	};
@@ -362,6 +358,7 @@ export function estimateCompactionWindowPrefillTokens(params: {
 		+ Math.max(0, Math.floor(params.stablePrefixTokens));
 }
 
+// Pi's extension loader does not expose Pi AI's internal Responses converter.
 function shortHash(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
@@ -479,7 +476,7 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 					if (sameModel && typeof block.thinkingSignature === "string") {
 						try {
 							const reasoning = JSON.parse(block.thinkingSignature);
-							if (isJsonObject(reasoning) && reasoning.type === "reasoning") items.push(cloneItem(reasoning));
+							if (isJsonObject(reasoning) && reasoning.type === "reasoning") items.push(structuredClone(reasoning));
 						} catch {}
 					} else if (!sameModel && typeof block.thinking === "string" && block.thinking.trim()) {
 						const id = textIndex === 0 ? `msg_pi_${messageIndex}` : `msg_pi_${messageIndex}_${textIndex}`;
@@ -654,8 +651,8 @@ export function effectiveInputForBranch(params: {
 		}
 		const tail = branch.slice(checkpoint.checkpoint.entryIndex + 1);
 		return [
-			...checkpoint.checkpoint.details.replacementHistory.map(cloneItem),
-			...(checkpoint.checkpoint.details.preservedInput ?? []).map(cloneItem),
+			...checkpoint.checkpoint.details.replacementHistory.map((item) => structuredClone(item)),
+			...(checkpoint.checkpoint.details.preservedInput ?? []).map((item) => structuredClone(item)),
 			...entriesToResponseItems(params.model, tail, params.tools),
 		];
 	}
@@ -747,7 +744,7 @@ function truncateFunctionOutput(item: ResponseItem): ResponseItem | undefined {
 		&& item.type !== "custom_tool_call_output"
 		&& item.type !== "tool_search_output"
 	) return undefined;
-	const copy = cloneItem(item);
+	const copy = structuredClone(item);
 	if (item.type === "tool_search_output") copy.tools = [];
 	else copy.output = CONTEXT_WINDOW_TRUNCATED_OUTPUT;
 	return copy;
@@ -759,7 +756,7 @@ export function trimFunctionCallHistoryToFitContextWindow(
 	maxTokens: number,
 	reservedTokens = 0,
 ): ResponseItem[] {
-	const result = items.map(cloneItem);
+	const result = items.map((item) => structuredClone(item));
 	const inputBudget = Math.max(0, maxTokens - reservedTokens);
 	let excess = approximateResponseItemTokens(result) - inputBudget;
 	if (excess <= 0) return result;
@@ -780,7 +777,7 @@ function truncateTextPrefix(text: string, maxCharacters: number): string {
 
 function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | undefined {
 	if ((item.type !== "message" && item.type !== undefined) || maxTokens <= 0) return undefined;
-	const copy = cloneItem(item);
+	const copy = structuredClone(item);
 	let remainingCharacters = maxTokens * 4;
 
 	if (typeof copy.content === "string") {
@@ -943,7 +940,7 @@ export function latestRemoteCompactionSuffix(
 	maxTokens: number,
 	reservedTokens = 0,
 ): ResponseItem[] {
-	const source = items.map(cloneItem);
+	const source = items.map((item) => structuredClone(item));
 	const budget = Math.max(0, maxTokens - reservedTokens);
 	const userStarts = source.flatMap((item, index) => item.role === "user" ? [index] : []);
 	if (userStarts.length === 0) return [];
@@ -978,8 +975,8 @@ export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED
 		const sourceTokens = retainedItemTokens(group.source);
 		const tokens = sourceTokens + noticeTokens;
 		if (tokens <= remaining) {
-			if (group.notice) retained.push(cloneItem(group.notice));
-			retained.push(cloneItem(group.source));
+			if (group.notice) retained.push(structuredClone(group.notice));
+			retained.push(structuredClone(group.source));
 			remaining -= tokens;
 			continue;
 		}
@@ -989,7 +986,7 @@ export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED
 			? truncateMessage(group.source, sourceBudget)
 			: undefined;
 		if (truncated) {
-			if (group.notice) retained.push(cloneItem(group.notice));
+			if (group.notice) retained.push(structuredClone(group.notice));
 			retained.push(truncated);
 			remaining = 0;
 		}
@@ -1014,7 +1011,7 @@ export function buildReplacementHistory(
 	if (compactionItem.type !== "compaction" || typeof compactionItem.encrypted_content !== "string") {
 		throw new Error("OpenAI Codex did not return a valid compaction item.");
 	}
-	return [...retainRecentMessages(preCompactionInput), cloneItem(compactionItem)];
+	return [...retainRecentMessages(preCompactionInput), structuredClone(compactionItem)];
 }
 
 export function buildToolPayload(allTools: ToolInfo[], activeToolNames: string[]): unknown[] | undefined {
@@ -1031,7 +1028,7 @@ export function buildCompactionRequestBody(params: {
 	tools?: unknown[];
 	sessionId: string;
 }): JsonObject {
-	const base = params.basePayload ? cloneItem(params.basePayload) : {};
+	const base = params.basePayload ? structuredClone(params.basePayload) : {};
 	const previousText = isJsonObject(base.text) && typeof base.text.verbosity === "string"
 		? { verbosity: base.text.verbosity }
 		: { verbosity: "low" };
@@ -1042,7 +1039,7 @@ export function buildCompactionRequestBody(params: {
 		store: false,
 		stream: true,
 		instructions,
-		input: [...params.input.map(cloneItem), { type: "compaction_trigger" }],
+		input: [...params.input.map((item) => structuredClone(item)), { type: "compaction_trigger" }],
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 		include: ["reasoning.encrypted_content"],
@@ -1050,7 +1047,7 @@ export function buildCompactionRequestBody(params: {
 		text: previousText,
 	};
 	if (requestTools) body.tools = requestTools;
-	if (isJsonObject(base.reasoning)) body.reasoning = cloneItem(base.reasoning);
+	if (isJsonObject(base.reasoning)) body.reasoning = structuredClone(base.reasoning);
 	if (typeof base.service_tier === "string") body.service_tier = base.service_tier;
 	return body;
 }
@@ -1154,30 +1151,40 @@ export function markFallbackEligibility(error: Error, eligible: boolean): Error 
 
 export function markContextOverflowRecovery(error: Error): Error & { contextOverflowRecovery: boolean; retryWithCurrentModel: boolean } {
 	Object.defineProperty(error, "contextOverflowRecovery", { value: true, enumerable: false, configurable: true });
-	return markFallbackEligibility(error, false) as Error & { contextOverflowRecovery: boolean; retryWithCurrentModel: boolean };
+	return markFallbackEligibility(markCompactionRetry(error, "none"), false) as Error & { contextOverflowRecovery: boolean; retryWithCurrentModel: boolean };
 }
 
-class NonRetryableCompactionError extends Error {}
-class RetryableCompactionStreamError extends Error {}
+type CompactionRetry = "none" | "automatic" | "explicit";
 
-export function isRetryableCompactionError(error: unknown): boolean {
-	if (typeof error === "object" && error !== null && "retryableCompaction" in error) {
-		return (error as { retryableCompaction?: unknown }).retryableCompaction === true;
-	}
-	return error instanceof RetryableCompactionStreamError;
+function compactionRetry(error: unknown): CompactionRetry | undefined {
+	if (typeof error !== "object" || error === null || !("compactionRetry" in error)) return undefined;
+	const value = (error as { compactionRetry?: unknown }).compactionRetry;
+	return value === "none" || value === "automatic" || value === "explicit" ? value : undefined;
 }
 
-function markExplicitRetry(error: Error, allowed: boolean): Error {
-	Object.defineProperty(error, "retryableCompaction", { value: allowed, enumerable: false, configurable: true });
+function compactionErrorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null || !("compactionCode" in error)) return undefined;
+	const value = (error as { compactionCode?: unknown }).compactionCode;
+	return typeof value === "string" ? value : undefined;
+}
+
+function markCompactionRetry<T extends Error>(error: T, retry: CompactionRetry): T {
+	Object.defineProperty(error, "compactionRetry", { value: retry, enumerable: false, configurable: true });
 	return error;
 }
 
-function markRetryableCompactionError(error: Error): Error {
-	return markExplicitRetry(error, true);
+function markCompactionCode<T extends Error>(error: T, code: string): T {
+	if (code) Object.defineProperty(error, "compactionCode", { value: code, enumerable: false, configurable: true });
+	return error;
 }
 
-function hasExplicitRetryDecision(error: unknown): error is Error {
-	return error instanceof Error && "retryableCompaction" in error;
+export function isRetryableCompactionError(error: unknown): boolean {
+	return compactionRetry(error) === "explicit";
+}
+
+function shouldRetryCompaction(error: unknown): boolean {
+	const retry = compactionRetry(error);
+	return retry === "automatic" || retry === "explicit";
 }
 
 function normalizedErrorCode(code: string): string {
@@ -1210,25 +1217,26 @@ function classifySseCompactionError(code: string, message: string, includeCode =
 		: message || `OpenAI Codex compaction failed (${code}).`;
 	const normalizedCode = normalizedErrorCode(code);
 	const machineDetails = `${normalizedCode} ${message}`;
+	const tag = <T extends Error>(error: T): T => markCompactionCode(error, normalizedCode);
 	if (isFailClosedCompactionError(machineDetails)) {
-		return markFallbackEligibility(new NonRetryableCompactionError(detail), false);
+		return tag(markFallbackEligibility(markCompactionRetry(new Error(detail), "none"), false));
 	}
 	if (SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode) && !RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)) {
-		return markFallbackEligibility(withRetryDelay(new NonRetryableCompactionError(detail), message), true);
+		return tag(markFallbackEligibility(markCompactionRetry(withRetryDelay(new Error(detail), message), "none"), true));
 	}
 	if (!normalizedCode || !isKnownCompactionErrorCode(normalizedCode)) {
-		return markFallbackEligibility(withRetryDelay(new RetryableCompactionStreamError(detail), message), false);
+		return tag(markFallbackEligibility(markCompactionRetry(withRetryDelay(new Error(detail), message), "explicit"), false));
 	}
 	if (
 		RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)
 		|| RETRYABLE_COMPACTION_ERROR_PATTERN.test(machineDetails)
 	) {
-		return markFallbackEligibility(
-			withRetryDelay(new RetryableCompactionStreamError(detail), message),
+		return tag(markFallbackEligibility(
+			markCompactionRetry(withRetryDelay(new Error(detail), message), "explicit"),
 			SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode),
-		);
+		));
 	}
-	return markFallbackEligibility(withRetryDelay(new NonRetryableCompactionError(detail), message), false);
+	return tag(markFallbackEligibility(markCompactionRetry(withRetryDelay(new Error(detail), message), "none"), false));
 }
 
 function errorCodeFromResponseBody(body: string): string {
@@ -1266,11 +1274,11 @@ function classifyHttpCompactionError(
 		|| NON_RETRYABLE_FALLBACK_ERROR_CODES.has(code)
 		|| USAGE_LIMIT_MESSAGE_PATTERN.test(body);
 	const retryable = isRetryableStatus(status) && !terminal;
-	const error = retryable
-		? markRetryableCompactionError(new Error(`${prefix} (${status}): ${body || "HTTP error"}`))
-		: new NonRetryableCompactionError(`${prefix} (${status}): ${body || "HTTP error"}`);
-	if (code) Object.defineProperty(error, "compactionCode", { value: code, enumerable: false, configurable: true });
-	return { error: markFallbackEligibility(error, fallback), retryable };
+	const error = markCompactionRetry(
+		new Error(`${prefix} (${status}): ${body || "HTTP error"}`),
+		retryable ? "explicit" : "none",
+	);
+	return { error: markFallbackEligibility(markCompactionCode(error, code), fallback), retryable };
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -1280,27 +1288,19 @@ function abortError(signal: AbortSignal): Error {
 async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	if (signal?.aborted) throw abortError(signal);
 	if (ms <= 0) return;
-	await new Promise<void>((resolve, reject) => {
-		const cleanup = () => signal?.removeEventListener("abort", onAbort);
-		const timer = setTimeout(() => {
-			cleanup();
-			resolve();
-		}, ms);
-		const onAbort = () => {
-			clearTimeout(timer);
-			cleanup();
-			reject(signal?.reason instanceof Error ? signal.reason : new Error("Compaction aborted"));
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-		if (signal?.aborted) onAbort();
-	});
+	try {
+		await sleep(ms, undefined, signal ? { signal } : undefined);
+	} catch (error) {
+		if (signal?.aborted) throw abortError(signal);
+		throw error;
+	}
 }
 
 async function withCompactionTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const timeout = new Promise<never>((_, reject) => {
 		timer = setTimeout(() => reject(markFallbackEligibility(
-			new RetryableCompactionStreamError("OpenAI Codex compaction request timed out."),
+			markCompactionRetry(new Error("OpenAI Codex compaction request timed out."), "explicit"),
 			false,
 		)), timeoutMs);
 	});
@@ -1318,7 +1318,7 @@ async function readSseChunk(
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const timeout = new Promise<never>((_, reject) => {
 		timer = setTimeout(() => reject(markFallbackEligibility(
-			new RetryableCompactionStreamError("OpenAI Codex compaction stream idle timeout."),
+			markCompactionRetry(new Error("OpenAI Codex compaction stream idle timeout."), "explicit"),
 			false,
 		)), idleTimeoutMs);
 	});
@@ -1336,7 +1336,7 @@ async function parseSseResponse(
 ): Promise<{ item: ResponseItem; usage?: unknown }> {
 	if (!response.body) {
 		throw markFallbackEligibility(
-			new RetryableCompactionStreamError("OpenAI Codex returned an empty compaction stream."),
+			markCompactionRetry(new Error("OpenAI Codex returned an empty compaction stream."), "explicit"),
 			false,
 		);
 	}
@@ -1386,7 +1386,7 @@ async function parseSseResponse(
 					: "";
 			if (!message && !code) {
 				throw markFallbackEligibility(
-					new NonRetryableCompactionError("OpenAI Codex compaction failed."),
+					markCompactionRetry(new Error("OpenAI Codex compaction failed."), "none"),
 					false,
 				);
 			}
@@ -1416,12 +1416,16 @@ async function parseSseResponse(
 			const message = typeof details.message === "string" && details.message.trim()
 				? details.message
 				: `OpenAI Codex compaction ended with response.incomplete (${reason}).`;
+			const normalizedReason = normalizedErrorCode(reason);
 			const explicitRetry = !isFailClosedCompactionError(`${reason} ${message}`)
 				&& !/invalid[_ -]?(?:prompt|request)|malformed|protocol/i.test(`${reason} ${message}`);
-			const error = markExplicitRetry(
-				withRetryDelay(new RetryableCompactionStreamError(message), message),
-				explicitRetry,
-			);
+			const retry = normalizedReason === "context_length_exceeded" || normalizedReason === "context_window_exceeded"
+				? "automatic"
+				: explicitRetry ? "explicit" : "automatic";
+			const error = markCompactionCode(markCompactionRetry(
+				withRetryDelay(new Error(message), message),
+				retry,
+			), normalizedReason);
 			throw markFallbackEligibility(error, false);
 		}
 		if (event.type !== "response.output_item.done" && (typeof event.code === "string" || typeof event.message === "string" || isJsonObject(event.error))) {
@@ -1473,21 +1477,24 @@ async function parseSseResponse(
 	}
 	if (!completed) {
 		throw markFallbackEligibility(
-			new RetryableCompactionStreamError(
-				"OpenAI Codex compaction stream closed before response.completed.",
+			markCompactionRetry(
+				new Error("OpenAI Codex compaction stream closed before response.completed."),
+				"explicit",
 			),
 			false,
 		);
 	}
 	if (compactionItems.length !== 1) {
-		throw new NonRetryableCompactionError(
-			`OpenAI Codex returned ${compactionItems.length} compaction items; expected exactly one.`,
+		throw markCompactionRetry(
+			new Error(`OpenAI Codex returned ${compactionItems.length} compaction items; expected exactly one.`),
+			"none",
 		);
 	}
 	const item = compactionItems[0]!;
 	if (typeof item.encrypted_content !== "string") {
-		throw new NonRetryableCompactionError(
-			"OpenAI Codex returned a compaction item without encrypted_content.",
+		throw markCompactionRetry(
+			new Error("OpenAI Codex returned a compaction item without encrypted_content."),
+			"none",
 		);
 	}
 	return { item, usage };
@@ -1546,17 +1553,15 @@ async function runRemoteCompaction<T>(params: {
 			}
 			return await params.parse(response, params.idleTimeoutMs);
 		} catch (error) {
+			const classified = error instanceof Error ? error : new Error(String(error));
 			if (params.signal?.aborted) {
-				throw markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
+				throw markFallbackEligibility(markCompactionRetry(classified, "none"), false);
 			}
-			if (error instanceof NonRetryableCompactionError) throw error;
-			lastError = hasExplicitRetryDecision(error)
-				? error
-				: error instanceof Error
-					? markRetryableCompactionError(error)
-					: markRetryableCompactionError(new Error(String(error)));
-			if (attempt === MAX_REMOTE_RETRIES) throw lastError;
-			const retryAfterMs = isJsonObject(error) && typeof error.retryAfterMs === "number" ? error.retryAfterMs : undefined;
+			if (compactionRetry(classified) === undefined) markCompactionRetry(classified, "explicit");
+			if (!shouldRetryCompaction(classified)) throw classified;
+			lastError = classified;
+			if (attempt === MAX_REMOTE_RETRIES) throw classified;
+			const retryAfterMs = isJsonObject(classified) && typeof classified.retryAfterMs === "number" ? classified.retryAfterMs : undefined;
 			await delay(retryAfterMs ?? 1000 * 2 ** attempt, params.signal);
 		}
 	}
@@ -1594,18 +1599,18 @@ export function buildLegacyCompactionRequestBody(params: {
 	tools?: unknown[];
 	sessionId: string;
 }): JsonObject {
-	const base = params.basePayload ? cloneItem(params.basePayload) : {};
+	const base = params.basePayload ? structuredClone(params.basePayload) : {};
 	const requestTools = Array.isArray(base.tools) ? base.tools : params.tools;
 	const instructions = typeof base.instructions === "string" ? base.instructions : params.instructions;
 	const body: JsonObject = {
 		model: params.model.id,
-		input: params.input.map(cloneItem),
+		input: params.input.map((item) => structuredClone(item)),
 		instructions,
 		parallel_tool_calls: true,
 		prompt_cache_key: params.sessionId,
 	};
 	if (requestTools) body.tools = requestTools;
-	if (isJsonObject(base.reasoning)) body.reasoning = cloneItem(base.reasoning);
+	if (isJsonObject(base.reasoning)) body.reasoning = structuredClone(base.reasoning);
 	if (typeof base.service_tier === "string") body.service_tier = base.service_tier;
 	if (isJsonObject(base.text) && typeof base.text.verbosity === "string") {
 		body.text = { verbosity: base.text.verbosity };
@@ -1634,17 +1639,17 @@ export function callLegacyRemoteCompaction(params: {
 			try {
 				parsed = await withCompactionTimeout(response.json(), idleTimeoutMs);
 			} catch (error) {
-				if (error instanceof RetryableCompactionStreamError) throw error;
-				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid JSON.");
+				if (shouldRetryCompaction(error)) throw error;
+				throw markCompactionRetry(new Error("OpenAI Codex legacy compaction returned invalid JSON."), "none");
 			}
 			if (!isJsonObject(parsed)) {
-				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid JSON.");
+				throw markCompactionRetry(new Error("OpenAI Codex legacy compaction returned invalid JSON."), "none");
 			}
 			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {
-				throw new NonRetryableCompactionError("OpenAI Codex legacy compaction returned invalid output.");
+				throw markCompactionRetry(new Error("OpenAI Codex legacy compaction returned invalid output."), "none");
 			}
 			return {
-				replacementHistory: parsed.output.map(cloneItem),
+				replacementHistory: parsed.output.map((item) => structuredClone(item)),
 				usage: usageFromResponse(params.model, parsed.usage),
 				...(response.headers.get("x-codex-turn-state") ? { turnState: response.headers.get("x-codex-turn-state")! } : {}),
 			};
@@ -1653,7 +1658,7 @@ export function callLegacyRemoteCompaction(params: {
 }
 
 export function stripInputFromPayload(payload: JsonObject): JsonObject {
-	const shape = cloneItem(payload);
+	const shape = structuredClone(payload);
 	delete shape.input;
 	delete shape.messages;
 	delete shape.previous_response_id;

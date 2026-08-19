@@ -32,6 +32,7 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResu
 		id: "gpt",
 		contextWindow: 100_000,
 		reasoning: true,
+		compat: {},
 	};
 	const sessionManager = {
 		getSessionId: () => "session",
@@ -66,6 +67,14 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResu
 	return { handlers, ctx, model, notify, select };
 }
 
+test("disables unsupported long cache retention for Codex", () => {
+	const { handlers, ctx, model } = installExtension();
+
+	handlers.get("context")?.({ messages: [] }, ctx);
+
+	expect(model.compat).toMatchObject({ supportsLongCacheRetention: false });
+});
+
 test("filters Pi compaction summaries before legacy checkpoint migration", () => {
 	const { handlers, ctx } = installExtension([legacyEntry()]);
 
@@ -95,29 +104,6 @@ test("clears turn state when navigating to another session-tree leaf", () => {
 	expect(afterTreeHeaders["x-codex-turn-state"]).toBeUndefined();
 });
 
-test("removes unsupported prompt cache retention from Codex requests", async () => {
-	const { handlers, ctx, notify } = installExtension([], true);
-	const result = await handlers.get("before_provider_request")?.({
-		payload: {
-			model: "gpt",
-			input: [],
-			prompt_cache_retention: "24h",
-		},
-	}, ctx);
-
-	expect(result).toEqual({ model: "gpt", input: [] });
-	expect(notify).toHaveBeenCalledWith(
-		"OpenAI Codex does not support prompt_cache_retention; the setting was ignored.",
-		"warning",
-	);
-
-	handlers.get("session_tree")?.({ newLeafId: "other", oldLeafId: "current" }, ctx);
-	await handlers.get("before_provider_request")?.({
-		payload: { model: "gpt", input: [], prompt_cache_retention: "24h" },
-	}, ctx);
-	expect(notify).toHaveBeenCalledTimes(1);
-});
-
 test("offers a UI action before blocking a failed Codex request", async () => {
 	const { handlers, ctx, select } = installExtension([legacyEntry()], true, "Cancel");
 
@@ -128,16 +114,6 @@ test("offers a UI action before blocking a failed Codex request", async () => {
 		["Start a new session", "Cancel"],
 		{ signal: ctx.signal },
 	);
-	expect(ctx.abort).toHaveBeenCalled();
-});
-
-test("removes unsupported prompt cache retention even when request preparation aborts", async () => {
-	const { handlers, ctx } = installExtension([legacyEntry()], true);
-	const payload: Record<string, unknown> = { prompt_cache_retention: "24h" };
-
-	await handlers.get("before_provider_request")?.({ payload }, ctx);
-
-	expect(payload.prompt_cache_retention).toBeUndefined();
 	expect(ctx.abort).toHaveBeenCalled();
 });
 

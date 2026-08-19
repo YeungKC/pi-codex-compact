@@ -1,4 +1,21 @@
 import { describe, expect, test, vi } from "vitest";
+
+vi.mock("node:timers/promises", () => ({
+	setTimeout: (ms: number, value?: unknown, options?: { signal?: AbortSignal }) => new Promise((resolve, reject) => {
+		const signal = options?.signal;
+		if (signal?.aborted) return reject(signal.reason);
+		const timer = globalThis.setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve(value);
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal?.reason);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	}),
+}));
+
 import { createNativeCheckpoint } from "./remote-compaction.ts";
 import { approximateResponseItemTokens, isContextWindowCompactionError, isRetryableCompactionError, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
@@ -216,6 +233,41 @@ describe("Codex compaction history", () => {
 			expect(error).toMatchObject({ retryWithCurrentModel: expectedFallback });
 			expect(isRetryableCompactionError(error)).toBe(expectedExplicitRetry);
 			expect(calls).toBe(expectedCalls);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("does not treat a protocol incomplete response as context overflow", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		try {
+			const failure = callRemoteCompaction(remoteRequest({
+				fetchImpl: async () => {
+					calls++;
+					return sse('data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"new_protocol_reason","message":"context_length_exceeded"}}}\n\n');
+				},
+			})).catch((error) => error);
+			await vi.runAllTimersAsync();
+			const error = await failure;
+			expect(calls).toBe(3);
+			expect(isContextWindowCompactionError(error)).toBe(false);
+			expect(isRetryableCompactionError(error)).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("marks an incomplete context overflow for automatic retry only", async () => {
+		vi.useFakeTimers();
+		try {
+			const failure = callRemoteCompaction(remoteRequest({
+				fetchImpl: async () => sse('data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"context_length_exceeded"}}}\n\n'),
+			})).catch((error) => error);
+			await vi.runAllTimersAsync();
+			const error = await failure;
+			expect(isContextWindowCompactionError(error)).toBe(true);
+			expect(isRetryableCompactionError(error)).toBe(false);
 		} finally {
 			vi.useRealTimers();
 		}

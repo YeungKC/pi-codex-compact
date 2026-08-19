@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { compactionHash } from "./capabilities.ts";
@@ -14,6 +15,7 @@ import {
 	modelKey,
 	markContextOverflowRecovery,
 	approximateCompactionRequestTokens,
+	approximateResponseItemTokens,
 	latestRemoteCompactionSuffix,
 	trimFunctionCallHistoryToFitContextWindow,
 	type FailedRequestDetails,
@@ -92,6 +94,20 @@ function contextOverflowRecoveryError(model: Model<any>): Error {
 	));
 }
 
+function compactionRequestReservedTokens(
+	ctx: Pick<ExtensionContext, "getSystemPrompt">,
+	basePayload: JsonObject | undefined,
+	tools: unknown[],
+	includeTrigger: boolean,
+): number {
+	return approximateCompactionRequestTokens({
+		input: [],
+		instructions: typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt(),
+		tools: Array.isArray(basePayload?.tools) ? basePayload.tools : tools,
+		includeTrigger,
+	});
+}
+
 function conversationLeafId(branch: SessionEntry[]): string | undefined {
 	return [...branch].reverse().find((entry) => entry.type !== "custom")?.id;
 }
@@ -132,7 +148,7 @@ function requestInputWithoutFailedRequest(
 	const failedIndex = requestInput.findLastIndex((item, index) =>
 		index < lastUserIndex
 			&& item.role === "user"
-			&& sameValue(item.content, failed.content),
+			&& isDeepStrictEqual(item.content, failed.content),
 	);
 	return failedIndex < 0
 		? requestInput
@@ -196,14 +212,7 @@ function checkpointPreservedCurrentUser(branch: SessionEntry[], requestInput: Re
 	if (requestUserCount > checkpointUsers.length) return undefined;
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const checkpointUser = checkpointUsers.findLast((item) => item.role === "user");
-	return requestUser && checkpointUser && sameValue(checkpointUser.content, requestUser.content) ? checkpointUser : undefined;
-}
-
-function appendPreservedUser(details: NativeCompactionDetails, requestUser: ResponseItem): NativeCompactionDetails {
-	return {
-		...details,
-		preservedInput: [...(details.preservedInput ?? []), structuredClone(requestUser)],
-	};
+	return requestUser && checkpointUser && isDeepStrictEqual(checkpointUser.content, requestUser.content) ? checkpointUser : undefined;
 }
 
 function preserveCurrentUser(
@@ -215,12 +224,12 @@ function preserveCurrentUser(
 	const requestUser = requestInput?.findLast((item) => item.role === "user");
 	const currentUser = branch.findLast((entry) => entry.type === "message" && entry.message.role === "user");
 	if (!requestUser || !currentUser || currentUser.type !== "message") return details;
-	if (alreadyPreserved && details.replacementHistory.some((item) => item.role === "user" && sameValue(item.content, requestUser.content))) return details;
+	if (alreadyPreserved && details.replacementHistory.some((item) => item.role === "user" && isDeepStrictEqual(item.content, requestUser.content))) return details;
 	const compactedBranch = branchBeforeCurrentUser(branch, requestInput);
-	if (compactedBranch.length < branch.length) return appendPreservedUser(details, requestUser);
-	if (details.replacementHistory.some((item) => item.role === "user" && sameValue(item.content, requestUser.content))) return details;
+	if (compactedBranch.length < branch.length) return appendPreservedInput(details, [requestUser]);
+	if (details.replacementHistory.some((item) => item.role === "user" && isDeepStrictEqual(item.content, requestUser.content))) return details;
 	return textContent(messageContent(currentUser)) === textContent(requestUser.content)
-		? appendPreservedUser(details, requestUser)
+		? appendPreservedInput(details, [requestUser])
 		: details;
 }
 
@@ -240,7 +249,7 @@ function withoutLastUser(items: ResponseItem[]): ResponseItem[] {
 
 function preserveRequestUser(details: NativeCompactionDetails, requestInput: ResponseItem[]): NativeCompactionDetails {
 	const requestUser = requestInput.findLast((item) => item.role === "user");
-	return requestUser ? appendPreservedUser(details, requestUser) : details;
+	return requestUser ? appendPreservedInput(details, [requestUser]) : details;
 }
 
 function appendPreservedInput(details: NativeCompactionDetails, input: ResponseItem[]): NativeCompactionDetails {
@@ -255,26 +264,11 @@ function ensureNotAborted(signal?: AbortSignal): void {
 	throw signal.reason instanceof Error ? signal.reason : new Error("Compaction aborted.");
 }
 
-function sameValue(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) || Array.isArray(right)) {
-		return Array.isArray(left)
-			&& Array.isArray(right)
-			&& left.length === right.length
-			&& left.every((item, index) => sameValue(item, right[index]));
-	}
-	if (!isJsonObject(left) || !isJsonObject(right)) return false;
-	const leftKeys = Object.keys(left);
-	const rightKeys = Object.keys(right);
-	return leftKeys.length === rightKeys.length
-		&& leftKeys.every((key) => Object.hasOwn(right, key) && sameValue(left[key], right[key]));
-}
-
 function sameUserOccurrence(left: ResponseItem, right: ResponseItem): boolean {
 	const leftId = typeof left.id === "string" ? left.id : undefined;
 	const rightId = typeof right.id === "string" ? right.id : undefined;
 	if (leftId !== undefined || rightId !== undefined) return leftId !== undefined && leftId === rightId;
-	return sameValue(left.content, right.content);
+	return isDeepStrictEqual(left.content, right.content);
 }
 
 function requestTail(
@@ -286,7 +280,7 @@ function requestTail(
 	const candidates = prefixes.flatMap((value) => systemPromptInput.length > 0 ? [value, [...systemPromptInput, ...value]] : [value]);
 	for (const prefix of candidates) {
 		if (requestInput.length < prefix.length) continue;
-		if (prefix.every((item, index) => sameValue(item, requestInput[index]!))) {
+		if (prefix.every((item, index) => isDeepStrictEqual(item, requestInput[index]!))) {
 			return requestInput.slice(prefix.length);
 		}
 	}
@@ -304,7 +298,7 @@ function unmatchedRequestItems(
 		let requestIndex = 0;
 		const matches: number[] = [];
 		for (const historyItem of history) {
-			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && sameValue(item, historyItem));
+			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && isDeepStrictEqual(item, historyItem));
 			if (nextIndex < 0) continue;
 			requestIndex = nextIndex + 1;
 			matches.push(nextIndex);
@@ -318,7 +312,7 @@ function unmatchedRequestItems(
 	const matchedIndexes = new Set(bestMatches);
 	const preservedIndexes = new Set<number>();
 	for (const preservedItem of preservedItems) {
-		const preservedIndex = requestInput.findLastIndex((item, index) => !preservedIndexes.has(index) && sameValue(item, preservedItem));
+		const preservedIndex = requestInput.findLastIndex((item, index) => !preservedIndexes.has(index) && isDeepStrictEqual(item, preservedItem));
 		if (preservedIndex >= 0) {
 			preservedIndexes.add(preservedIndex);
 			matchedIndexes.delete(preservedIndex);
@@ -327,7 +321,7 @@ function unmatchedRequestItems(
 	const unmatched = requestInput.filter((_item, index) => !matchedIndexes.has(index));
 	return [
 		...unmatched,
-		...preservedItems.filter((item) => !requestInput.some((requestItem) => sameValue(requestItem, item))),
+		...preservedItems.filter((item) => !requestInput.some((requestItem) => isDeepStrictEqual(requestItem, item))),
 	];
 }
 
@@ -498,23 +492,16 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const previousModel = resolveModel(ctx, legacy.checkpoint.details.modelKey);
 		const historyModel = previousModel && isOpenAICodexModel(previousModel) ? previousModel : model;
 		const createFor = async (selectedModel: Model<any>) => {
-			const input = fullInputForBranch({ branch: compactionBranch, model: selectedModel, tools: deps.getAllTools() });
-			const instructions = typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt();
-			const tools = Array.isArray(basePayload?.tools) ? basePayload.tools : deps.getAllTools();
-			const includeTrigger = deps.includeCompactionTrigger?.(ctx) ?? true;
-			const reservedTokens = approximateCompactionRequestTokens({
-				input: [],
-				instructions,
-				tools,
-				includeTrigger,
-			});
+			const allTools = deps.getAllTools();
+			const input = fullInputForBranch({ branch: compactionBranch, model: selectedModel, tools: allTools });
+			const reservedTokens = compactionRequestReservedTokens(
+				ctx,
+				basePayload,
+				allTools,
+				deps.includeCompactionTrigger?.(ctx) ?? true,
+			);
 			const trimmedInput = trimFunctionCallHistoryToFitContextWindow(input, selectedModel.contextWindow, reservedTokens);
-			const estimatedTokens = approximateCompactionRequestTokens({
-				input: trimmedInput,
-				instructions,
-				tools,
-				includeTrigger,
-			});
+			const estimatedTokens = reservedTokens + approximateResponseItemTokens(trimmedInput);
 			if (estimatedTokens > selectedModel.contextWindow) {
 				throw oversizedLegacyMigrationError(selectedModel, estimatedTokens);
 			}
@@ -570,15 +557,12 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			?? (checkpointModel && isOpenAICodexModel(checkpointModel) ? checkpointModel : model);
 		const lastUserIndex = requestInput.findLastIndex((item) => item.role === "user");
 		const historyInput = lastUserIndex >= 0 ? requestInput.slice(0, lastUserIndex) : requestInput;
-		const instructions = typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt();
-		const tools = Array.isArray(basePayload?.tools) ? basePayload.tools : deps.getAllTools();
-		const includeTrigger = deps.includeCompactionTrigger?.(ctx) ?? true;
-		const reservedTokens = approximateCompactionRequestTokens({
-			input: [],
-			instructions,
-			tools,
-			includeTrigger,
-		});
+		const reservedTokens = compactionRequestReservedTokens(
+			ctx,
+			basePayload,
+			deps.getAllTools(),
+			deps.includeCompactionTrigger?.(ctx) ?? true,
+		);
 		const input = latestRemoteCompactionSuffix(historyInput, compactionModel.contextWindow, reservedTokens);
 		if (input.length === 0) throw contextOverflowRecoveryError(compactionModel);
 		const leafId = conversationLeafId(branch);
