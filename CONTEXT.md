@@ -40,11 +40,11 @@ A lossy remote-only continuation for `context_length_exceeded`: the newest compl
 **Model-transition compaction**:
 Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
 
-**Legacy checkpoint**:
-A version-1 native compaction entry written by an earlier extension version. If it explicitly contains a fully valid opaque V2 replacement history, the extension replays that bounded replacement history and removes only Pi's `<summary>` wrapper. Otherwise, the first request migrates it by remote-compacting the full branch; `context_length_exceeded` uses context overflow recovery instead of permanently blocking the session.
+**Unsupported checkpoint**:
+A native compaction entry from an older protocol or extension version. The extension ignores it and replays Pi's normal branch. A later V2 compaction can write a current replacement; it never calls a legacy endpoint or blocks the session permanently.
 
 **Malformed checkpoint**:
-A native compaction entry that fails the current schema. It is ignored and the full branch is replayed; a later remote compaction can write a valid replacement instead of permanently blocking the session.
+A native compaction entry that fails the current V2 schema. It is ignored and the full branch is replayed; a later remote compaction can write a valid replacement instead of permanently blocking the session.
 
 **Failed request marker**:
 A non-model-visible session entry that identifies a user input blocked before provider execution. The next request excludes that stale entry from history while keeping a retry as the current input.

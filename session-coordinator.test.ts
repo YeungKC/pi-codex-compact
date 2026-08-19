@@ -5,7 +5,6 @@ import { createSessionCoordinator } from "./session-coordinator.ts";
 import {
 	effectiveInputForBranch,
 	findNativeCheckpoint,
-	fullInputForBranch,
 	modelKey,
 	FAILED_REQUEST_KIND,
 	NATIVE_COMPACTION_KIND,
@@ -53,33 +52,6 @@ function details(key: string, encrypted = "opaque"): NativeCompactionDetails {
 		strategy: "v2",
 		modelKey: key,
 		replacementHistory: [{ type: "compaction", encrypted_content: encrypted }],
-	};
-}
-
-function legacyDetails(key: string): Record<string, unknown> {
-	return {
-		kind: NATIVE_COMPACTION_KIND,
-		version: 1,
-		strategy: "v1",
-		modelKey: key,
-		replacementHistory: [{ type: "compaction", encrypted_content: "old" }],
-	};
-}
-
-function legacyV2Details(key: string): Record<string, unknown> {
-	return {
-		kind: NATIVE_COMPACTION_KIND,
-		version: 1,
-		strategy: "v2",
-		modelKey: key,
-		replacementHistory: [
-			{
-				type: "message",
-				role: "user",
-				content: [{ type: "input_text", text: "The conversation history before this point was compacted into the following summary:\n\n<summary>\nOLD SUMMARY\n</summary>" }],
-			},
-			{ type: "compaction", encrypted_content: "old" },
-		],
 	};
 }
 
@@ -377,172 +349,34 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(0);
 	});
 
-	test("replays a valid legacy V2 checkpoint without a migration request", async () => {
+	test("ignores an unsupported V1 checkpoint and leaves Pi's normal history unchanged", async () => {
 		const currentModel = model("old");
-		const branch = [userEntry("old history"), customEntry(legacyV2Details(modelKey(currentModel)))];
-		const coordinator = createCoordinator(branch, async () => {
-			throw new Error("legacy V2 checkpoint should not be migrated");
-		});
-		const request = [
-			{ type: "compaction", encrypted_content: "old" },
-			userInput("new request"),
-		];
-
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual(request);
-		expect(findNativeCheckpoint(branch).status).toBe("valid");
-	});
-
-	test("migrates a legacy checkpoint from the full branch on first request", async () => {
-		const currentModel = model("old");
-		const branch = [userEntry("old history"), customEntry(legacyDetails(modelKey(currentModel)))];
-		let compactedInput: ResponseItem[] | undefined;
-		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
-			compactedInput = input;
-			return details(modelKey(currentModel), "migrated");
-		});
-		const request = [userInput("old history"), userInput("new request")];
-
-		const input = await coordinator.prepareRequest(currentModel, context([currentModel]), request);
-
-		expect(compactedInput).toEqual([userInput("old history")]);
-		expect(input).toEqual([{ type: "compaction", encrypted_content: "migrated" }, userInput("new request")]);
-		expect(findNativeCheckpoint(branch).status).toBe("valid");
-	});
-
-	test("blocks an oversized legacy migration before sending the full branch", async () => {
-		const currentModel = model("old", "openai-codex", 100);
 		const branch = [
-			userEntry("x".repeat(300)),
-			customEntry(legacyDetails(modelKey(currentModel))),
+			userEntry("old history"),
+			customEntry({
+				kind: NATIVE_COMPACTION_KIND,
+				version: 2,
+				strategy: "v1",
+				modelKey: modelKey(currentModel),
+				replacementHistory: [{ type: "compaction", encrypted_content: "old" }],
+			}),
 		];
 		let calls = 0;
 		const coordinator = createCoordinator(branch, async () => {
 			calls++;
-			return details(modelKey(currentModel), "unexpected");
+			return details(modelKey(currentModel));
 		});
 
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel], "s".repeat(200)), [userInput("new request")]))
-			.rejects.toThrow(/legacy compaction checkpoint cannot be migrated.*above this model's/);
+		await expect(coordinator.prepareRequest(
+			currentModel,
+			context([currentModel]),
+			[userInput("old history"), userInput("new request")],
+		)).resolves.toBeUndefined();
 		expect(calls).toBe(0);
+		expect(findNativeCheckpoint(branch).status).toBe("none");
 	});
 
-	test("migrates legacy state even when Pi changes the request prefix", async () => {
-		const currentModel = model("old");
-		const branch = [userEntry("old history"), customEntry(legacyDetails(modelKey(currentModel)))];
-		let compactedInput: ResponseItem[] | undefined;
-		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
-			compactedInput = input;
-			return details(modelKey(currentModel), "migrated");
-		});
-
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("new request")])).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "migrated" },
-			userInput("new request"),
-		]);
-		expect(compactedInput).toEqual([userInput("old history")]);
-	});
-
-	test("preserves the transformed request tail during legacy migration", async () => {
-		const currentModel = model("old");
-		const branch = [userEntry("old history"), customEntry(legacyDetails(modelKey(currentModel)))];
-		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
-			expect(input).toEqual([userInput("old history")]);
-			return details(modelKey(currentModel), "migrated");
-		});
-		const request = [
-			userInput("new request"),
-			{ type: "function_call_output", call_id: "call", output: "tool result" },
-		];
-
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "migrated" },
-			...request,
-		]);
-	});
-
-	test("preserves unmatched transformed items around legacy history", async () => {
-		const currentModel = model("old");
-		const branch = [userEntry("one", "one"), userEntry("two", "two"), customEntry(legacyDetails(modelKey(currentModel)))];
-		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
-			expect(input).toEqual([userInput("one"), userInput("two")]);
-			return details(modelKey(currentModel), "migrated");
-		});
-		const request = [userInput("prefix"), userInput("one"), userInput("middle"), userInput("two"), userInput("new")];
-
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "migrated" },
-			userInput("prefix"),
-			userInput("middle"),
-			userInput("new"),
-		]);
-	});
-
-	test("keeps a preserved current user in authoritative request order", async () => {
-		const currentModel = model("old");
-		const branch = [userEntry("history"), userEntry("current"), userEntry("current"), customEntry(legacyDetails(modelKey(currentModel)))];
-		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
-			expect(input).toEqual([userInput("history"), userInput("current")]);
-			return details(modelKey(currentModel), "migrated");
-		});
-		const request = [userInput("prefix"), userInput("history"), userInput("current")];
-
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "migrated" },
-			userInput("prefix"),
-			userInput("current"),
-		]);
-	});
-
-	test("does not duplicate history after a missing transformed item", async () => {
-		const currentModel = model("old");
-		const branch = [userEntry("a", "a"), userEntry("b", "b"), userEntry("c", "c"), customEntry(legacyDetails(modelKey(currentModel)))];
-		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
-			expect(input).toEqual([userInput("a"), userInput("b"), userInput("c")]);
-			return details(modelKey(currentModel), "migrated");
-		});
-		const request = [userInput("a"), userInput("inserted"), userInput("c"), userInput("new")];
-
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "migrated" },
-			userInput("inserted"),
-			userInput("new"),
-		]);
-	});
-
-	test("uses the legacy checkpoint model before falling back to the current model", async () => {
-		const oldModel = model("old");
-		const currentModel = model("new");
-		const branch = [userEntry("old history"), customEntry(legacyDetails(modelKey(oldModel)))];
-		let usedModel: string | undefined;
-		const coordinator = createCoordinator(branch, async (selectedModel) => {
-			usedModel = modelKey(selectedModel);
-			return details(modelKey(selectedModel), "migrated");
-		});
-
-		await coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("old history"), userInput("new request")]);
-		expect(usedModel).toBe(modelKey(oldModel));
-	});
-
-	test("retries legacy migration on a later request after failure", async () => {
-		const currentModel = model("old");
-		const branch = [userEntry("old history"), customEntry(legacyDetails(modelKey(currentModel)))];
-		let calls = 0;
-		const coordinator = createCoordinator(branch, async () => {
-			calls++;
-			if (calls === 1) throw new Error("temporary unavailable");
-			return details(modelKey(currentModel), "migrated");
-		});
-		const request = [userInput("old history"), userInput("new request")];
-
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).rejects.toThrow("temporary unavailable");
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), request)).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "migrated" },
-			userInput("new request"),
-		]);
-		expect(calls).toBe(2);
-	});
-
-	test("replays full history after a malformed current checkpoint", async () => {
+	test("leaves a malformed current checkpoint to Pi's normal history", async () => {
 		const currentModel = model("old");
 		const branch = [
 			userEntry("old"),
@@ -557,10 +391,7 @@ describe("Codex session coordinator", () => {
 		];
 		const coordinator = createCoordinator(branch);
 
-		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("old"), userInput("hello")])).resolves.toEqual([
-			userInput("old"),
-			userInput("hello"),
-		]);
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("old"), userInput("hello")])).resolves.toBeUndefined();
 	});
 
 	test("preserves a persisted current user without duplicating it", async () => {
@@ -759,9 +590,4 @@ describe("Codex session coordinator", () => {
 		expect(usedModel).toBe(modelKey(currentModel));
 	});
 
-	test("fullInputForBranch remains the legacy migration source", () => {
-		const currentModel = model("old");
-		const branch = [userEntry("one"), customEntry(legacyDetails(modelKey(currentModel)))];
-		expect(fullInputForBranch({ branch, model: currentModel, tools: [] })).toEqual([userInput("one")]);
-	});
 });

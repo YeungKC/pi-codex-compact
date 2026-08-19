@@ -12,7 +12,6 @@ import {
 	isJsonObject,
 	isOpenAICodexModel,
 	mergeFeatureHeader,
-	removeFeatureHeader,
 	approximateResponseItemTokens,
 	isContextWindowCompactionError,
 	isRetryableCompactionError,
@@ -32,10 +31,6 @@ function errorMessage(error: unknown): string {
 
 function disableUnsupportedLongCacheRetention(model: Model<"openai-codex-responses">): void {
 	model.compat = { ...model.compat, supportsLongCacheRetention: false };
-}
-
-function isLegacyMigrationLimit(message: string): boolean {
-	return message.startsWith("OpenAI Codex legacy compaction checkpoint cannot be migrated");
 }
 
 type BlockedAction = "retry" | "new-session" | "cancel";
@@ -92,14 +87,12 @@ function notifyBlocked(
 	if (!ctx.hasUI) return;
 	const message = errorMessage(error);
 	const nextStep = action === "new-session" ? " Start a new session to continue." : "";
-	ctx.ui.notify(`OpenAI Codex request blocked: ${message}.${nextStep}`, isLegacyMigrationLimit(message) ? "warning" : "error");
+	ctx.ui.notify(`OpenAI Codex request blocked: ${message}.${nextStep}`, "error");
 }
 
-function setFeatureHeader(headers: Record<string, string | null>, includeRemoteCompactionV2: boolean): void {
+function setFeatureHeader(headers: Record<string, string | null>): void {
 	const existing = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-codex-beta-features");
-	const features = includeRemoteCompactionV2
-		? mergeFeatureHeader(existing?.[1])
-		: removeFeatureHeader(existing?.[1]);
+	const features = mergeFeatureHeader(existing?.[1]);
 	if (features) {
 		headers[existing?.[0] ?? "x-codex-beta-features"] = features;
 	} else if (existing) {
@@ -120,7 +113,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 			basePayload: params.basePayload ?? basePayloadBySession.get(sessionId),
 			turnState: turnStateBySession.get(sessionId),
 			onTurnState: (state) => rememberTurnState(sessionId, state),
-			config: loadConfig(params.ctx.cwd, params.ctx.isProjectTrusted()),
 			allTools: pi.getAllTools(),
 			activeToolNames: pi.getActiveTools(),
 		});
@@ -132,7 +124,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		createCheckpoint,
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
 		appendFailedRequest: (details) => pi.appendEntry(FAILED_REQUEST_KIND, details),
-		includeCompactionTrigger: (ctx) => loadConfig(ctx.cwd, ctx.isProjectTrusted()).remoteCompactionV2,
 		shouldAutoCompact: ({ ctx, model, input, reason }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			// Pi exposes assistant usage but not Codex's window counters; estimate the stable prefix.
@@ -183,7 +174,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
 		disableUnsupportedLongCacheRetention(ctx.model);
 		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
-		if (checkpoint.status !== "valid" && checkpoint.status !== "legacy") return undefined;
+		if (checkpoint.status !== "valid") return undefined;
 		return {
 			messages: event.messages.filter((message) => message.role !== "compactionSummary"),
 		};
@@ -191,7 +182,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return;
-		setFeatureHeader(event.headers, loadConfig(ctx.cwd, ctx.isProjectTrusted()).remoteCompactionV2);
+		setFeatureHeader(event.headers);
 		const turnState = turnStateBySession.get(ctx.sessionManager.getSessionId());
 		if (turnState) event.headers["x-codex-turn-state"] = turnState;
 	});

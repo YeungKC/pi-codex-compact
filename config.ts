@@ -4,15 +4,12 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 export type CodexCompactionConfig = {
-	/** Mirrors the remote_compaction_v2 feature gate. */
-	remoteCompactionV2: boolean;
 	/** Optional Codex-style auto-compaction limit. */
 	autoCompactTokenLimit?: number;
 	autoCompactScope: "total" | "bodyAfterPrefix";
 };
 
 const DEFAULT_CONFIG: CodexCompactionConfig = {
-	remoteCompactionV2: true,
 	autoCompactScope: "total",
 };
 
@@ -20,7 +17,6 @@ export function parseConfig(input: unknown): Partial<CodexCompactionConfig> {
 	if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
 	const value = input as Record<string, unknown>;
 	return {
-		...(typeof value.remoteCompactionV2 === "boolean" ? { remoteCompactionV2: value.remoteCompactionV2 } : {}),
 		...(typeof value.autoCompactTokenLimit === "number" && value.autoCompactTokenLimit > 0
 			? { autoCompactTokenLimit: value.autoCompactTokenLimit }
 			: {}),

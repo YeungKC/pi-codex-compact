@@ -36,13 +36,12 @@ Then, in an `openai-codex` session, run `/compact`. The checkpoint is stored in 
 
 ## Configuration
 
-No configuration is required. By default, the extension uses Codex remote-compaction V2 and automatically compacts retained history at 90% of the selected model's context window. The current user input is not included in this pre-request threshold check.
+No configuration is required. The extension uses Codex remote-compaction V2 and automatically compacts retained history at 90% of the selected model's context window. The current user input is not included in this pre-request threshold check.
 
 Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`. Missing or invalid fields leave the defaults in place:
 
 ```json
 {
-  "remoteCompactionV2": false,
   "autoCompactTokenLimit": 128000,
   "autoCompactScope": "total"
 }
@@ -50,7 +49,6 @@ Optional configuration belongs in `~/.pi/agent/pi-codex-compact.json`. Missing o
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `remoteCompactionV2` | `true` | Use Codex V2; set `false` only for the legacy V1 endpoint. |
 | `autoCompactTokenLimit` | 90% of the model context window | Override the automatic-compaction threshold, capped at 90% of the model context window as in Codex. |
 | `autoCompactScope` | `"total"` | Count estimated retained-history tokens; `"bodyAfterPrefix"` counts growth after the current compaction window's prefix. Until a prefix baseline exists, only the context-window hard cap triggers compaction. |
 
@@ -61,7 +59,7 @@ The extension does not probe endpoints at runtime.
 Where Pi exposes the needed lifecycle hooks, this extension follows Codex CLI's observable remote-compaction flow:
 
 - Sends active Responses history followed by `{ "type": "compaction_trigger" }`.
-- Uses V2 by default and persists the returned opaque `encrypted_content` checkpoint.
+- Uses V2 and persists the returned opaque `encrypted_content` checkpoint.
 - Replays the checkpoint with the active Pi branch tail on later requests.
 - Defers model-transition compaction until the first request after model selection.
 - Runs automatic compaction before a provider request, not after an aborted turn.
@@ -79,7 +77,7 @@ Codex CLI internally owns exact `comp_hash` capability metadata, token accountin
 The extension therefore:
 
 - uses the frozen Codex model hash snapshot; an absent hash skips only hash-transition compaction;
-- replays a verifiable version-1 V2 checkpoint directly; otherwise migrates the full branch on the first request without replaying Pi's old prose compaction summary, and uses a bounded remote suffix recovery for `context_length_exceeded`;
+- ignores unsupported older checkpoints and replays Pi's normal branch; a later V2 compaction writes a current replacement, while `context_length_exceeded` uses bounded remote suffix recovery;
 - estimates history, the current compaction-window prefix, images, and tool output for automatic compaction;
 - treats the actual pre-provider request as authoritative when a fork has changed Pi's inherited history.
 

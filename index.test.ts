@@ -7,17 +7,19 @@ type Handler = (event: any, ctx: any) => unknown;
 
 const apiKey = `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account" } })).toString("base64url")}.c`;
 
-function legacyEntry(): SessionEntry {
+function checkpointEntry(): SessionEntry {
 	return {
-		id: "legacy",
+		id: "checkpoint",
 		parentId: null,
 		timestamp: new Date().toISOString(),
-		type: "compaction",
-		details: {
+		type: "custom",
+		customType: NATIVE_COMPACTION_KIND,
+		data: {
 			kind: NATIVE_COMPACTION_KIND,
-			version: 1,
+			version: 2,
+			strategy: "v2",
 			modelKey: "openai-codex:openai-codex-responses:gpt",
-			replacementHistory: [{ type: "compaction", encrypted_content: "old" }],
+			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
 		},
 	} as unknown as SessionEntry;
 }
@@ -75,8 +77,8 @@ test("disables unsupported long cache retention for Codex", () => {
 	expect(model.compat).toMatchObject({ supportsLongCacheRetention: false });
 });
 
-test("filters Pi compaction summaries before legacy checkpoint migration", () => {
-	const { handlers, ctx } = installExtension([legacyEntry()]);
+test("filters Pi compaction summaries after a valid V2 checkpoint", () => {
+	const { handlers, ctx } = installExtension([checkpointEntry()]);
 
 	const result = handlers.get("context")?.(
 		{
@@ -105,7 +107,7 @@ test("clears turn state when navigating to another session-tree leaf", () => {
 });
 
 test("offers a UI action before blocking a failed Codex request", async () => {
-	const { handlers, ctx, select } = installExtension([legacyEntry()], true, "Cancel");
+	const { handlers, ctx, select } = installExtension([checkpointEntry()], true, "Cancel");
 
 	await handlers.get("before_provider_request")?.({ payload: {} }, ctx);
 

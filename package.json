@@ -1,7 +1,7 @@
 {
   "name": "@yeungkc/pi-codex-compact",
   "version": "0.0.6",
-  "description": "Pi extension implementing Codex CLI-compatible remote V1/V2 compaction for OpenAI Codex models.",
+  "description": "Pi extension implementing Codex CLI-compatible remote V2 compaction for OpenAI Codex models.",
   "packageManager": "pnpm@11.18.0",
   "type": "module",
   "keywords": [

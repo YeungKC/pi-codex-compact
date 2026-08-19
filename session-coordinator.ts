@@ -6,8 +6,8 @@ import {
 	FAILED_REQUEST_KIND,
 	effectiveInputForBranch,
 	findNativeCheckpoint,
-	isFailClosedCompactionError,
 	fullInputForBranch,
+	isFailClosedCompactionError,
 	piContextInputForBranch,
 	systemPromptInputForModel,
 	isOpenAICodexModel,
@@ -15,9 +15,7 @@ import {
 	modelKey,
 	markContextOverflowRecovery,
 	approximateCompactionRequestTokens,
-	approximateResponseItemTokens,
 	latestRemoteCompactionSuffix,
-	trimFunctionCallHistoryToFitContextWindow,
 	type FailedRequestDetails,
 	type JsonObject,
 	type NativeCompactionDetails,
@@ -43,7 +41,6 @@ export type SessionCoordinatorDeps = {
 	createCheckpoint: CheckpointFactory;
 	appendCheckpoint: (details: NativeCompactionDetails) => void;
 	appendFailedRequest?: (details: FailedRequestDetails) => void;
-	includeCompactionTrigger?: (ctx: ExtensionContext) => boolean;
 	shouldAutoCompact?: (params: {
 		ctx: ExtensionContext;
 		model: Model<any>;
@@ -82,12 +79,6 @@ function shouldRetryWithCurrentModel(error: unknown): boolean {
 	return /(?:\b(?:400|403|408|409|429|5\d\d)\b|invalid request|unexpected status|context window|context_length_exceeded|invalid_prompt|usage limit|server overloaded|internal server|retry limit)/i.test(message);
 }
 
-function oversizedLegacyMigrationError(model: Model<any>, estimatedTokens: number): Error {
-	return markContextOverflowRecovery(new Error(
-		`OpenAI Codex legacy compaction checkpoint cannot be migrated because the full compaction request is estimated at ${estimatedTokens} tokens, above this model's ${model.contextWindow} token context window. Start a new session or switch to a larger-context Codex model.`,
-	));
-}
-
 function contextOverflowRecoveryError(model: Model<any>): Error {
 	return markContextOverflowRecovery(new Error(
 		`OpenAI Codex context overflow recovery could not keep a complete history turn within this model's ${model.contextWindow} token context window. Shorten the current request or start a new session.`,
@@ -98,13 +89,12 @@ function compactionRequestReservedTokens(
 	ctx: Pick<ExtensionContext, "getSystemPrompt">,
 	basePayload: JsonObject | undefined,
 	tools: unknown[],
-	includeTrigger: boolean,
 ): number {
 	return approximateCompactionRequestTokens({
 		input: [],
 		instructions: typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt(),
 		tools: Array.isArray(basePayload?.tools) ? basePayload.tools : tools,
-		includeTrigger,
+		includeTrigger: true,
 	});
 }
 
@@ -287,44 +277,6 @@ function requestTail(
 	throw new Error("The Codex request changed before model-transition compaction completed.");
 }
 
-// ponytail: O(history × request) only on the legacy migration fallback; index item IDs if fork transforms make this hot.
-function unmatchedRequestItems(
-	requestInput: ResponseItem[],
-	histories: ResponseItem[][],
-	preservedItems: ResponseItem[] = [],
-): ResponseItem[] {
-	let bestMatches: number[] = [];
-	for (const history of histories) {
-		let requestIndex = 0;
-		const matches: number[] = [];
-		for (const historyItem of history) {
-			const nextIndex = requestInput.findIndex((item, index) => index >= requestIndex && isDeepStrictEqual(item, historyItem));
-			if (nextIndex < 0) continue;
-			requestIndex = nextIndex + 1;
-			matches.push(nextIndex);
-		}
-		const lastMatch = matches.at(-1) ?? -1;
-		const bestLastMatch = bestMatches.at(-1) ?? -1;
-		if (matches.length > bestMatches.length || (matches.length === bestMatches.length && lastMatch > bestLastMatch)) {
-			bestMatches = matches;
-		}
-	}
-	const matchedIndexes = new Set(bestMatches);
-	const preservedIndexes = new Set<number>();
-	for (const preservedItem of preservedItems) {
-		const preservedIndex = requestInput.findLastIndex((item, index) => !preservedIndexes.has(index) && isDeepStrictEqual(item, preservedItem));
-		if (preservedIndex >= 0) {
-			preservedIndexes.add(preservedIndex);
-			matchedIndexes.delete(preservedIndex);
-		}
-	}
-	const unmatched = requestInput.filter((_item, index) => !matchedIndexes.has(index));
-	return [
-		...unmatched,
-		...preservedItems.filter((item) => !requestInput.some((requestItem) => isDeepStrictEqual(requestItem, item))),
-	];
-}
-
 function resolveModel(ctx: ExtensionContext, key: string): Model<any> | undefined {
 	const parts = key.split(":");
 	if (parts.length < 3) return undefined;
@@ -379,7 +331,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 	const pendingBySession = new Map<string, PendingTransition>();
 	const transitionBySession = new Map<string, Promise<void>>();
 	const automaticCompactionBySession = new Map<string, Promise<void>>();
-	const legacyMigrationBySession = new Map<string, Promise<NativeCompactionDetails>>();
 	let generation = 0;
 
 	const clear = (): void => {
@@ -387,7 +338,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		pendingBySession.clear();
 		transitionBySession.clear();
 		automaticCompactionBySession.clear();
-		legacyMigrationBySession.clear();
 	};
 
 	const recordFailedRequest = (ctx: ExtensionContext, requestInput: ResponseItem[] | undefined): void => {
@@ -475,69 +425,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		throw new Error("The session changed while Codex model-transition compaction was running.");
 	};
 
-	const migrateLegacyCheckpoint = async (
-		sessionId: string,
-		ctx: ExtensionContext,
-		model: Model<any>,
-		legacy: Extract<ReturnType<typeof findNativeCheckpoint>, { status: "legacy" }>,
-		basePayload: JsonObject | undefined,
-		requestInput: ResponseItem[],
-		startGeneration: number,
-		signal?: AbortSignal,
-	): Promise<NativeCompactionDetails> => {
-		const operationSignal = signal ?? ctx.signal;
-		const branch = deps.getBranch(ctx);
-		const leafId = conversationLeafId(branch);
-		const compactionBranch = branchBeforeCurrentUser(branch, requestInput);
-		const previousModel = resolveModel(ctx, legacy.checkpoint.details.modelKey);
-		const historyModel = previousModel && isOpenAICodexModel(previousModel) ? previousModel : model;
-		const createFor = async (selectedModel: Model<any>) => {
-			const allTools = deps.getAllTools();
-			const input = fullInputForBranch({ branch: compactionBranch, model: selectedModel, tools: allTools });
-			const reservedTokens = compactionRequestReservedTokens(
-				ctx,
-				basePayload,
-				allTools,
-				deps.includeCompactionTrigger?.(ctx) ?? true,
-			);
-			const trimmedInput = trimFunctionCallHistoryToFitContextWindow(input, selectedModel.contextWindow, reservedTokens);
-			const estimatedTokens = reservedTokens + approximateResponseItemTokens(trimmedInput);
-			if (estimatedTokens > selectedModel.contextWindow) {
-				throw oversizedLegacyMigrationError(selectedModel, estimatedTokens);
-			}
-			return deps.createCheckpoint({
-				ctx,
-				model: selectedModel,
-				input,
-				basePayload,
-				signal: operationSignal,
-			});
-		};
-		let native: Awaited<ReturnType<CheckpointFactory>>;
-		try {
-			native = await createFor(historyModel);
-		} catch (firstError) {
-			if (modelKey(historyModel) === modelKey(model) || !shouldRetryWithCurrentModel(firstError)) throw firstError;
-			try {
-				native = await createFor(model);
-			} catch {
-				throw firstError;
-			}
-		}
-		ensureNotAborted(operationSignal);
-		if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
-			throw new Error("The session changed while legacy Codex compaction migration was running.");
-		}
-		const migrated = rebindCheckpoint(
-			preserveCurrentUser(native.details, branch, requestInput),
-			modelKey(model),
-			compactionHash(model),
-		);
-		deps.appendCheckpoint(migrated);
-		pendingBySession.delete(sessionId);
-		return migrated;
-	};
-
 	const recoverRequestAfterContextOverflow = async (
 		model: Model<any>,
 		ctx: ExtensionContext,
@@ -550,19 +437,14 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const branch = deps.getBranch(ctx);
 		const checkpoint = findNativeCheckpoint(branch);
 		const pending = pendingBySession.get(sessionId);
-		const checkpointModel = checkpoint.status === "legacy" || checkpoint.status === "valid"
+		const checkpointModel = checkpoint.status === "valid"
 			? resolveModel(ctx, checkpoint.checkpoint.details.modelKey)
 			: undefined;
 		const compactionModel = pending?.previousModel
 			?? (checkpointModel && isOpenAICodexModel(checkpointModel) ? checkpointModel : model);
 		const lastUserIndex = requestInput.findLastIndex((item) => item.role === "user");
 		const historyInput = lastUserIndex >= 0 ? requestInput.slice(0, lastUserIndex) : requestInput;
-		const reservedTokens = compactionRequestReservedTokens(
-			ctx,
-			basePayload,
-			deps.getAllTools(),
-			deps.includeCompactionTrigger?.(ctx) ?? true,
-		);
+		const reservedTokens = compactionRequestReservedTokens(ctx, basePayload, deps.getAllTools());
 		const input = latestRemoteCompactionSuffix(historyInput, compactionModel.contextWindow, reservedTokens);
 		if (input.length === 0) throw contextOverflowRecoveryError(compactionModel);
 		const leafId = conversationLeafId(branch);
@@ -728,13 +610,13 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			pendingBySession.delete(sessionId);
 			pending = undefined;
 		}
-		const checkpointModelKey = checkpoint.status === "valid" || checkpoint.status === "legacy"
+		const checkpointModelKey = checkpoint.status === "valid"
 			? checkpoint.checkpoint.details.modelKey
 			: undefined;
 		if (pending && pending.targetModelKey !== modelKey(model)) {
 			throw new Error("The pending Codex model transition targets a different model.");
 		}
-		if (!requestInput && (pending || checkpoint.status !== "none")) {
+		if (!requestInput && (pending || checkpoint.status === "valid")) {
 			throw new Error("The Codex request input is unavailable while replaying compaction state.");
 		}
 		const historyModel = pending?.previousModel
@@ -759,21 +641,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		const currentRawHistoryInput = fullInputForBranch({ branch: historyBranch, model, tools });
 		const currentPiContextInput = piContextInputForBranch({ branch: historyBranch, model, tools });
 		const systemPromptInput = systemPromptInputForModel(model, ctx.getSystemPrompt());
-		const runLegacyMigration = async (): Promise<NativeCompactionDetails> => {
-			if (checkpoint.status !== "legacy" || !requestInput) {
-				throw new Error("The Codex request input is unavailable while migrating legacy compaction state.");
-			}
-			const activeMigration = legacyMigrationBySession.get(sessionId);
-			if (activeMigration) return activeMigration;
-			const startGeneration = generation;
-			const migration = migrateLegacyCheckpoint(sessionId, ctx, model, checkpoint, basePayload, requestInput, startGeneration);
-			legacyMigrationBySession.set(sessionId, migration);
-			try {
-				return await migration;
-			} finally {
-				if (legacyMigrationBySession.get(sessionId) === migration) legacyMigrationBySession.delete(sessionId);
-			}
-		};
 		let tail: ResponseItem[];
 		try {
 			tail = requestTail(
@@ -782,18 +649,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				systemPromptInput,
 			);
 		} catch (error) {
-			if (checkpoint.status === "legacy") {
-				const migrated = await runLegacyMigration();
-				const preserved = migrated.preservedInput ?? [];
-				const migratedTail = unmatchedRequestItems(requestInput!, [
-					rawHistoryInput,
-					currentRawHistoryInput,
-					historyInput,
-					currentHistoryInput,
-				], preserved);
-				return [...migrated.replacementHistory, ...migratedTail];
-			}
-			if (!pending && checkpoint.status === "none") return undefined;
+			if (!pending && checkpoint.status !== "valid") return undefined;
 			const compactionInput = withoutLastUser(requestInput!);
 			const createCheckpointFor = (selectedModel: Model<any>) => deps.createCheckpoint({
 				ctx,
@@ -827,21 +683,6 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			return [...details.replacementHistory, ...(details.preservedInput ?? [])];
 		}
 
-		if (checkpoint.status === "legacy") {
-			await runLegacyMigration();
-			const migratedBranch = deps.getBranch(ctx);
-			const migratedCheckpoint = findNativeCheckpoint(migratedBranch);
-			if (migratedCheckpoint.status !== "valid") {
-				throw new Error("Legacy Codex compaction migration did not create a valid checkpoint.");
-			}
-			const migratedTail = unmatchedRequestItems(requestInput!, [
-				rawHistoryInput,
-				currentRawHistoryInput,
-				historyInput,
-				currentHistoryInput,
-			], migratedCheckpoint.checkpoint.details.preservedInput ?? []);
-			return [...migratedCheckpoint.checkpoint.details.replacementHistory, ...migratedTail];
-		}
 
 		const activeAutomaticCompaction = automaticCompactionBySession.get(sessionId);
 		if (activeAutomaticCompaction) {
@@ -928,7 +769,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			branch = deps.getBranch(ctx);
 		}
 		const currentCheckpoint = findNativeCheckpoint(branch);
-		if (currentCheckpoint.status === "none") return undefined;
+		if (currentCheckpoint.status !== "valid") return undefined;
 		const preservedUser = checkpointPreservedCurrentUser(branch, requestInput);
 		if (preservedUser) {
 			const preservedUserIndex = tail.findLastIndex((item) =>
@@ -972,8 +813,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			}
 			const instructions = typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt();
 			const tools = Array.isArray(basePayload?.tools) ? basePayload.tools : deps.getAllTools();
-			const includeTrigger = deps.includeCompactionTrigger?.(ctx) ?? true;
-			const reservedTokens = approximateCompactionRequestTokens({ input: [], instructions, tools, includeTrigger });
+			const reservedTokens = approximateCompactionRequestTokens({ input: [], instructions, tools, includeTrigger: true });
 			const input = latestRemoteCompactionSuffix(recoveryInput, model.contextWindow, reservedTokens);
 			if (input.length === 0) throw contextOverflowRecoveryError(model);
 			return input;

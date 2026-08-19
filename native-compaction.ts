@@ -11,14 +11,12 @@ import { calculateCost, type Message, type Model, type Usage } from "@earendil-w
 export const NATIVE_COMPACTION_KIND = "openai-codex-native-compaction";
 export const FAILED_REQUEST_KIND = "openai-codex-failed-request";
 export const NATIVE_COMPACTION_VERSION = 2;
-const LEGACY_NATIVE_COMPACTION_VERSION = 1;
 export const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 export const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const MAX_REMOTE_RETRIES = 2;
 const V2_COMPACTION_IDLE_TIMEOUT_MS = 300_000;
-const V1_COMPACTION_IDLE_TIMEOUT_MS = V2_COMPACTION_IDLE_TIMEOUT_MS * 4;
 export const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
 const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?(?:violation|denied|failure|failed)|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failure|failed|denied|error)|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing)/i;
@@ -96,21 +94,12 @@ export type FailedRequestDetails = {
 export interface NativeCompactionDetails {
 	kind: typeof NATIVE_COMPACTION_KIND;
 	version: typeof NATIVE_COMPACTION_VERSION;
-	strategy: "v1" | "v2";
+	strategy: "v2";
 	modelKey: string;
 	compHash?: string;
 	preservedInput?: ResponseItem[];
 	replacementHistory: ResponseItem[];
 }
-
-export type LegacyNativeCompactionDetails = {
-	kind: typeof NATIVE_COMPACTION_KIND;
-	version: typeof LEGACY_NATIVE_COMPACTION_VERSION;
-	modelKey: string;
-	compHash?: string;
-	strategy?: "v2";
-	replacementHistory?: ResponseItem[];
-};
 
 export type NativeCheckpoint = {
 	entryIndex: number;
@@ -118,26 +107,13 @@ export type NativeCheckpoint = {
 	details: NativeCompactionDetails;
 };
 
-export type LegacyNativeCheckpoint = {
-	entryIndex: number;
-	entryId: string;
-	details: LegacyNativeCompactionDetails;
-};
-
 export type CheckpointLookup =
 	| { status: "none" }
 	| { status: "invalid"; entryIndex: number; entryId: string }
-	| { status: "legacy"; checkpoint: LegacyNativeCheckpoint }
 	| { status: "valid"; checkpoint: NativeCheckpoint };
 
 export type RemoteCompactionResult = {
 	compactionItem: ResponseItem;
-	usage?: Usage;
-	turnState?: string;
-};
-
-export type LegacyCompactionResult = {
-	replacementHistory: ResponseItem[];
 	usage?: Usage;
 	turnState?: string;
 };
@@ -202,68 +178,24 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	if (value.preservedInput !== undefined) {
 		if (!Array.isArray(value.preservedInput) || preservedInput === undefined || preservedInput.length !== value.preservedInput.length) return undefined;
 	}
-	const strategy = value.strategy === undefined
-		? "v2"
-		: value.strategy === "v1" || value.strategy === "v2"
-			? value.strategy
-			: undefined;
-	if (!strategy) return undefined;
-	if (strategy === "v2") {
-		const compactionItems = replacementHistory.filter((item) => item.type === "compaction");
-		if (
-			compactionItems.length !== 1 ||
-			typeof compactionItems[0]?.encrypted_content !== "string" ||
-			replacementHistory.at(-1)?.type !== "compaction"
-		) {
-			return undefined;
-		}
+	if (value.strategy !== undefined && value.strategy !== "v2") return undefined;
+	const compactionItems = replacementHistory.filter((item) => item.type === "compaction");
+	if (
+		compactionItems.length !== 1 ||
+		typeof compactionItems[0]?.encrypted_content !== "string" ||
+		replacementHistory.at(-1)?.type !== "compaction"
+	) {
+		return undefined;
 	}
 
 	return {
 		kind: NATIVE_COMPACTION_KIND,
 		version: NATIVE_COMPACTION_VERSION,
-		strategy,
+		strategy: "v2",
 		modelKey: value.modelKey,
 		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
 		...(preservedInput ? { preservedInput: preservedInput.map((item) => structuredClone(item)) } : {}),
 		replacementHistory: replacementHistory.map((item) => structuredClone(item)),
-	};
-}
-
-const LEGACY_COMPACTION_SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
-const LEGACY_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
-
-function isLegacyCompactionSummary(item: ResponseItem): boolean {
-	if ((item.type !== "message" && item.type !== undefined) || item.role !== "user") return false;
-	const text = contentText(item.content).trimStart();
-	return text.startsWith(LEGACY_COMPACTION_SUMMARY_PREFIX) && text.trimEnd().endsWith(LEGACY_COMPACTION_SUMMARY_SUFFIX);
-}
-
-/** Recognizes v1 checkpoints and upgrades only a fully verifiable old V2 history. */
-export function parseLegacyNativeCompactionDetails(value: unknown): LegacyNativeCompactionDetails | undefined {
-	if (!isJsonObject(value)) return undefined;
-	if (value.kind !== NATIVE_COMPACTION_KIND || value.version !== LEGACY_NATIVE_COMPACTION_VERSION) return undefined;
-	if (value.strategy === "token-budget") return undefined;
-	if (typeof value.modelKey !== "string" || !Array.isArray(value.replacementHistory)) return undefined;
-	if (value.compHash !== undefined && typeof value.compHash !== "string") return undefined;
-
-	const replacementHistory = value.replacementHistory.filter(isResponseItem);
-	const canUpgradeV2 = value.strategy === "v2"
-		&& replacementHistory.length === value.replacementHistory.length
-		&& replacementHistory.filter((item) => item.type === "compaction").length === 1
-		&& replacementHistory.at(-1)?.type === "compaction"
-		&& typeof replacementHistory.at(-1)?.encrypted_content === "string";
-	return {
-		kind: NATIVE_COMPACTION_KIND,
-		version: LEGACY_NATIVE_COMPACTION_VERSION,
-		modelKey: value.modelKey,
-		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
-		...(canUpgradeV2
-			? {
-				strategy: "v2" as const,
-				replacementHistory: replacementHistory.filter((item) => !isLegacyCompactionSummary(item)).map((item) => structuredClone(item)),
-			}
-			: {}),
 	};
 }
 
@@ -285,35 +217,14 @@ export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
 		}
 
 		if (isJsonObject(rawDetails) && rawDetails.strategy === "token-budget") continue;
+		if (isJsonObject(rawDetails) && (rawDetails.version === 1 || rawDetails.strategy === "v1")) {
+			return { status: "none" };
+		}
 		const details = parseNativeCompactionDetails(rawDetails);
 		if (details) {
 			return {
 				status: "valid",
 				checkpoint: { entryIndex: index, entryId: entry.id, details },
-			};
-		}
-		const legacyDetails = parseLegacyNativeCompactionDetails(rawDetails);
-		if (legacyDetails) {
-			if (legacyDetails.strategy === "v2" && legacyDetails.replacementHistory) {
-				return {
-					status: "valid",
-					checkpoint: {
-						entryIndex: index,
-						entryId: entry.id,
-						details: {
-							kind: NATIVE_COMPACTION_KIND,
-							version: NATIVE_COMPACTION_VERSION,
-							strategy: "v2",
-							modelKey: legacyDetails.modelKey,
-							...(legacyDetails.compHash ? { compHash: legacyDetails.compHash } : {}),
-							replacementHistory: legacyDetails.replacementHistory,
-						},
-					},
-				};
-			}
-			return {
-				status: "legacy",
-				checkpoint: { entryIndex: index, entryId: entry.id, details: legacyDetails },
 			};
 		}
 		return { status: "invalid", entryIndex: index, entryId: entry.id };
@@ -348,9 +259,7 @@ export function estimateCompactionWindowPrefillTokens(params: {
 	stablePrefixTokens: number;
 }): number | undefined {
 	const checkpoint = findNativeCheckpoint(params.branch);
-	const checkpointIndex = checkpoint.status === "valid" || checkpoint.status === "legacy"
-		? checkpoint.checkpoint.entryIndex
-		: -1;
+	const checkpointIndex = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : -1;
 	const observed = params.branch.slice(checkpointIndex + 1).map(assistantInputTokens).find((value) => value !== undefined);
 	if (observed !== undefined) return observed;
 	if (checkpoint.status !== "valid") return undefined;
@@ -588,7 +497,6 @@ export function piContextInputForBranch(params: {
 	tools: ToolInfo[];
 }): ResponseItem[] {
 	const checkpoint = findNativeCheckpoint(params.branch);
-	if (checkpoint.status === "legacy") return fullInputForBranch(params);
 	const remoteCheckpoint = checkpoint.status === "valid";
 	const boundaryEnd = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : params.branch.length;
 	let firstKeptEntryId: string | undefined;
@@ -639,9 +547,6 @@ export function effectiveInputForBranch(params: {
 	}
 
 	const checkpoint = findNativeCheckpoint(branch);
-	if (checkpoint.status === "legacy") {
-		return fullInputForBranch({ branch, model: params.model, tools: params.tools });
-	}
 	if (checkpoint.status === "valid") {
 		if (
 			!params.allowCheckpointModelMismatch
@@ -994,16 +899,6 @@ export function retainRecentMessages(items: ResponseItem[], maxTokens = RETAINED
 	return retained.reverse();
 }
 
-export function filterLegacyCompactionHistory(items: ResponseItem[]): ResponseItem[] {
-	return items.filter((item) => {
-		if (item.type === "message" || item.type === undefined) {
-			if (item.role === "assistant") return true;
-			return item.role === "user" && isRetainedUserMessage(item);
-		}
-		return item.type === "compaction" || item.type === "context_compaction" || item.type === "agent_message";
-	});
-}
-
 export function buildReplacementHistory(
 	preCompactionInput: ResponseItem[],
 	compactionItem: ResponseItem,
@@ -1080,20 +975,11 @@ export function mergeFeatureHeader(existing: string | null | undefined): string 
 	return [...new Set([...features, REMOTE_COMPACTION_FEATURE])].join(",");
 }
 
-export function removeFeatureHeader(existing: string | null | undefined): string {
-	return (existing ?? "")
-		.split(",")
-		.map((value) => value.trim())
-		.filter((value) => value && value.toLowerCase() !== REMOTE_COMPACTION_FEATURE)
-		.join(",");
-}
-
 export function buildCodexHeaders(params: {
 	apiKey: string;
 	headers?: Record<string, string | null>;
 	sessionId: string;
 	turnState?: string;
-	includeRemoteCompactionV2?: boolean;
 }): Headers {
 	const headers = new Headers();
 	for (const [name, value] of Object.entries(params.headers ?? {})) {
@@ -1105,15 +991,12 @@ export function buildCodexHeaders(params: {
 	headers.set("originator", "pi");
 	headers.set("user-agent", "pi-codex-compact");
 	headers.set("OpenAI-Beta", "responses=experimental");
-	headers.set("accept", params.includeRemoteCompactionV2 === false ? "application/json" : "text/event-stream");
+	headers.set("accept", "text/event-stream");
 	headers.set("content-type", "application/json");
 	headers.set("session-id", params.sessionId);
 	headers.set("x-client-request-id", params.sessionId);
 	if (params.turnState) headers.set("x-codex-turn-state", params.turnState);
-	const featureHeader = headers.get("x-codex-beta-features");
-	const features = params.includeRemoteCompactionV2 === false
-		? removeFeatureHeader(featureHeader)
-		: mergeFeatureHeader(featureHeader);
+	const features = mergeFeatureHeader(headers.get("x-codex-beta-features"));
 	if (features) headers.set("x-codex-beta-features", features);
 	else headers.delete("x-codex-beta-features");
 	return headers;
@@ -1584,72 +1467,6 @@ export function callRemoteCompaction(params: {
 			const parsed = await parseSseResponse(response, params.signal, idleTimeoutMs);
 			return {
 				compactionItem: parsed.item,
-				usage: usageFromResponse(params.model, parsed.usage),
-				...(response.headers.get("x-codex-turn-state") ? { turnState: response.headers.get("x-codex-turn-state")! } : {}),
-			};
-		},
-	});
-}
-
-export function buildLegacyCompactionRequestBody(params: {
-	basePayload?: JsonObject;
-	model: Model<any>;
-	input: ResponseItem[];
-	instructions: string;
-	tools?: unknown[];
-	sessionId: string;
-}): JsonObject {
-	const base = params.basePayload ? structuredClone(params.basePayload) : {};
-	const requestTools = Array.isArray(base.tools) ? base.tools : params.tools;
-	const instructions = typeof base.instructions === "string" ? base.instructions : params.instructions;
-	const body: JsonObject = {
-		model: params.model.id,
-		input: params.input.map((item) => structuredClone(item)),
-		instructions,
-		parallel_tool_calls: true,
-		prompt_cache_key: params.sessionId,
-	};
-	if (requestTools) body.tools = requestTools;
-	if (isJsonObject(base.reasoning)) body.reasoning = structuredClone(base.reasoning);
-	if (typeof base.service_tier === "string") body.service_tier = base.service_tier;
-	if (isJsonObject(base.text) && typeof base.text.verbosity === "string") {
-		body.text = { verbosity: base.text.verbosity };
-	}
-	return body;
-}
-
-export function resolveCodexCompactUrl(baseUrl?: string): string {
-	return `${resolveCodexResponsesUrl(baseUrl)}/compact`;
-}
-
-export function callLegacyRemoteCompaction(params: {
-	url: string;
-	headers: Headers;
-	body: JsonObject;
-	model: Model<any>;
-	signal?: AbortSignal;
-	fetchImpl?: typeof fetch;
-}): Promise<LegacyCompactionResult> {
-	return runRemoteCompaction({
-		...params,
-		prefix: "OpenAI Codex legacy compaction failed",
-		idleTimeoutMs: V1_COMPACTION_IDLE_TIMEOUT_MS,
-		parse: async (response, idleTimeoutMs) => {
-			let parsed: unknown;
-			try {
-				parsed = await withCompactionTimeout(response.json(), idleTimeoutMs);
-			} catch (error) {
-				if (shouldRetryCompaction(error)) throw error;
-				throw markCompactionRetry(new Error("OpenAI Codex legacy compaction returned invalid JSON."), "none");
-			}
-			if (!isJsonObject(parsed)) {
-				throw markCompactionRetry(new Error("OpenAI Codex legacy compaction returned invalid JSON."), "none");
-			}
-			if (!Array.isArray(parsed.output) || parsed.output.some((item) => !isResponseItem(item))) {
-				throw markCompactionRetry(new Error("OpenAI Codex legacy compaction returned invalid output."), "none");
-			}
-			return {
-				replacementHistory: parsed.output.map((item) => structuredClone(item)),
 				usage: usageFromResponse(params.model, parsed.usage),
 				...(response.headers.get("x-codex-turn-state") ? { turnState: response.headers.get("x-codex-turn-state")! } : {}),
 			};

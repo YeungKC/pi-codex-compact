@@ -1,16 +1,12 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
-import type { CodexCompactionConfig } from "./config.ts";
 import { compactionHash } from "./capabilities.ts";
 import {
 	buildCodexHeaders,
 	buildCompactionRequestBody,
-	buildLegacyCompactionRequestBody,
 	buildReplacementHistory,
 	buildToolPayload,
-	callLegacyRemoteCompaction,
 	callRemoteCompaction,
-	filterLegacyCompactionHistory,
 	modelKey,
 	approximateCompactionRequestTokens,
 	approximateTokenCount,
@@ -18,7 +14,6 @@ import {
 	markFallbackEligibility,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
-	resolveCodexCompactUrl,
 	resolveCodexResponsesUrl,
 	trimFunctionCallHistoryToFitContextWindow,
 	type JsonObject,
@@ -34,7 +29,6 @@ export type NativeCheckpointRequest = {
 	turnState?: string;
 	onTurnState?: (turnState: string) => void;
 	signal?: AbortSignal;
-	config: CodexCompactionConfig;
 	allTools: Parameters<typeof buildToolPayload>[0];
 	activeToolNames: string[];
 };
@@ -66,10 +60,7 @@ function compactionBasePayload(params: NativeCheckpointRequest): JsonObject {
 	return base;
 }
 
-/**
- * Owns the remote protocol seam. The lifecycle adapter supplies session facts;
- * V1 and V2 remain internal adapters and both return the same checkpoint shape.
- */
+/** Owns the V2 remote protocol seam. The lifecycle adapter supplies session facts. */
 export async function createNativeCheckpoint(params: NativeCheckpointRequest): Promise<NativeCheckpointResult> {
 	const auth = await params.ctx.modelRegistry.getApiKeyAndHeaders(params.model);
 	if (!auth.ok || !auth.apiKey) {
@@ -91,7 +82,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 	const reservedTokens = approximateTokenCount({
 		instructions,
 		tools,
-		...(params.config.remoteCompactionV2 ? { input: [{ type: "compaction_trigger" }] } : {}),
+		input: [{ type: "compaction_trigger" }],
 	});
 	const input = trimFunctionCallHistoryToFitContextWindow(
 		params.input,
@@ -102,7 +93,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		input,
 		instructions,
 		tools,
-		includeTrigger: params.config.remoteCompactionV2,
+		includeTrigger: true,
 	}) > params.model.contextWindow) {
 		throw markContextOverflowRecovery(new Error(
 			`OpenAI Codex compaction input exceeds this model's ${params.model.contextWindow} token context window after tool-output trimming.`,
@@ -113,38 +104,7 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		headers: auth.headers,
 		sessionId,
 		turnState: params.turnState,
-		includeRemoteCompactionV2: params.config.remoteCompactionV2,
 	});
-
-	if (!params.config.remoteCompactionV2) {
-		const remote = await callLegacyRemoteCompaction({
-			url: resolveCodexCompactUrl(baseUrl),
-			headers,
-			body: buildLegacyCompactionRequestBody({
-				basePayload,
-				model: params.model,
-				input,
-				instructions,
-				tools,
-				sessionId,
-			}),
-			model: params.model,
-			signal: params.signal,
-		});
-		if (remote.turnState) params.onTurnState?.(remote.turnState);
-		return {
-			details: {
-				kind: NATIVE_COMPACTION_KIND,
-				version: NATIVE_COMPACTION_VERSION,
-				strategy: "v1",
-				modelKey: modelKey(params.model),
-				...(compactionHash(params.model) ? { compHash: compactionHash(params.model) } : {}),
-				replacementHistory: filterLegacyCompactionHistory(remote.replacementHistory),
-			},
-			usage: remote.usage,
-		};
-	}
-
 	const body = buildCompactionRequestBody({
 		basePayload,
 		model: params.model,
