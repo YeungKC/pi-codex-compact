@@ -9,7 +9,6 @@ import {
 	callRemoteCompaction,
 	modelKey,
 	approximateCompactionRequestTokens,
-	approximateTokenCount,
 	markContextOverflowRecovery,
 	markFallbackEligibility,
 	NATIVE_COMPACTION_KIND,
@@ -79,10 +78,11 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		? basePayload.instructions
 		: params.ctx.getSystemPrompt();
 	// Leave room for the stable request prefix and the V2 trigger item.
-	const reservedTokens = approximateTokenCount({
+	const reservedTokens = approximateCompactionRequestTokens({
+		input: [],
 		instructions,
 		tools,
-		input: [{ type: "compaction_trigger" }],
+		includeTrigger: true,
 	});
 	const input = trimFunctionCallHistoryToFitContextWindow(
 		params.input,

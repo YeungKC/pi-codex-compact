@@ -85,11 +85,6 @@ function notifyBlocked(
 	ctx.ui.notify(`OpenAI Codex request blocked: ${message}.${nextStep}`, "error");
 }
 
-function setFeatureHeader(headers: Record<string, string | null>): void {
-	const existing = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-codex-beta-features");
-	headers[existing?.[0] ?? "x-codex-beta-features"] = mergeFeatureHeader(existing?.[1]);
-}
-
 export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	const basePayloadBySession = new Map<string, JsonObject>();
 	const turnStateBySession = new Map<string, string>();
@@ -170,7 +165,9 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return;
-		setFeatureHeader(event.headers);
+		const existingFeatureHeader = Object.entries(event.headers)
+			.find(([name]) => name.toLowerCase() === "x-codex-beta-features");
+		event.headers[existingFeatureHeader?.[0] ?? "x-codex-beta-features"] = mergeFeatureHeader(existingFeatureHeader?.[1]);
 		const turnState = turnStateBySession.get(ctx.sessionManager.getSessionId());
 		if (turnState) event.headers["x-codex-turn-state"] = turnState;
 	});

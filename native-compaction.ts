@@ -483,14 +483,6 @@ export function fullInputForBranch(params: {
 	return entriesToResponseItems(params.model, params.branch, params.tools);
 }
 
-/** Reconstructs the context Pi sends after a real CompactionEntry. */
-export function systemPromptInputForModel(model: Model<any>, systemPrompt: string): ResponseItem[] {
-	if (!systemPrompt) return [];
-	const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
-	const role = model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
-	return [{ role, content: systemPrompt }];
-}
-
 export function piContextInputForBranch(params: {
 	branch: SessionEntry[];
 	model: Model<any>;
@@ -1175,34 +1167,20 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	}
 }
 
-async function withCompactionTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+async function withCompactionTimeout<T>(
+	operation: Promise<T> | (() => Promise<T>),
+	timeoutMs: number,
+	message: string,
+): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const timeout = new Promise<never>((_, reject) => {
 		timer = setTimeout(() => reject(markFallbackEligibility(
-			markCompactionRetry(new Error("OpenAI Codex compaction request timed out."), "explicit"),
+			markCompactionRetry(new Error(message), "explicit"),
 			false,
 		)), timeoutMs);
 	});
 	try {
-		return await Promise.race([operation, timeout]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
-}
-
-async function readSseChunk(
-	reader: ReadableStreamDefaultReader<Uint8Array>,
-	idleTimeoutMs: number,
-): Promise<ReadableStreamReadResult<Uint8Array>> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(markFallbackEligibility(
-			markCompactionRetry(new Error("OpenAI Codex compaction stream idle timeout."), "explicit"),
-			false,
-		)), idleTimeoutMs);
-	});
-	try {
-		return await Promise.race([reader.read(), timeout]);
+		return await Promise.race([typeof operation === "function" ? operation() : operation, timeout]);
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
 	}
@@ -1333,7 +1311,11 @@ async function parseSseResponse(
 
 	try {
 		while (!stopReading) {
-			const { done, value } = await readSseChunk(reader, idleTimeoutMs);
+			const { done, value } = await withCompactionTimeout(
+				() => reader.read(),
+				idleTimeoutMs,
+				"OpenAI Codex compaction stream idle timeout.",
+			);
 			buffer += decoder.decode(value, { stream: !done });
 			buffer = buffer.replace(/\r\n/g, "\n");
 			let boundary = buffer.indexOf("\n\n");
@@ -1412,12 +1394,16 @@ async function runRemoteCompaction<T>(params: {
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
 		try {
-			const response = await withCompactionTimeout(fetchImpl(params.url, {
-				method: "POST",
-				headers: params.headers,
-				body: JSON.stringify(params.body),
-				signal: params.signal,
-			}), params.idleTimeoutMs);
+			const response = await withCompactionTimeout(
+				fetchImpl(params.url, {
+					method: "POST",
+					headers: params.headers,
+					body: JSON.stringify(params.body),
+					signal: params.signal,
+				}),
+				params.idleTimeoutMs,
+				"OpenAI Codex compaction request timed out.",
+			);
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
 				const classified = classifyHttpCompactionError(

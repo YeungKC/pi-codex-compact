@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 vi.mock("node:timers/promises", () => ({
 	setTimeout: (ms: number, value?: unknown, options?: { signal?: AbortSignal }) => new Promise((resolve, reject) => {
@@ -18,6 +18,8 @@ vi.mock("node:timers/promises", () => ({
 
 import { createNativeCheckpoint } from "./remote-compaction.ts";
 import { approximateResponseItemTokens, isContextWindowCompactionError, isRetryableCompactionError, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+
+afterEach(() => vi.useRealTimers());
 
 type RemoteRequest = Parameters<typeof callRemoteCompaction>[0];
 const remoteModel = { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never;
@@ -173,41 +175,33 @@ describe("Codex compaction history", () => {
 	test("retries transient response.failed errors and preserves details", async () => {
 		vi.useFakeTimers();
 		let calls = 0;
-		try {
-			const promise = callRemoteCompaction(remoteRequest({
-				fetchImpl: async () => {
-					calls++;
-					return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"internal_server_error\",\"message\":\"busy\"}}}\n\ndata: [DONE]\n\n");
-				},
-			}));
-			const failure = expect(promise).rejects.toMatchObject({ message: expect.stringContaining("busy"), retryWithCurrentModel: false });
-			await vi.runAllTimersAsync();
-			await failure;
-			expect(calls).toBe(3);
-		} finally {
-			vi.useRealTimers();
-		}
+		const promise = callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"internal_server_error\",\"message\":\"busy\"}}}\n\ndata: [DONE]\n\n");
+			},
+		}));
+		const failure = expect(promise).rejects.toMatchObject({ message: expect.stringContaining("busy"), retryWithCurrentModel: false });
+		await vi.runAllTimersAsync();
+		await failure;
+		expect(calls).toBe(3);
 	});
 
 	test("uses the SSE retry-after hint", async () => {
 		vi.useFakeTimers();
 		let calls = 0;
-		try {
-			const promise = callRemoteCompaction(remoteRequest({
-				fetchImpl: async () => {
-					calls++;
-					return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 5s\"}}}\n\ndata: [DONE]\n\n");
-				},
-			}));
-			const failure = promise.catch(error => error);
-			await vi.advanceTimersByTimeAsync(4_999);
-			expect(calls).toBe(1);
-			await vi.runAllTimersAsync();
-			expect(await failure).toMatchObject({ retryWithCurrentModel: false });
-			expect(calls).toBe(3);
-		} finally {
-			vi.useRealTimers();
-		}
+		const promise = callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 5s\"}}}\n\ndata: [DONE]\n\n");
+			},
+		}));
+		const failure = promise.catch(error => error);
+		await vi.advanceTimersByTimeAsync(4_999);
+		expect(calls).toBe(1);
+		await vi.runAllTimersAsync();
+		expect(await failure).toMatchObject({ retryWithCurrentModel: false });
+		expect(calls).toBe(3);
 	});
 
 	test.each([
@@ -217,57 +211,45 @@ describe("Codex compaction history", () => {
 	] as const)("handles incomplete reason %s", async (reason, expectedFallback, expectedCalls, expectedExplicitRetry) => {
 		vi.useFakeTimers();
 		let calls = 0;
-		try {
-			const promise = callRemoteCompaction(remoteRequest({
-				fetchImpl: async () => {
-					calls++;
-					return sse(`data: ${JSON.stringify({ type: "response.incomplete", response: { incomplete_details: { reason } } })}\n\n`);
-				},
-			}));
-			const failure = promise.catch(error => error);
-			await vi.runAllTimersAsync();
-			const error = await failure;
-			expect(error).toMatchObject({ retryWithCurrentModel: expectedFallback });
-			expect(isRetryableCompactionError(error)).toBe(expectedExplicitRetry);
-			expect(calls).toBe(expectedCalls);
-		} finally {
-			vi.useRealTimers();
-		}
+		const promise = callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return sse(`data: ${JSON.stringify({ type: "response.incomplete", response: { incomplete_details: { reason } } })}\n\n`);
+			},
+		}));
+		const failure = promise.catch(error => error);
+		await vi.runAllTimersAsync();
+		const error = await failure;
+		expect(error).toMatchObject({ retryWithCurrentModel: expectedFallback });
+		expect(isRetryableCompactionError(error)).toBe(expectedExplicitRetry);
+		expect(calls).toBe(expectedCalls);
 	});
 
 	test("does not treat a protocol incomplete response as context overflow", async () => {
 		vi.useFakeTimers();
 		let calls = 0;
-		try {
-			const failure = callRemoteCompaction(remoteRequest({
-				fetchImpl: async () => {
-					calls++;
-					return sse('data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"new_protocol_reason","message":"context_length_exceeded"}}}\n\n');
-				},
-			})).catch((error) => error);
-			await vi.runAllTimersAsync();
-			const error = await failure;
-			expect(calls).toBe(3);
-			expect(isContextWindowCompactionError(error)).toBe(false);
-			expect(isRetryableCompactionError(error)).toBe(false);
-		} finally {
-			vi.useRealTimers();
-		}
+		const failure = callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return sse('data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"new_protocol_reason","message":"context_length_exceeded"}}}\n\n');
+			},
+		})).catch((error) => error);
+		await vi.runAllTimersAsync();
+		const error = await failure;
+		expect(calls).toBe(3);
+		expect(isContextWindowCompactionError(error)).toBe(false);
+		expect(isRetryableCompactionError(error)).toBe(false);
 	});
 
 	test("marks an incomplete context overflow for automatic retry only", async () => {
 		vi.useFakeTimers();
-		try {
-			const failure = callRemoteCompaction(remoteRequest({
-				fetchImpl: async () => sse('data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"context_length_exceeded"}}}\n\n'),
-			})).catch((error) => error);
-			await vi.runAllTimersAsync();
-			const error = await failure;
-			expect(isContextWindowCompactionError(error)).toBe(true);
-			expect(isRetryableCompactionError(error)).toBe(false);
-		} finally {
-			vi.useRealTimers();
-		}
+		const failure = callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => sse('data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"context_length_exceeded"}}}\n\n'),
+		})).catch((error) => error);
+		await vi.runAllTimersAsync();
+		const error = await failure;
+		expect(isContextWindowCompactionError(error)).toBe(true);
+		expect(isRetryableCompactionError(error)).toBe(false);
 	});
 
 	test("does not switch models for usage-limit SSE errors", async () => {
@@ -289,28 +271,24 @@ describe("Codex compaction history", () => {
 
 	test("maps HTTP usage errors and transient overloads separately", async () => {
 		vi.useFakeTimers();
-		try {
-			for (const [status, body, expectedCalls] of [
-				[429, { error: { type: "usage_limit_reached", message: "try another model" } }, 1],
-				[429, { error: { code: "rate_limit_reached", message: "slow down" } }, 3],
-				[503, { error: { code: "server_is_overloaded", message: "busy" } }, 3],
-			] as const) {
-				let calls = 0;
-				let failure: unknown;
-				const promise = callRemoteCompaction(remoteRequest({
-					fetchImpl: async () => {
-						calls++;
-						return new Response(JSON.stringify(body), { status });
-					},
-				}));
-				const settled = promise.then(() => undefined, (error) => { failure = error; });
-				await vi.runAllTimersAsync();
-				await settled;
-				expect(calls).toBe(expectedCalls);
-				expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
-			}
-		} finally {
-			vi.useRealTimers();
+		for (const [status, body, expectedCalls] of [
+			[429, { error: { type: "usage_limit_reached", message: "try another model" } }, 1],
+			[429, { error: { code: "rate_limit_reached", message: "slow down" } }, 3],
+			[503, { error: { code: "server_is_overloaded", message: "busy" } }, 3],
+		] as const) {
+			let calls = 0;
+			let failure: unknown;
+			const promise = callRemoteCompaction(remoteRequest({
+				fetchImpl: async () => {
+					calls++;
+					return new Response(JSON.stringify(body), { status });
+				},
+			}));
+			const settled = promise.then(() => undefined, (error) => { failure = error; });
+			await vi.runAllTimersAsync();
+			await settled;
+			expect(calls).toBe(expectedCalls);
+			expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
 		}
 	});
 
@@ -383,21 +361,17 @@ describe("Codex compaction history", () => {
 		},
 	])("handles $name", async ({ response, expectedFallback, expectedCalls }) => {
 		vi.useFakeTimers();
-		try {
-			let calls = 0;
-			const promise = callRemoteCompaction(remoteRequest({
-				fetchImpl: async () => {
-					calls++;
-					return response();
-				},
-			}));
-			const failure = promise.catch(error => error);
-			await vi.runAllTimersAsync();
-			expect(await failure).toMatchObject({ retryWithCurrentModel: expectedFallback });
-			expect(calls).toBe(expectedCalls);
-		} finally {
-			vi.useRealTimers();
-		}
+		let calls = 0;
+		const promise = callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return response();
+			},
+		}));
+		const failure = promise.catch(error => error);
+		await vi.runAllTimersAsync();
+		expect(await failure).toMatchObject({ retryWithCurrentModel: expectedFallback });
+		expect(calls).toBe(expectedCalls);
 	});
 
 	test("preserves nested SSE error details", async () => {

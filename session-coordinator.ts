@@ -9,7 +9,6 @@ import {
 	fullInputForBranch,
 	isFailClosedCompactionError,
 	piContextInputForBranch,
-	systemPromptInputForModel,
 	isOpenAICodexModel,
 	isJsonObject,
 	modelKey,
@@ -639,7 +638,14 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		});
 		const currentRawHistoryInput = fullInputForBranch({ branch: historyBranch, model, tools });
 		const currentPiContextInput = piContextInputForBranch({ branch: historyBranch, model, tools });
-		const systemPromptInput = systemPromptInputForModel(model, ctx.getSystemPrompt());
+		const systemPrompt = ctx.getSystemPrompt();
+		const supportsDeveloperRole = (model.compat as { supportsDeveloperRole?: boolean } | undefined)?.supportsDeveloperRole;
+		const systemPromptInput: ResponseItem[] = systemPrompt
+			? [{
+				role: model.reasoning && supportsDeveloperRole !== false ? "developer" : "system",
+				content: systemPrompt,
+			}]
+			: [];
 		let tail: ResponseItem[];
 		try {
 			tail = requestTail(
@@ -810,9 +816,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				const lastAssistantIndex = recoveryInput.findLastIndex((item) => item.role === "assistant");
 				if (lastAssistantIndex >= 0) recoveryInput = recoveryInput.filter((_item, index) => index !== lastAssistantIndex);
 			}
-			const instructions = typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt();
-			const tools = Array.isArray(basePayload?.tools) ? basePayload.tools : deps.getAllTools();
-			const reservedTokens = approximateCompactionRequestTokens({ input: [], instructions, tools, includeTrigger: true });
+			const reservedTokens = compactionRequestReservedTokens(ctx, basePayload, deps.getAllTools());
 			const input = latestRemoteCompactionSuffix(recoveryInput, model.contextWindow, reservedTokens);
 			if (input.length === 0) throw contextOverflowRecoveryError(model);
 			return input;
