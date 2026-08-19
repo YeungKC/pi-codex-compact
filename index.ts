@@ -14,6 +14,7 @@ import {
 	removeFeatureHeader,
 	approximateResponseItemTokens,
 	isContextWindowCompactionError,
+	isRetryableCompactionError,
 	approximateTokenCount,
 	buildToolPayload,
 	stripInputFromPayload,
@@ -48,13 +49,16 @@ async function chooseBlockedAction(
 ): Promise<BlockedAction> {
 	const message = errorMessage(error);
 	const canUseSuffix = allowSuffix && isContextWindowCompactionError(error);
+	const canRetry = isRetryableCompactionError(error) && !canUseSuffix;
 	if (!ctx.hasUI) {
 		console.warn(`OpenAI Codex request blocked: ${message}`);
 		return canUseSuffix ? "suffix" : "cancel";
 	}
 	const options = canUseSuffix
-		? ["Continue with less history", "Retry", "Start a new session", "Cancel"]
-		: ["Retry", "Start a new session", "Cancel"];
+		? ["Continue with less history", "Start a new session", "Cancel"]
+		: canRetry
+			? ["Retry", "Start a new session", "Cancel"]
+			: ["Start a new session", "Cancel"];
 	let choice: string | undefined;
 	try {
 		choice = await ctx.ui.select("OpenAI Codex request blocked", options, { signal: signal ?? ctx.signal });

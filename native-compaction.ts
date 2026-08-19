@@ -1160,6 +1160,26 @@ export function markContextOverflowRecovery(error: Error): Error & { contextOver
 class NonRetryableCompactionError extends Error {}
 class RetryableCompactionStreamError extends Error {}
 
+export function isRetryableCompactionError(error: unknown): boolean {
+	if (typeof error === "object" && error !== null && "retryableCompaction" in error) {
+		return (error as { retryableCompaction?: unknown }).retryableCompaction === true;
+	}
+	return error instanceof RetryableCompactionStreamError;
+}
+
+function markExplicitRetry(error: Error, allowed: boolean): Error {
+	Object.defineProperty(error, "retryableCompaction", { value: allowed, enumerable: false, configurable: true });
+	return error;
+}
+
+function markRetryableCompactionError(error: Error): Error {
+	return markExplicitRetry(error, true);
+}
+
+function hasExplicitRetryDecision(error: unknown): error is Error {
+	return error instanceof Error && "retryableCompaction" in error;
+}
+
 function normalizedErrorCode(code: string): string {
 	return code.trim().toLowerCase();
 }
@@ -1247,7 +1267,7 @@ function classifyHttpCompactionError(
 		|| USAGE_LIMIT_MESSAGE_PATTERN.test(body);
 	const retryable = isRetryableStatus(status) && !terminal;
 	const error = retryable
-		? new Error(`${prefix} (${status}): ${body || "HTTP error"}`)
+		? markRetryableCompactionError(new Error(`${prefix} (${status}): ${body || "HTTP error"}`))
 		: new NonRetryableCompactionError(`${prefix} (${status}): ${body || "HTTP error"}`);
 	if (code) Object.defineProperty(error, "compactionCode", { value: code, enumerable: false, configurable: true });
 	return { error: markFallbackEligibility(error, fallback), retryable };
@@ -1396,7 +1416,13 @@ async function parseSseResponse(
 			const message = typeof details.message === "string" && details.message.trim()
 				? details.message
 				: `OpenAI Codex compaction ended with response.incomplete (${reason}).`;
-			throw markFallbackEligibility(withRetryDelay(new RetryableCompactionStreamError(message), message), false);
+			const explicitRetry = !isFailClosedCompactionError(`${reason} ${message}`)
+				&& !/invalid[_ -]?(?:prompt|request)|malformed|protocol/i.test(`${reason} ${message}`);
+			const error = markExplicitRetry(
+				withRetryDelay(new RetryableCompactionStreamError(message), message),
+				explicitRetry,
+			);
+			throw markFallbackEligibility(error, false);
 		}
 		if (event.type !== "response.output_item.done" && (typeof event.code === "string" || typeof event.message === "string" || isJsonObject(event.error))) {
 			const nested = isJsonObject(event.error) ? event.error : {};
@@ -1524,8 +1550,12 @@ async function runRemoteCompaction<T>(params: {
 				throw markFallbackEligibility(error instanceof Error ? error : new Error(String(error)), false);
 			}
 			if (error instanceof NonRetryableCompactionError) throw error;
-			lastError = error;
-			if (attempt === MAX_REMOTE_RETRIES) throw error;
+			lastError = hasExplicitRetryDecision(error)
+				? error
+				: error instanceof Error
+					? markRetryableCompactionError(error)
+					: markRetryableCompactionError(new Error(String(error)));
+			if (attempt === MAX_REMOTE_RETRIES) throw lastError;
 			const retryAfterMs = isJsonObject(error) && typeof error.retryAfterMs === "number" ? error.retryAfterMs : undefined;
 			await delay(retryAfterMs ?? 1000 * 2 ** attempt, params.signal);
 		}

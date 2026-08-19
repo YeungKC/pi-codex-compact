@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, isContextWindowCompactionError, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, isContextWindowCompactionError, isRetryableCompactionError, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildLegacyCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, filterLegacyCompactionHistory, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseLegacyNativeCompactionDetails, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 type RemoteRequest = Parameters<typeof callRemoteCompaction>[0];
 const remoteModel = { id: "gpt", provider: "openai-codex", api: "openai-codex-responses" } as never;
@@ -197,10 +197,10 @@ describe("Codex compaction history", () => {
 	});
 
 	test.each([
-		["content_filter", false, 3],
-		["new_protocol_reason", false, 3],
-		["server_error", false, 3],
-	] as const)("handles incomplete reason %s", async (reason, expectedFallback, expectedCalls) => {
+		["content_filter", false, 3, false],
+		["new_protocol_reason", false, 3, false],
+		["server_error", false, 3, true],
+	] as const)("handles incomplete reason %s", async (reason, expectedFallback, expectedCalls, expectedExplicitRetry) => {
 		vi.useFakeTimers();
 		let calls = 0;
 		try {
@@ -212,7 +212,9 @@ describe("Codex compaction history", () => {
 			}));
 			const failure = promise.catch(error => error);
 			await vi.runAllTimersAsync();
-			expect(await failure).toMatchObject({ retryWithCurrentModel: expectedFallback });
+			const error = await failure;
+			expect(error).toMatchObject({ retryWithCurrentModel: expectedFallback });
+			expect(isRetryableCompactionError(error)).toBe(expectedExplicitRetry);
 			expect(calls).toBe(expectedCalls);
 		} finally {
 			vi.useRealTimers();
@@ -767,7 +769,18 @@ describe("Codex compaction history", () => {
 				fetchImpl: async () => new Response(body, { status: 400 }),
 			})));
 			expect(failure).toMatchObject({ retryWithCurrentModel: false });
+			expect(isRetryableCompactionError(failure)).toBe(false);
 		}
+	});
+
+	test("marks exhausted transient errors as retryable for an explicit retry", async () => {
+		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => new Response("temporary", {
+				status: 503,
+				headers: { "retry-after-ms": "0" },
+			}),
+		})));
+		expect(isRetryableCompactionError(failure)).toBe(true);
 	});
 
 	test("filters V1 tool history before replay", () => {

@@ -125,7 +125,7 @@ test("offers a UI action before blocking a failed Codex request", async () => {
 
 	expect(select).toHaveBeenCalledWith(
 		"OpenAI Codex request blocked",
-		["Retry", "Start a new session", "Cancel"],
+		["Start a new session", "Cancel"],
 		{ signal: ctx.signal },
 	);
 	expect(ctx.abort).toHaveBeenCalled();
