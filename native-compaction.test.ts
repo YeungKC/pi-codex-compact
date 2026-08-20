@@ -17,7 +17,7 @@ vi.mock("node:timers/promises", () => ({
 }));
 
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, isContextWindowCompactionError, isRetryableCompactionError, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildReplacementHistory, callRemoteCompaction, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, isContextWindowCompactionError, compactionFailureClassification, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildReplacementHistory, buildToolPayload, callRemoteCompaction, effectiveInputForBranch, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 afterEach(() => vi.useRealTimers());
 
@@ -136,6 +136,73 @@ describe("Codex compaction history", () => {
 		}
 	});
 
+	test("omits input-declared deferred tools from generated compaction tools", async () => {
+		let requestBody: Record<string, unknown> | undefined;
+		vi.stubGlobal("fetch", async (_url: string, init?: RequestInit) => {
+			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response([
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } });
+		});
+		const deferredTools = [
+			{
+				type: "function",
+				name: "lazy",
+				description: "lazy tool",
+				parameters: { type: "object", properties: {} },
+				strict: null,
+			},
+			{
+				type: "function",
+				name: "searched",
+				description: "searched tool",
+				parameters: { type: "object", properties: {} },
+				defer_loading: true,
+			},
+		];
+		const input = [
+			{ type: "additional_tools", role: "developer", tools: [deferredTools[0]] },
+			{ type: "tool_search_output", call_id: "search", execution: "client", status: "completed", tools: [deferredTools[1]] },
+		];
+		try {
+			await createNativeCheckpoint({
+				ctx: {
+					getSystemPrompt: () => "instructions",
+					modelRegistry: {
+						getApiKeyAndHeaders: async () => ({
+							ok: true,
+							apiKey: `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account" } })).toString("base64url")}.c`,
+							headers: {},
+							baseUrl: "https://auth.example/backend-api",
+						}),
+					},
+					sessionManager: { getSessionId: () => "session" },
+				} as never,
+				model: {
+					id: "gpt",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					contextWindow: 100_000,
+					compat: { supportsAdditionalTools: true },
+				} as never,
+				input: input as never,
+				allTools: [
+					{ name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} } },
+					{ name: "searched", description: "searched tool", parameters: { type: "object", properties: {} } },
+					{ name: "immediate", description: "immediate tool", parameters: { type: "object", properties: {} } },
+				] as never,
+				activeToolNames: ["lazy", "searched", "immediate"],
+			});
+			expect(requestBody?.tools).toEqual([
+				{ type: "function", name: "immediate", description: "immediate tool", parameters: { type: "object", properties: {} }, strict: null },
+			]);
+			expect(requestBody?.input).toEqual(expect.arrayContaining(input));
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	test("preserves eligible response.failed details for model fallback", async () => {
 		let calls = 0;
 		const body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too large\"}}}\n\ndata: [DONE]\n\n";
@@ -157,6 +224,12 @@ describe("Codex compaction history", () => {
 		{
 			name: "code-only context failure",
 			response: () => sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\"}}}\n\ndata: [DONE]\n\n"),
+			expectedFallback: true,
+			expectedCalls: 1,
+		},
+		{
+			name: "missing-model SSE failure",
+			response: () => sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"model_not_found\"}}}\n\ndata: [DONE]\n\n"),
 			expectedFallback: true,
 			expectedCalls: 1,
 		},
@@ -187,6 +260,33 @@ describe("Codex compaction history", () => {
 		expect(calls).toBe(3);
 	});
 
+	test("carries response turn state into a retry after SSE failure", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		const requestHeaders: Headers[] = [];
+		const onTurnState = vi.fn();
+		const promise = callRemoteCompaction(remoteRequest({
+			onTurnState,
+			fetchImpl: async (_url, init) => {
+				calls++;
+				requestHeaders.push(new Headers(init?.headers));
+				if (calls === 1) {
+					return new Response(
+						'data: {"type":"response.failed","response":{"error":{"code":"internal_server_error","message":"busy"}}}\n\n',
+						{ headers: { ...sseHeaders, "x-codex-turn-state": "sticky-after-headers" } },
+					);
+				}
+				return sse('data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}\n\ndata: {"type":"response.completed"}\n\n');
+			},
+		}));
+		await vi.runAllTimersAsync();
+		await expect(promise).resolves.toMatchObject({ compactionItem: { encrypted_content: "opaque" } });
+		expect(calls).toBe(2);
+		expect(requestHeaders[1]?.get("x-codex-turn-state")).toBe("sticky-after-headers");
+		expect(onTurnState).toHaveBeenCalledWith("sticky-after-headers");
+		expect(onTurnState).toHaveBeenCalledTimes(1);
+	});
+
 	test("uses the SSE retry-after hint", async () => {
 		vi.useFakeTimers();
 		let calls = 0;
@@ -205,10 +305,10 @@ describe("Codex compaction history", () => {
 	});
 
 	test.each([
-		["content_filter", false, 3, false],
-		["new_protocol_reason", false, 3, false],
-		["server_error", false, 3, true],
-	] as const)("handles incomplete reason %s", async (reason, expectedFallback, expectedCalls, expectedExplicitRetry) => {
+		["content_filter", false, 3],
+		["new_protocol_reason", false, 3],
+		["server_error", false, 3],
+	] as const)("handles incomplete reason %s", async (reason, expectedFallback, expectedCalls) => {
 		vi.useFakeTimers();
 		let calls = 0;
 		const promise = callRemoteCompaction(remoteRequest({
@@ -221,7 +321,6 @@ describe("Codex compaction history", () => {
 		await vi.runAllTimersAsync();
 		const error = await failure;
 		expect(error).toMatchObject({ retryWithCurrentModel: expectedFallback });
-		expect(isRetryableCompactionError(error)).toBe(expectedExplicitRetry);
 		expect(calls).toBe(expectedCalls);
 	});
 
@@ -238,7 +337,6 @@ describe("Codex compaction history", () => {
 		const error = await failure;
 		expect(calls).toBe(3);
 		expect(isContextWindowCompactionError(error)).toBe(false);
-		expect(isRetryableCompactionError(error)).toBe(false);
 	});
 
 	test("marks an incomplete context overflow for automatic retry only", async () => {
@@ -249,7 +347,6 @@ describe("Codex compaction history", () => {
 		await vi.runAllTimersAsync();
 		const error = await failure;
 		expect(isContextWindowCompactionError(error)).toBe(true);
-		expect(isRetryableCompactionError(error)).toBe(false);
 	});
 
 	test("does not switch models for usage-limit SSE errors", async () => {
@@ -269,12 +366,27 @@ describe("Codex compaction history", () => {
 		expect(failure).toMatchObject({ retryWithCurrentModel: false });
 	});
 
+	test("does not treat an eligible SSE code with a quota message as overflow or fallback", async () => {
+		let calls = 0;
+		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"quota exhausted\"}}}\n\ndata: [DONE]\n\n");
+			},
+		})));
+
+		expect(calls).toBe(1);
+		expect(failure).toMatchObject({ retryWithCurrentModel: false });
+		expect(isContextWindowCompactionError(failure)).toBe(false);
+	});
+
 	test("maps HTTP usage errors and transient overloads separately", async () => {
 		vi.useFakeTimers();
-		for (const [status, body, expectedCalls] of [
-			[429, { error: { type: "usage_limit_reached", message: "try another model" } }, 1],
-			[429, { error: { code: "rate_limit_reached", message: "slow down" } }, 3],
-			[503, { error: { code: "server_is_overloaded", message: "busy" } }, 3],
+		for (const [status, body, expectedCalls, expectedFallback] of [
+			[429, { error: { type: "usage_limit_reached", message: "try another model" } }, 1, false],
+			[429, { error: { code: "insufficient_quota", message: "quota exceeded" } }, 1, false],
+			[429, { error: { code: "rate_limit_reached", message: "slow down" } }, 3, true],
+			[503, { error: { code: "server_is_overloaded", message: "busy" } }, 3, true],
 		] as const) {
 			let calls = 0;
 			let failure: unknown;
@@ -288,16 +400,28 @@ describe("Codex compaction history", () => {
 			await vi.runAllTimersAsync();
 			await settled;
 			expect(calls).toBe(expectedCalls);
-			expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(true);
+			expect((failure as { retryWithCurrentModel?: boolean }).retryWithCurrentModel).toBe(expectedFallback);
 		}
 	});
 
 	test.each([
 		{
-			name: "unknown HTTP code",
+			name: "unknown HTTP 4xx code",
+			response: () => new Response(JSON.stringify({ error: { code: "future_protocol_code" } }), { status: 400 }),
+			expectedFallback: false,
+			expectedCalls: 1,
+		},
+		{
+			name: "unknown HTTP 5xx code",
 			response: () => new Response(JSON.stringify({ error: { code: "future_protocol_code" } }), { status: 500 }),
-			expectedFallback: true,
+			expectedFallback: false,
 			expectedCalls: 3,
+		},
+		{
+			name: "message-only HTTP protocol failure",
+			response: () => new Response("protocol failure", { status: 500 }),
+			expectedFallback: false,
+			expectedCalls: 1,
 		},
 		{
 			name: "canceled HTTP error",
@@ -308,7 +432,19 @@ describe("Codex compaction history", () => {
 		{
 			name: "message-only HTTP usage limit",
 			response: () => new Response(JSON.stringify({ error: { message: "usage limit reached" } }), { status: 429 }),
-			expectedFallback: true,
+			expectedFallback: false,
+			expectedCalls: 1,
+		},
+		{
+			name: "message-only HTTP quota reached",
+			response: () => new Response(JSON.stringify({ error: { message: "quota reached" } }), { status: 429 }),
+			expectedFallback: false,
+			expectedCalls: 1,
+		},
+		{
+			name: "message-only HTTP quota exhausted",
+			response: () => new Response(JSON.stringify({ error: { message: "quota exhausted" } }), { status: 429 }),
+			expectedFallback: false,
 			expectedCalls: 1,
 		},
 		{
@@ -331,15 +467,51 @@ describe("Codex compaction history", () => {
 		},
 		{
 			name: "malformed SSE data",
-			response: () => sse("data: {bad\n\n"),
+			response: () => sse([
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				"data: {bad",
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n"),
 			expectedFallback: false,
-			expectedCalls: 3,
+			expectedCalls: 1,
 		},
 		{
 			name: "non-object SSE data",
-			response: () => sse("data: null\n\n"),
+			response: () => sse([
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				"data: null",
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n"),
 			expectedFallback: false,
-			expectedCalls: 3,
+			expectedCalls: 1,
+		},
+		{
+			name: "missing response output item",
+			response: () => sse([
+				'data: {"type":"response.output_item.done"}',
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n"),
+			expectedFallback: false,
+			expectedCalls: 1,
+		},
+		{
+			name: "null response output item",
+			response: () => sse([
+				'data: {"type":"response.output_item.done","item":null}',
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n"),
+			expectedFallback: false,
+			expectedCalls: 1,
+		},
+		{
+			name: "non-object response output item after compaction",
+			response: () => sse([
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				'data: {"type":"response.output_item.done","item":"not-an-object"}',
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n"),
+			expectedFallback: false,
+			expectedCalls: 1,
 		},
 		{
 			name: "unknown SSE message-only error",
@@ -374,6 +546,19 @@ describe("Codex compaction history", () => {
 		expect(calls).toBe(expectedCalls);
 	});
 
+	test("accepts empty framing, DONE, and unknown SSE events", async () => {
+		const result = await callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => sse([
+				"",
+				'data: {"type":"future.event","payload":"ignored"}',
+				"data: [DONE]",
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				'data: {"type":"response.completed"}',
+			].join("\n\n") + "\n\n"),
+		}));
+		expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "opaque" });
+	});
+
 	test("preserves nested SSE error details", async () => {
 		let calls = 0;
 		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
@@ -384,6 +569,72 @@ describe("Codex compaction history", () => {
 		})));
 		expect(failure).toMatchObject({ message: "OpenAI Codex compaction failed (invalid_prompt): nested invalid prompt", retryWithCurrentModel: true });
 		expect(calls).toBe(1);
+	});
+
+	test("keeps unknown credential-like HTTP and SSE failures fail-closed", async () => {
+		vi.useFakeTimers();
+		for (const [name, response] of [
+			[
+				"HTTP",
+				() => new Response(
+					JSON.stringify({ error: { code: "credential_backend_failure", message: "credential verification failed" } }),
+					{ status: 503, headers: { "retry-after-ms": "0" } },
+				),
+			],
+			[
+				"SSE credential",
+				() => sse(`data: {"type":"error","code":"credential_backend_failure","message":"credential verification failed"}\n\n`),
+			],
+			[
+				"HTTP authorization",
+				() => new Response(
+					JSON.stringify({ error: { code: "authorization_backend_failure", message: "authorization failed" } }),
+					{ status: 503, headers: { "retry-after-ms": "0" } },
+				),
+			],
+			[
+				"HTTP access denied",
+				() => new Response(
+					JSON.stringify({ error: { code: "access_denied", message: "access denied" } }),
+					{ status: 400 },
+				),
+			],
+			[
+				"SSE policy",
+				() => sse(`data: {"type":"error","code":"policy_backend_failure","message":"policy blocked"}\n\n`),
+			],
+		] as const) {
+			let calls = 0;
+			const promise = callRemoteCompaction(remoteRequest({
+				fetchImpl: async () => {
+					calls++;
+					return response();
+				},
+			})).catch(error => error);
+			await vi.runAllTimersAsync();
+			const failure = await promise;
+			expect(failure, name).toMatchObject({ retryWithCurrentModel: false });
+			expect(calls, name).toBe(1);
+		}
+	});
+
+	test("maps unknown provider error codes to stable safe classifications", () => {
+		const unknown = new Error("OpenAI Codex compaction failed (credential_bearer_secret): Authorization Bearer secret");
+		Object.defineProperty(unknown, "compactionCode", { value: "credential_bearer_secret" });
+
+		expect(compactionFailureClassification(unknown)).toBe("authentication");
+		expect(compactionFailureClassification(unknown)).toBe(compactionFailureClassification(unknown));
+		expect(compactionFailureClassification(unknown)).not.toContain("credential_bearer_secret");
+		expect(compactionFailureClassification(unknown)).not.toContain("secret");
+	});
+
+	test("uses a fixed HTTP classification for unknown credential-like codes", () => {
+		const unknown = new Error("OpenAI Codex compaction failed (418): Authorization Bearer secret");
+		Object.defineProperty(unknown, "compactionCode", { value: "credential_bearer_secret" });
+
+		expect(compactionFailureClassification(unknown)).toBe("http_418");
+		expect(compactionFailureClassification(unknown)).not.toContain("credential_bearer_secret");
+		expect(compactionFailureClassification(unknown)).not.toContain("secret");
 	});
 
 	test("returns after a completed SSE event without waiting for EOF", async () => {
@@ -656,6 +907,139 @@ describe("Codex compaction history", () => {
 		const result = fullInputForBranch({ branch, model, tools: [] });
 		expect(result.at(-1)).toMatchObject({ id: "msg_pi_2" });
 	});
+
+	test("matches Pi's deferred-tool capability and strict-mode shapes", () => {
+		const branch = [
+			{
+				id: "tool-call",
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					model: "gpt",
+					content: [{ type: "toolCall", id: "call|fc", name: "bash", arguments: {} }],
+				},
+			},
+			{
+				id: "tool-result",
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId: "call|fc",
+					toolName: "bash",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					addedToolNames: ["lazy"],
+				},
+			},
+		] as never;
+		const tool = { name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} } } as never;
+		const additionalTools = fullInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", compat: { supportsAdditionalTools: true } } as never,
+			tools: [tool],
+		});
+		expect(additionalTools).toContainEqual({
+			type: "additional_tools",
+			role: "developer",
+			tools: [{ type: "function", name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} }, strict: null }],
+		});
+		const additionalToolsWithoutStrict = fullInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", compat: { supportsAdditionalTools: true, supportsStrictMode: false } } as never,
+			tools: [tool],
+		});
+		expect(additionalToolsWithoutStrict).toContainEqual({
+			type: "additional_tools",
+			role: "developer",
+			tools: [{ type: "function", name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} } }],
+		});
+
+		const toolSearch = fullInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", compat: { supportsToolSearch: true, supportsStrictMode: false } } as never,
+			tools: [tool],
+		});
+		expect(toolSearch).toContainEqual({
+			type: "tool_search_output",
+			call_id: expect.any(String),
+			execution: "client",
+			status: "completed",
+			tools: [{ type: "function", name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} }, defer_loading: true }],
+		});
+
+		const unsupported = fullInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", compat: {} } as never,
+			tools: [tool],
+		});
+		expect(unsupported.some((item) => item.type === "additional_tools" || item.type === "tool_search_call" || item.type === "tool_search_output")).toBe(false);
+		expect(buildToolPayload([tool], ["lazy"], false)).toEqual([
+			{ type: "function", name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} } },
+		]);
+	});
+
+	test("deduplicates deferred tools already present in a checkpoint prefix", () => {
+		const lazyTool = { name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} } } as never;
+		const newTool = { name: "new", description: "new tool", parameters: { type: "object", properties: {} } } as never;
+		const prefix = {
+			type: "additional_tools",
+			role: "developer",
+			tools: [{ type: "function", name: "lazy", description: "lazy tool", parameters: { type: "object", properties: {} }, strict: null }],
+		};
+		const branch = [
+			{
+				id: "checkpoint",
+				type: "custom",
+				customType: NATIVE_COMPACTION_KIND,
+				data: {
+					kind: NATIVE_COMPACTION_KIND,
+					version: NATIVE_COMPACTION_VERSION,
+					strategy: "v2",
+					modelKey: "openai-codex:openai-codex-responses:gpt",
+					preservedInput: [prefix],
+					replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+				},
+			},
+			{
+				id: "result-1",
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId: "call|one",
+					toolName: "bash",
+					content: [{ type: "text", text: "one" }],
+					addedToolNames: ["lazy", "new", "new"],
+				},
+			},
+			{
+				id: "result-2",
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId: "call|two",
+					toolName: "bash",
+					content: [{ type: "text", text: "two" }],
+					addedToolNames: ["new"],
+				},
+			},
+		] as never;
+		const result = effectiveInputForBranch({
+			branch,
+			model: { provider: "openai-codex", api: "openai-codex-responses", id: "gpt", compat: { supportsAdditionalTools: true } } as never,
+			tools: [lazyTool, newTool],
+		});
+		expect(result.filter((item) => item.type === "additional_tools")).toEqual([
+			prefix,
+			{
+				type: "additional_tools",
+				role: "developer",
+				tools: [{ type: "function", name: "new", description: "new tool", parameters: { type: "object", properties: {} }, strict: null }],
+			},
+		]);
+	});
+
 	test("keeps recent message items and drops tool history", () => {
 		const result = retainRecentMessages([
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },
@@ -736,6 +1120,43 @@ describe("Codex compaction history", () => {
 			],
 		});
 		expect(details?.replacementHistory).toHaveLength(2);
+	});
+
+	test("rejects malformed nested AgentMessage content", () => {
+		const details = parseNativeCompactionDetails({
+			kind: NATIVE_COMPACTION_KIND,
+			version: NATIVE_COMPACTION_VERSION,
+			strategy: "v2",
+			modelKey: "openai-codex:openai-codex-responses:test",
+			replacementHistory: [
+				{
+					type: "agent_message",
+					author: "root",
+					recipient: "root/child",
+					content: [{ type: "input_text", text: 42 }],
+				},
+				{ type: "compaction", encrypted_content: "opaque" },
+			],
+		});
+		expect(details).toBeUndefined();
+	});
+
+	test("rejects role-only AgentMessage checkpoints", () => {
+		const details = parseNativeCompactionDetails({
+			kind: NATIVE_COMPACTION_KIND,
+			version: NATIVE_COMPACTION_VERSION,
+			strategy: "v2",
+			modelKey: "openai-codex:openai-codex-responses:test",
+			replacementHistory: [
+				{
+					type: "agent_message",
+					role: "assistant",
+					content: [{ type: "input_text", text: "legacy" }],
+				},
+				{ type: "compaction", encrypted_content: "opaque" },
+			],
+		});
+		expect(details).toBeUndefined();
 	});
 
 	test("does not share the agent-message limit across items", () => {
@@ -830,6 +1251,18 @@ describe("Codex compaction history", () => {
 		expect(isContextWindowCompactionError(invalidPromptError)).toBe(false);
 	});
 
+	test("retains a preceding compaction at source index zero during overflow recovery", () => {
+		const result = latestRemoteCompactionSuffix([
+			{ type: "compaction", encrypted_content: "opaque" },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "new" }] },
+		], 1_000);
+
+		expect(result).toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "new" }] },
+		]);
+	});
+
 	test("keeps the newest complete user turn for overflow recovery", () => {
 		const result = latestRemoteCompactionSuffix([
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },
@@ -855,24 +1288,38 @@ describe("Codex compaction history", () => {
 		expect(result[1]?.output).toBe("Output exceeded the available model context and was truncated");
 	});
 
+	test("continues past a non-truncatable newest message", () => {
+		const newestMessage = { type: "message", role: "assistant", content: [{ type: "output_text", text: "keep" }] };
+		const result = trimFunctionCallHistoryToFitContextWindow([
+			{ type: "function_call_output", call_id: "old", output: "old".repeat(200) },
+			newestMessage,
+		], 20);
+		expect(result[0]?.output).toBe("Output exceeded the available model context and was truncated");
+		expect(result[1]).toEqual(newestMessage);
+	});
+
 	test("keeps machine-readable auth and policy errors out of model fallback", async () => {
 		for (const body of ['{"code":"invalid_api_key"}', '{"code":"policy_violation"}']) {
 			const failure = await captureFailure(callRemoteCompaction(remoteRequest({
 				fetchImpl: async () => new Response(body, { status: 400 }),
 			})));
 			expect(failure).toMatchObject({ retryWithCurrentModel: false });
-			expect(isRetryableCompactionError(failure)).toBe(false);
 		}
 	});
 
-	test("marks exhausted transient errors as retryable for an explicit retry", async () => {
+	test("exhausts transient network retries without exposing a UI retry contract", async () => {
+		let calls = 0;
 		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
-			fetchImpl: async () => new Response("temporary", {
-				status: 503,
-				headers: { "retry-after-ms": "0" },
-			}),
+			fetchImpl: async () => {
+				calls++;
+				return new Response("temporary", {
+					status: 503,
+					headers: { "retry-after-ms": "0" },
+				});
+			},
 		})));
-		expect(isRetryableCompactionError(failure)).toBe(true);
+		expect(failure).toMatchObject({ retryWithCurrentModel: true });
+		expect(calls).toBe(3);
 	});
 
 	test("always appends exactly one valid compaction checkpoint", () => {

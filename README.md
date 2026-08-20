@@ -66,7 +66,7 @@ Where Pi exposes the needed lifecycle hooks, this extension follows Codex CLI's 
 - Reuses Codex request settings for manual compaction and forwards the server's sticky turn state only within the active turn.
 - Retains recent eligible user and agent messages, drops standalone developer/system and old tool/reasoning items, keeps an attached generated image-resize notice with its retained source, caps retained agent messages at 10,000 tokens, and applies Codex V2's 64,000-token retained-message budget.
 - Retries transient HTTP and stream failures. For eligible model/request failures during a transition, it retries with the newly selected model.
-- Automatically remote-compacts a newer history suffix for `context_length_exceeded`; if no complete suffix fits, the UI offers starting a new session or cancelling. Other blocked requests never retry unless the error is explicitly transient.
+- Automatically remote-compacts a newer history suffix for `context_length_exceeded`; if the bounded recovery fails, it emits a safe failure notice and cancels only the current operation. Other blocked requests never retry unless the error is explicitly transient.
 
 Unsupported providers keep Pi's normal local text summarization.
 

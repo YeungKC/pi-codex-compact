@@ -1,7 +1,7 @@
 import { expect, test, vi } from "vitest";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import codexCompactionExtension from "./index.ts";
-import { NATIVE_COMPACTION_KIND } from "./native-compaction.ts";
+import { FAILED_REQUEST_KIND, NATIVE_COMPACTION_KIND } from "./native-compaction.ts";
 
 type Handler = (event: any, ctx: any) => unknown;
 
@@ -24,10 +24,9 @@ function checkpointEntry(): SessionEntry {
 	} as unknown as SessionEntry;
 }
 
-function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResult?: string) {
+function installExtension(branch: SessionEntry[] = [], hasUI = false) {
 	const handlers = new Map<string, Handler>();
 	const notify = vi.fn();
-	const select = vi.fn(async () => selectResult);
 	const model = {
 		provider: "openai-codex",
 		api: "openai-codex-responses",
@@ -44,7 +43,7 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResu
 		cwd: process.cwd(),
 		isProjectTrusted: () => true,
 		hasUI,
-		ui: { notify, select },
+		ui: { notify },
 		abort: vi.fn(),
 		signal: new AbortController().signal,
 		model,
@@ -52,6 +51,7 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResu
 		getSystemPrompt: () => "system instructions",
 		sessionManager,
 		modelRegistry: {
+			find: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
 			getApiKeyAndHeaders: async () => ({
 				ok: true,
 				apiKey,
@@ -60,13 +60,14 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false, selectResu
 			}),
 		},
 	};
+	const appendEntry = vi.fn();
 	codexCompactionExtension({
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		getAllTools: () => [],
 		getActiveTools: () => [],
-		appendEntry: vi.fn(),
+		appendEntry,
 	} as never);
-	return { handlers, ctx, model, notify, select };
+	return { handlers, ctx, model, notify, appendEntry };
 }
 
 test("removes unsupported prompt cache retention from Codex requests", async () => {
@@ -75,6 +76,40 @@ test("removes unsupported prompt cache retention from Codex requests", async () 
 
 	await expect(handlers.get("before_provider_request")?.({ payload }, ctx)).resolves.toBe(payload);
 	expect(payload).not.toHaveProperty("prompt_cache_retention");
+});
+
+test("returns sanitized input after filtering a stale failed marker", async () => {
+	const secret = "stale-failed-input";
+	const branch = [
+		{
+			id: "failed-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: secret }] },
+		},
+		{
+			id: "failed-marker",
+			parentId: "failed-user",
+			timestamp: new Date().toISOString(),
+			type: "custom",
+			customType: FAILED_REQUEST_KIND,
+			data: { kind: FAILED_REQUEST_KIND, entryId: "failed-user" },
+		},
+	] as never;
+	const { handlers, ctx } = installExtension(branch);
+	const result = await handlers.get("before_provider_request")?.({
+		payload: {
+			input: [
+				{ role: "user", content: [{ type: "input_text", text: secret }] },
+				{ role: "user", content: [{ type: "input_text", text: "retry" }] },
+			],
+		},
+	}, ctx);
+
+	expect(result).toEqual({ input: [{ role: "user", content: [{ type: "input_text", text: "retry" }] }] });
+	expect(JSON.stringify(result)).not.toContain(secret);
+	expect(ctx.abort).not.toHaveBeenCalled();
 });
 
 test("filters Pi compaction summaries after a valid V2 checkpoint", () => {
@@ -110,7 +145,15 @@ test("replays the full branch when a native checkpoint is malformed", () => {
 				version: 2,
 				strategy: "v2",
 				modelKey: "openai-codex:openai-codex-responses:gpt",
-				replacementHistory: [],
+				replacementHistory: [
+					{
+						type: "agent_message",
+						author: "root",
+						recipient: "root/child",
+						content: [{ type: "input_text", text: 42 }],
+					},
+					{ type: "compaction", encrypted_content: "opaque" },
+				],
 			},
 		},
 		{ id: "tail", type: "message", message: { role: "user", content: [{ type: "text", text: "tail" }] } },
@@ -144,17 +187,255 @@ test("clears turn state when navigating to another session-tree leaf", () => {
 	expect(afterTreeHeaders["x-codex-turn-state"]).toBeUndefined();
 });
 
-test("offers a UI action before blocking a failed Codex request", async () => {
-	const { handlers, ctx, select } = installExtension([checkpointEntry()], true, "Cancel");
+test("reports a terminal request failure without interactive choices", async () => {
+	const { handlers, ctx, notify } = installExtension([checkpointEntry()], true);
 
 	await handlers.get("before_provider_request")?.({ payload: {} }, ctx);
 
-	expect(select).toHaveBeenCalledWith(
-		"OpenAI Codex request blocked",
-		["Start a new session", "Cancel"],
-		{ signal: ctx.signal },
+	expect(notify).toHaveBeenCalledWith(
+		expect.stringMatching(/^OpenAI Codex failure: phase=before_provider_request; code=[a-z0-9_.-]+; model=gpt; recoveryAttempted=false; outcome=request_aborted; next=.+$/),
+		"error",
 	);
 	expect(ctx.abort).toHaveBeenCalled();
+});
+
+test("persists safe diagnostics without request input or raw error text", async () => {
+	const secret = "sk-live-user-input-secret";
+	const branch = [
+		{
+			id: "history-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "older history" }] },
+		},
+		checkpointEntry(),
+		{
+			id: "failed-user",
+			parentId: "checkpoint",
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: secret }] },
+		},
+	] as never;
+	const { handlers, ctx, notify, appendEntry } = installExtension(branch, true);
+	const fetchMock = vi.fn(async () => new Response(
+		JSON.stringify({ error: { code: "credential_bearer_secret", message: "Authorization Bearer secret" } }),
+		{ status: 400 },
+	));
+	vi.stubGlobal("fetch", fetchMock);
+	try {
+		await handlers.get("before_provider_request")?.({
+			payload: { input: [{ role: "user", content: [{ type: "input_text", text: secret }] }] },
+		}, ctx);
+	} finally {
+		vi.unstubAllGlobals();
+	}
+
+	const failed = appendEntry.mock.calls.find(([kind]) => kind === FAILED_REQUEST_KIND)?.[1] as Record<string, unknown> | undefined;
+	expect(failed).toMatchObject({
+		kind: FAILED_REQUEST_KIND,
+		entryId: "failed-user",
+		diagnostics: {
+			phase: "before_provider_request",
+			code: "http_400",
+			recoveryAttempted: false,
+		},
+	});
+	expect(fetchMock).toHaveBeenCalledTimes(1);
+	expect(failed).not.toHaveProperty("content");
+	expect(JSON.stringify(failed)).not.toContain(secret);
+	expect(JSON.stringify(failed)).not.toContain("credential_bearer_secret");
+	expect(JSON.stringify(failed)).not.toContain("Authorization Bearer secret");
+	expect(notify).toHaveBeenCalledWith(expect.not.stringContaining(secret), "error");
+	expect(notify).toHaveBeenCalledWith(expect.not.stringContaining("credential_bearer_secret"), "error");
+});
+
+test("writes the same safe failure notice without UI", async () => {
+	const error = vi.spyOn(console, "error").mockImplementation(() => {});
+	const { handlers, ctx } = installExtension([checkpointEntry()]);
+	await handlers.get("before_provider_request")?.({ payload: {} }, ctx);
+	const calls = error.mock.calls;
+	error.mockRestore();
+	expect(calls).toHaveLength(1);
+	expect(calls[0]).toEqual([
+		expect.stringMatching(/^OpenAI Codex failure: phase=before_provider_request; code=[a-z0-9_.-]+; model=gpt; recoveryAttempted=false; outcome=request_aborted; next=.+$/),
+	]);
+});
+
+test("reports a terminal manual compaction failure without choices", async () => {
+	const { handlers, ctx, notify } = installExtension([], true);
+	vi.stubGlobal("fetch", async () => new Response(
+		JSON.stringify({ error: { code: "manual_failure", message: "do-not-display-this-body" } }),
+		{ status: 400 },
+	));
+	try {
+		await expect(handlers.get("session_before_compact")?.({
+			branchEntries: [],
+			preparation: { firstKeptEntryId: "", tokensBefore: 0 },
+			reason: "manual",
+			willRetry: false,
+			signal: new AbortController().signal,
+		}, ctx)).resolves.toEqual({ cancel: true });
+	} finally {
+		vi.unstubAllGlobals();
+	}
+	expect(notify).toHaveBeenCalledWith(
+		expect.stringMatching(/^OpenAI Codex failure: phase=session_before_compact; code=http_400; model=gpt; recoveryAttempted=false; outcome=compaction_cancelled; next=.+$/),
+		"error",
+	);
+	expect(notify).toHaveBeenCalledWith(expect.not.stringContaining("do-not-display-this-body"), "error");
+});
+
+test("reports a safe manual compaction failure without UI", async () => {
+	const error = vi.spyOn(console, "error").mockImplementation(() => {});
+	const { handlers, ctx, notify } = installExtension([], false);
+	vi.stubGlobal("fetch", async () => new Response(
+		JSON.stringify({ error: { code: "credential_bearer_secret", message: "Authorization Bearer secret" } }),
+		{ status: 400 },
+	));
+	try {
+		await expect(handlers.get("session_before_compact")?.({
+			branchEntries: [],
+			preparation: { firstKeptEntryId: "", tokensBefore: 0 },
+			reason: "manual",
+			willRetry: false,
+			signal: new AbortController().signal,
+		}, ctx)).resolves.toEqual({ cancel: true });
+	} finally {
+		vi.unstubAllGlobals();
+	}
+	const calls = error.mock.calls;
+	error.mockRestore();
+	expect(notify).not.toHaveBeenCalled();
+	expect(calls).toHaveLength(1);
+	expect(calls[0]).toEqual([
+		expect.stringMatching(/^OpenAI Codex failure: phase=session_before_compact; code=http_400; model=gpt; recoveryAttempted=false; outcome=compaction_cancelled; next=.+$/),
+	]);
+	expect(String(calls[0]?.[0])).not.toContain("credential_bearer_secret");
+	expect(String(calls[0]?.[0])).not.toContain("Authorization Bearer secret");
+});
+
+test("cancels a stale compaction after the session tree changes", async () => {
+	const { handlers, ctx } = installExtension();
+	let resolveFetch!: (response: Response) => void;
+	let markFetchStarted!: () => void;
+	const fetchStarted = new Promise<void>((resolve) => {
+		markFetchStarted = resolve;
+	});
+	const fetchResponse = new Promise<Response>((resolve) => {
+		resolveFetch = resolve;
+	});
+	vi.stubGlobal("fetch", async () => {
+		markFetchStarted();
+		return fetchResponse;
+	});
+	try {
+		const compaction = handlers.get("session_before_compact")?.({
+			branchEntries: [],
+			preparation: { firstKeptEntryId: "", tokensBefore: 0 },
+			reason: "manual",
+			willRetry: false,
+			signal: new AbortController().signal,
+		}, ctx);
+		await fetchStarted;
+		handlers.get("session_tree")?.({}, ctx);
+		resolveFetch(new Response([
+			'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+			'data: {"type":"response.completed"}',
+		].join("\n\n") + "\n\n", {
+			headers: {
+				"content-type": "text/event-stream",
+				"x-codex-turn-state": "old-leaf-state",
+			},
+		}));
+		await expect(compaction).resolves.toEqual({ cancel: true });
+		const headers: Record<string, string | null> = {};
+		handlers.get("before_provider_headers")?.({ headers }, ctx);
+		expect(headers["x-codex-turn-state"]).toBeUndefined();
+	} finally {
+		vi.unstubAllGlobals();
+	}
+});
+
+test("does not preserve an active failed user during manual compaction", async () => {
+	const secret = "stale-failed-input";
+	const branch = [
+		{
+			id: "failed-user",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: secret }] },
+		},
+		{
+			id: "failed-marker",
+			parentId: "failed-user",
+			timestamp: new Date().toISOString(),
+			type: "custom",
+			customType: FAILED_REQUEST_KIND,
+			data: { kind: FAILED_REQUEST_KIND, entryId: "failed-user" },
+		},
+	] as never;
+	const { handlers, ctx } = installExtension(branch);
+	vi.stubGlobal("fetch", async () => new Response([
+		'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+		'data: {"type":"response.completed"}',
+	].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } }));
+	try {
+		const result = await handlers.get("session_before_compact")?.({
+			branchEntries: branch,
+			preparation: { firstKeptEntryId: "", tokensBefore: 0 },
+			reason: "manual",
+			willRetry: false,
+			signal: new AbortController().signal,
+		}, ctx) as { compaction?: { details?: { replacementHistory?: unknown[]; preservedInput?: unknown[] } } } | undefined;
+		const details = result?.compaction?.details;
+		expect(details?.replacementHistory).not.toEqual(expect.arrayContaining([
+			expect.objectContaining({ role: "user", content: expect.arrayContaining([expect.objectContaining({ text: secret })]) }),
+		]));
+		expect(details?.preservedInput ?? []).not.toEqual(expect.arrayContaining([
+			expect.objectContaining({ role: "user", content: expect.arrayContaining([expect.objectContaining({ text: secret })]) }),
+		]));
+		expect(JSON.stringify(details)).not.toContain(secret);
+	} finally {
+		vi.unstubAllGlobals();
+	}
+});
+
+test.each([
+	["invalid_api_key", "check Codex authentication and retry manually"],
+	["authentication_error", "check Codex authentication and retry manually"],
+	["unauthorized", "check Codex authentication and retry manually"],
+	["forbidden", "check Codex authentication and retry manually"],
+	["permission_denied", "check Codex authentication and retry manually"],
+	["invalid_token", "check Codex authentication and retry manually"],
+	["credential_error", "check Codex authentication and retry manually"],
+	["policy_violation", "check Codex plan, permissions, quota, and billing before retrying manually"],
+	["insufficient_quota", "check Codex plan, permissions, quota, and billing before retrying manually"],
+	["usage_limit_reached", "check Codex plan, permissions, quota, and billing before retrying manually"],
+	["billing_error", "check Codex plan, permissions, quota, and billing before retrying manually"],
+	["out_of_budget", "check Codex plan, permissions, quota, and billing before retrying manually"],
+] as const)("uses a safe next step for $0", async (code, nextStep) => {
+	const { handlers, ctx, notify } = installExtension([], true);
+	vi.stubGlobal("fetch", async () => new Response(
+		JSON.stringify({ error: { code, message: "safe test failure" } }),
+		{ status: 400 },
+	));
+	try {
+		await expect(handlers.get("session_before_compact")?.({
+			branchEntries: [],
+			preparation: { firstKeptEntryId: "", tokensBefore: 0 },
+			reason: "manual",
+			willRetry: false,
+			signal: new AbortController().signal,
+		}, ctx)).resolves.toEqual({ cancel: true });
+	} finally {
+		vi.unstubAllGlobals();
+	}
+	const notice = notify.mock.calls.at(-1)?.[0];
+	expect(notice).toContain(`code=${code}`);
+	expect(notice).toContain(`next=${nextStep}.`);
 });
 
 test("reuses the last request settings and turn state for manual compaction", async () => {

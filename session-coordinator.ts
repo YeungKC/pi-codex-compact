@@ -16,6 +16,7 @@ import {
 	approximateCompactionRequestTokens,
 	latestRemoteCompactionSuffix,
 	type FailedRequestDetails,
+	type FailedRequestDiagnostics,
 	type JsonObject,
 	type NativeCompactionDetails,
 	type ResponseItem,
@@ -52,6 +53,12 @@ type PendingTransition = {
 	previousModel: Model<any>;
 	targetModelKey: string;
 	reason: "hash" | "downshift";
+};
+
+type ActiveFailedRequest = FailedRequestDetails & {
+	markerIndex: number;
+	hasBranchUser: boolean;
+	hasNewerUser: boolean;
 };
 
 function isModelDownshift(previousModel: Model<any>, currentModel: Model<any>): boolean {
@@ -93,55 +100,93 @@ function compactionRequestReservedTokens(
 		input: [],
 		instructions: typeof basePayload?.instructions === "string" ? basePayload.instructions : ctx.getSystemPrompt(),
 		tools: Array.isArray(basePayload?.tools) ? basePayload.tools : tools,
-		includeTrigger: true,
 	});
 }
 
 function conversationLeafId(branch: SessionEntry[]): string | undefined {
-	return [...branch].reverse().find((entry) => entry.type !== "custom")?.id;
+	return branch.findLast((entry) => entry.type !== "custom")?.id;
 }
 
-function activeFailedRequest(branch: SessionEntry[]): FailedRequestDetails | undefined {
-	for (let index = branch.length - 1; index >= 0; index--) {
+function isRealUserEntry(entry: SessionEntry): entry is Extract<SessionEntry, { type: "message" }> {
+	return entry.type === "message" && entry.message.role === "user";
+}
+
+function isSuccessfulAssistantEntry(entry: SessionEntry): boolean {
+	return entry.type === "message"
+		&& entry.message.role === "assistant"
+		&& entry.message.stopReason !== "error"
+		&& entry.message.stopReason !== "aborted";
+}
+
+function activeFailedRequests(branch: SessionEntry[]): ActiveFailedRequest[] {
+	let lastSuccessfulAssistantIndex = -1;
+	for (let index = 0; index < branch.length; index++) {
+		if (isSuccessfulAssistantEntry(branch[index]!)) lastSuccessfulAssistantIndex = index;
+	}
+
+	const byEntryId = new Map<string, ActiveFailedRequest>();
+	for (let index = lastSuccessfulAssistantIndex + 1; index < branch.length; index++) {
 		const entry = branch[index];
 		if (entry?.type !== "custom" || entry.customType !== FAILED_REQUEST_KIND || !isJsonObject(entry.data)) continue;
-		if (typeof entry.data.entryId !== "string") return undefined;
-		const resolved = branch.slice(index + 1).some((candidate) =>
-			candidate.type === "message"
-				&& candidate.message.role === "assistant"
-				&& candidate.message.stopReason !== "error"
-				&& candidate.message.stopReason !== "aborted",
-		);
-		return resolved
-			? undefined
-			: {
-					kind: FAILED_REQUEST_KIND,
-					entryId: entry.data.entryId,
-					content: structuredClone(entry.data.content),
-				};
+		const data = entry.data;
+		if (data.kind !== FAILED_REQUEST_KIND || typeof data.entryId !== "string") continue;
+		let referencedUser: Extract<SessionEntry, { type: "message" }> | undefined;
+		const referencedIndex = branch.findIndex((candidate) => candidate.id === data.entryId);
+		if (referencedIndex >= 0) {
+			const referencedEntry = branch[referencedIndex];
+			if (!referencedEntry || !isRealUserEntry(referencedEntry) || referencedIndex <= lastSuccessfulAssistantIndex || referencedIndex >= index) continue;
+			referencedUser = referencedEntry;
+		}
+		byEntryId.set(data.entryId, {
+			kind: FAILED_REQUEST_KIND,
+			entryId: data.entryId,
+			markerIndex: index,
+			hasBranchUser: referencedUser !== undefined,
+			hasNewerUser: branch.slice(index + 1).some(isRealUserEntry),
+			...(referencedUser
+				? { content: structuredClone(messageContent(referencedUser)) }
+				: data.content !== undefined ? { content: structuredClone(data.content) } : {}),
+		});
 	}
-	return undefined;
+	return [...byEntryId.values()].sort((left, right) => left.markerIndex - right.markerIndex);
 }
 
-function branchWithoutFailedRequest(branch: SessionEntry[], failed: FailedRequestDetails | undefined): SessionEntry[] {
-	return failed ? branch.filter((entry) => entry.id !== failed.entryId) : branch;
+function branchWithoutFailedRequests(branch: SessionEntry[], failed: ActiveFailedRequest[]): SessionEntry[] {
+	const failedUserIds = new Set(failed.filter((request) => request.hasBranchUser).map((request) => request.entryId));
+	return failedUserIds.size === 0 ? branch : branch.filter((entry) => !failedUserIds.has(entry.id));
 }
 
-function requestInputWithoutFailedRequest(
+function sameFailedRequestContent(left: unknown, right: unknown): boolean {
+	return isDeepStrictEqual(left, right) || textContent(left) === textContent(right);
+}
+
+function requestInputWithoutFailedRequests(
 	requestInput: ResponseItem[] | undefined,
-	failed: FailedRequestDetails | undefined,
+	failed: ActiveFailedRequest[],
 ): ResponseItem[] | undefined {
-	if (!requestInput || !failed) return requestInput;
+	if (!requestInput || failed.length === 0) return requestInput;
 	const lastUserIndex = requestInput.findLastIndex((item) => item.role === "user");
 	if (lastUserIndex < 0) return requestInput;
-	const failedIndex = requestInput.findLastIndex((item, index) =>
-		index < lastUserIndex
+	const latest = failed.at(-1);
+	const latestIsReusedEntry = latest !== undefined
+		&& !latest.hasNewerUser
+		&& latest.content !== undefined
+		&& sameFailedRequestContent(requestInput[lastUserIndex]?.content, latest.content);
+	const stale = failed.filter((request) => request !== latest || !latestIsReusedEntry).reverse();
+	const matchedIndices = new Set<number>();
+	for (const request of stale) {
+		if (request.content === undefined) continue;
+		const failedIndex = requestInput.findLastIndex((item, index) =>
+			index < lastUserIndex
+			&& !matchedIndices.has(index)
 			&& item.role === "user"
-			&& isDeepStrictEqual(item.content, failed.content),
-	);
-	return failedIndex < 0
+			&& sameFailedRequestContent(item.content, request.content),
+		);
+		if (failedIndex >= 0) matchedIndices.add(failedIndex);
+	}
+	return matchedIndices.size === 0
 		? requestInput
-		: requestInput.filter((_item, index) => index !== failedIndex);
+		: requestInput.filter((_item, index) => !matchedIndices.has(index));
 }
 
 function hasBranchTailAfterCheckpoint(branch: SessionEntry[]): boolean {
@@ -324,8 +369,8 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		...deps,
 		getBranch: (ctx) => {
 			const branch = rawGetBranch(ctx);
-			return branchWithoutFailedRequest(branch, activeFailedRequest(branch));
-		},
+			return branchWithoutFailedRequests(branch, activeFailedRequests(branch));
+		}
 	};
 	const pendingBySession = new Map<string, PendingTransition>();
 	const transitionBySession = new Map<string, Promise<void>>();
@@ -339,19 +384,22 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		automaticCompactionBySession.clear();
 	};
 
-	const recordFailedRequest = (ctx: ExtensionContext, requestInput: ResponseItem[] | undefined): void => {
+	const recordFailedRequest = (
+		ctx: ExtensionContext,
+		requestInput: ResponseItem[] | undefined,
+		diagnostics?: FailedRequestDiagnostics,
+	): void => {
 		const requestUser = requestInput?.findLast((item) => item.role === "user");
 		if (!requestUser) return;
-		const entry = rawGetBranch(ctx).findLast((candidate) =>
-			candidate.type === "message"
-				&& candidate.message.role === "user"
-				&& textContent(candidate.message.content) === textContent(requestUser.content),
+		const latestModelVisible = rawGetBranch(ctx).findLast((entry) =>
+			entry.type === "message" || entry.type === "custom_message",
 		);
-		if (!entry) return;
+		if (!latestModelVisible || !isRealUserEntry(latestModelVisible)) return;
+		if (!sameFailedRequestContent(messageContent(latestModelVisible), requestUser.content)) return;
 		deps.appendFailedRequest?.({
 			kind: FAILED_REQUEST_KIND,
-			entryId: entry.id,
-			content: structuredClone(requestUser.content),
+			entryId: latestModelVisible.id,
+			...(diagnostics ? { diagnostics: structuredClone(diagnostics) } : {}),
 		});
 	};
 
@@ -582,7 +630,9 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		recovery?: "context-overflow",
 	): Promise<ResponseItem[] | undefined> => {
 		const sessionId = ctx.sessionManager.getSessionId();
-		requestInput = requestInputWithoutFailedRequest(requestInput, activeFailedRequest(rawGetBranch(ctx)));
+		const originalRequestInput = requestInput;
+		requestInput = requestInputWithoutFailedRequests(requestInput, activeFailedRequests(rawGetBranch(ctx)));
+		const requestInputWasSanitized = requestInput !== originalRequestInput;
 		if (recovery === "context-overflow") {
 			return recoverRequestAfterContextOverflow(model, ctx, requestInput, basePayload, ctx.signal);
 		}
@@ -654,7 +704,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				systemPromptInput,
 			);
 		} catch (error) {
-			if (!pending && checkpoint.status !== "valid") return undefined;
+			if (!pending && checkpoint.status !== "valid") return requestInputWasSanitized ? requestInput : undefined;
 			const compactionInput = withoutLastUser(requestInput!);
 			const createCheckpointFor = (selectedModel: Model<any>) => deps.createCheckpoint({
 				ctx,
@@ -774,7 +824,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			branch = deps.getBranch(ctx);
 		}
 		const currentCheckpoint = findNativeCheckpoint(branch);
-		if (currentCheckpoint.status !== "valid") return undefined;
+		if (currentCheckpoint.status !== "valid") return requestInputWasSanitized ? requestInput : undefined;
 		const preservedUser = checkpointPreservedCurrentUser(branch, requestInput);
 		if (preservedUser) {
 			const preservedUserIndex = tail.findLastIndex((item) =>
@@ -803,7 +853,7 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		basePayload?: JsonObject,
 	): Promise<ResponseItem[]> => {
 		if (!isOpenAICodexModel(model)) return [];
-		requestInput = requestInputWithoutFailedRequest(requestInput, activeFailedRequest(rawGetBranch(ctx)));
+		requestInput = requestInputWithoutFailedRequests(requestInput, activeFailedRequests(rawGetBranch(ctx)));
 		const operationSignal = signal ?? ctx.signal;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const activeTransition = transitionBySession.get(sessionId);

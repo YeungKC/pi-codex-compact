@@ -19,7 +19,7 @@ const MAX_REMOTE_RETRIES = 2;
 const V2_COMPACTION_IDLE_TIMEOUT_MS = 300_000;
 export const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
-const FAIL_CLOSED_ERROR_PATTERN = /(?:malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?(?:violation|denied|failure|failed)|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failure|failed|denied|error)|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing)/i;
+const FAIL_CLOSED_ERROR_PATTERN = /(?:credential|policy|auth(?:entication|orization)?|access[_ -]?denied|malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?(?:violation|denied|failure|failed)|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failure|failed|denied|error)|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing|protocol[_ -]?(?:failure|error))/i;
 const NON_RETRYABLE_FALLBACK_ERROR_CODES = new Set([
 	"context_length_exceeded",
 	"context_window_exceeded",
@@ -58,12 +58,13 @@ const SSE_MODEL_FALLBACK_ERROR_CODES = new Set([
 	"context_length_exceeded",
 	"context_window_exceeded",
 	"invalid_prompt",
+	"model_not_found",
 	"server_overloaded",
 	"server_is_overloaded",
 	"server_overload",
 	"slow_down",
 ]);
-const USAGE_LIMIT_MESSAGE_PATTERN = /usage[_ -]?limit(?:[ _-]?(?:reached|exceeded|hit))?/i;
+const USAGE_LIMIT_MESSAGE_PATTERN = /(?:usage[_ -]?(?:limit|quota|reached|exhausted|exceeded)|quota(?:[_ -]?(?:reached|exhausted|exceeded|depleted|limit))?)/i;
 const RETRYABLE_COMPACTION_ERROR_PATTERN = /(?:server[_ -]?(?:error|(?:is[_ -]?)?overload(?:ed)?)|service[_ -]?unavailable|temporar(?:y|ily)[_ -]?unavailable|upstream|internal[_ -]?server|gateway|timeout|try[_ -]?again|connection[_ -]?(?:reset|closed)|rate[_ -]?limit|slow[_ -]?down)/i;
 
 export function isFailClosedCompactionError(message: string): boolean {
@@ -72,7 +73,7 @@ export function isFailClosedCompactionError(message: string): boolean {
 
 export function isContextWindowCompactionError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
-	if (isFailClosedCompactionError(message) || /invalid_prompt/i.test(message)) return false;
+	if (isFailClosedCompactionError(message) || USAGE_LIMIT_MESSAGE_PATTERN.test(message) || /invalid_prompt/i.test(message)) return false;
 	if (typeof error === "object" && error !== null && "contextOverflowRecovery" in error) {
 		return (error as { contextOverflowRecovery?: unknown }).contextOverflowRecovery === true;
 	}
@@ -85,10 +86,18 @@ export function isContextWindowCompactionError(error: unknown): boolean {
 export type JsonObject = Record<string, unknown>;
 export type ResponseItem = JsonObject & { type?: string };
 
+export type FailedRequestDiagnostics = {
+	phase: "before_provider_request";
+	code: string;
+	recoveryAttempted: boolean;
+};
+
 export type FailedRequestDetails = {
 	kind: typeof FAILED_REQUEST_KIND;
 	entryId: string;
-	content: unknown;
+	/** Legacy markers may contain this; new markers resolve it from the branch in memory. */
+	content?: unknown;
+	diagnostics?: FailedRequestDiagnostics;
 };
 
 export interface NativeCompactionDetails {
@@ -115,7 +124,6 @@ export type CheckpointLookup =
 export type RemoteCompactionResult = {
 	compactionItem: ResponseItem;
 	usage?: Usage;
-	turnState?: string;
 };
 
 export function isJsonObject(value: unknown): value is JsonObject {
@@ -131,26 +139,88 @@ export function modelKey(model: Pick<Model<any>, "provider" | "api" | "id">): st
 	return `${model.provider}:${model.api}:${model.id}`;
 }
 
+function isContentItem(value: unknown): boolean {
+	if (!isJsonObject(value) || typeof value.type !== "string") return false;
+	switch (value.type) {
+		case "input_text":
+		case "output_text":
+			return typeof value.text === "string";
+		case "input_image":
+			return typeof value.image_url === "string"
+				&& (value.detail === undefined || ["auto", "low", "high", "original"].includes(value.detail as string));
+		case "input_audio":
+			return typeof value.audio_url === "string";
+		default:
+			return false;
+	}
+}
+
+function isAgentMessageContent(value: unknown): boolean {
+	if (!isJsonObject(value) || typeof value.type !== "string") return false;
+	return value.type === "input_text"
+		? typeof value.text === "string"
+		: value.type === "encrypted_content" && typeof value.encrypted_content === "string";
+}
+
+function isReasoningSummary(value: unknown): boolean {
+	return isJsonObject(value) && value.type === "summary_text" && typeof value.text === "string";
+}
+
+function isReasoningContent(value: unknown): boolean {
+	return isJsonObject(value)
+		&& (value.type === "reasoning_text" || value.type === "text")
+		&& typeof value.text === "string";
+}
+
+function isToolOutputContent(value: unknown): boolean {
+	if (!isJsonObject(value) || typeof value.type !== "string") return false;
+	return value.type === "input_text"
+		? typeof value.text === "string"
+		: value.type === "input_image"
+			? typeof value.image_url === "string"
+				&& (value.detail === undefined || ["auto", "low", "high", "original"].includes(value.detail as string))
+			: value.type === "input_audio"
+				? typeof value.audio_url === "string"
+				: value.type === "encrypted_content" && typeof value.encrypted_content === "string";
+}
+
+function isToolOutput(value: unknown): boolean {
+	return typeof value === "string" || (Array.isArray(value) && value.every(isToolOutputContent));
+}
+
 function isResponseItem(value: unknown): value is ResponseItem {
 	if (!isJsonObject(value)) return false;
 	if (typeof value.type !== "string") {
-		return typeof value.role === "string" && (typeof value.content === "string" || Array.isArray(value.content));
+		return typeof value.role === "string"
+			&& (typeof value.content === "string" || (Array.isArray(value.content) && value.content.every(isContentItem)));
 	}
 	switch (value.type) {
+		case "additional_tools":
+			return typeof value.role === "string" && Array.isArray(value.tools) && value.tools.every(isJsonObject);
 		case "message":
-			return typeof value.role === "string" && (typeof value.content === "string" || Array.isArray(value.content));
+			return typeof value.role === "string"
+				&& (typeof value.content === "string" || (Array.isArray(value.content) && value.content.every(isContentItem)));
 		case "agent_message":
 			return Array.isArray(value.content)
-				&& ((typeof value.author === "string" && typeof value.recipient === "string") || typeof value.role === "string");
+				&& value.content.every(isAgentMessageContent)
+				&& typeof value.author === "string"
+				&& typeof value.recipient === "string";
 		case "function_call":
-			return typeof value.call_id === "string" && typeof value.name === "string" && typeof value.arguments === "string";
+			return typeof value.call_id === "string"
+				&& typeof value.name === "string"
+				&& typeof value.arguments === "string"
+				&& (value.encrypted_function_args === undefined
+					|| (Array.isArray(value.encrypted_function_args) && value.encrypted_function_args.every((item) => typeof item === "string")));
 		case "function_call_output":
 		case "custom_tool_call_output":
-			return typeof value.call_id === "string" && Object.hasOwn(value, "output");
+			return typeof value.call_id === "string" && isToolOutput(value.output);
 		case "custom_tool_call":
 			return typeof value.call_id === "string" && typeof value.name === "string" && typeof value.input === "string";
 		case "reasoning":
-			return typeof value.encrypted_content === "string" || Array.isArray(value.summary) || Array.isArray(value.content);
+			return (value.encrypted_content === undefined || typeof value.encrypted_content === "string")
+				&& (value.summary === undefined || (Array.isArray(value.summary) && value.summary.every(isReasoningSummary)))
+				&& (value.content === undefined || (Array.isArray(value.content) && value.content.every(isReasoningContent)))
+				&& (value.encrypted_content !== undefined || value.summary !== undefined || value.content !== undefined);
 		case "compaction":
 		case "context_compaction":
 			return typeof value.encrypted_content === "string";
@@ -160,7 +230,8 @@ function isResponseItem(value: unknown): value is ResponseItem {
 			return (value.call_id === undefined || typeof value.call_id === "string")
 				&& typeof value.status === "string"
 				&& typeof value.execution === "string"
-				&& Array.isArray(value.tools);
+				&& Array.isArray(value.tools)
+				&& value.tools.every(isJsonObject);
 		default:
 			return false;
 	}
@@ -339,21 +410,37 @@ function toolResultOutput(message: JsonObject, model: Model<any>): unknown {
 	];
 }
 
-function responseTool(tool: ToolInfo, deferLoading = false): JsonObject {
+function responseTool(tool: ToolInfo, deferLoading = false, supportsStrictMode = true): JsonObject {
 	return {
 		type: "function",
 		name: tool.name,
 		description: tool.description,
 		parameters: tool.parameters as unknown,
-		strict: null,
+		...(supportsStrictMode ? { strict: null } : {}),
 		...(deferLoading ? { defer_loading: true } : {}),
 	};
 }
 
-function messagesToResponseItems(model: Model<any>, messages: Message[], tools: ToolInfo[]): ResponseItem[] {
+function messagesToResponseItems(
+	model: Model<any>,
+	messages: Message[],
+	tools: ToolInfo[],
+	loadedToolNames = new Set<string>(),
+): ResponseItem[] {
 	const items: ResponseItem[] = [];
 	const toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
+	const compat = model.compat as { supportsAdditionalTools?: boolean; supportsToolSearch?: boolean; supportsStrictMode?: boolean } | undefined;
+	const supportsAdditionalTools = compat?.supportsAdditionalTools === true;
+	const supportsToolSearch = compat?.supportsToolSearch === true;
+	const supportsStrictMode = compat?.supportsStrictMode !== false;
 	const pendingToolCalls = new Map<string, string>();
+	const usedToolNames = new Set<string>();
+	for (const message of messages as unknown as JsonObject[]) {
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		for (const block of message.content) {
+			if (isJsonObject(block) && block.type === "toolCall" && typeof block.name === "string") usedToolNames.add(block.name);
+		}
+	}
 	const flushOrphanedToolCalls = () => {
 		for (const callId of pendingToolCalls.values()) {
 			items.push({ type: "function_call_output", call_id: callId, output: "No result provided" });
@@ -439,10 +526,22 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 			pendingToolCalls.delete(message.toolCallId);
 			items.push({ type: "function_call_output", call_id: callId, output: toolResultOutput(message, model) });
 
-			const addedTools = Array.isArray(message.addedToolNames)
-				? message.addedToolNames.flatMap((name) => typeof name === "string" && toolsByName.has(name) ? [toolsByName.get(name)!] : [])
+			const addedTools = (supportsAdditionalTools || supportsToolSearch) && Array.isArray(message.addedToolNames)
+				? message.addedToolNames.flatMap((name) => {
+					if (typeof name !== "string" || usedToolNames.has(name) || loadedToolNames.has(name)) return [];
+					const tool = toolsByName.get(name);
+					if (!tool) return [];
+					loadedToolNames.add(name);
+					return [tool];
+				})
 				: [];
-			if (addedTools.length > 0) {
+			if (addedTools.length > 0 && supportsAdditionalTools) {
+				items.push({
+					type: "additional_tools",
+					role: "developer",
+					tools: addedTools.map((tool) => responseTool(tool, false, supportsStrictMode)),
+				});
+			} else if (addedTools.length > 0 && supportsToolSearch) {
 				const searchCallId = `pi_tool_load_${piShortHash(`${message.toolCallId}:${addedTools.map((tool) => tool.name).join(",")}`)}`;
 				items.push({
 					type: "tool_search_call",
@@ -456,7 +555,7 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 					call_id: searchCallId,
 					execution: "client",
 					status: "completed",
-					tools: addedTools.map((tool) => responseTool(tool, true)),
+					tools: addedTools.map((tool) => responseTool(tool, true, supportsStrictMode)),
 				});
 			}
 		}
@@ -468,11 +567,28 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 	return items;
 }
 
-function entriesToResponseItems(model: Model<any>, entries: SessionEntry[], tools: ToolInfo[], includeCompactionSummary = false): ResponseItem[] {
+export function loadedToolNamesFromItems(items: ResponseItem[]): Set<string> {
+	const loadedToolNames = new Set<string>();
+	for (const item of items) {
+		if ((item.type !== "additional_tools" && item.type !== "tool_search_output") || !Array.isArray(item.tools)) continue;
+		for (const tool of item.tools) {
+			if (isJsonObject(tool) && typeof tool.name === "string") loadedToolNames.add(tool.name);
+		}
+	}
+	return loadedToolNames;
+}
+
+function entriesToResponseItems(
+	model: Model<any>,
+	entries: SessionEntry[],
+	tools: ToolInfo[],
+	includeCompactionSummary = false,
+	loadedToolNames = new Set<string>(),
+): ResponseItem[] {
 	const messages = entries
 		.filter((entry) => includeCompactionSummary || entry.type !== "compaction")
 		.flatMap((entry) => sessionEntryToContextMessages(entry));
-	return messagesToResponseItems(model, convertToLlm(messages), tools);
+	return messagesToResponseItems(model, convertToLlm(messages), tools, loadedToolNames);
 }
 
 export function fullInputForBranch(params: {
@@ -547,11 +663,19 @@ export function effectiveInputForBranch(params: {
 		) {
 			throw new Error("The latest Codex compaction checkpoint requires model-transition compaction first.");
 		}
-		const tail = branch.slice(checkpoint.checkpoint.entryIndex + 1);
-		return [
+		const prefix = [
 			...checkpoint.checkpoint.details.replacementHistory.map((item) => structuredClone(item)),
 			...(checkpoint.checkpoint.details.preservedInput ?? []).map((item) => structuredClone(item)),
-			...entriesToResponseItems(params.model, tail, params.tools),
+		];
+		return [
+			...prefix,
+			...entriesToResponseItems(
+				params.model,
+				branch.slice(checkpoint.checkpoint.entryIndex + 1),
+				params.tools,
+				false,
+				loadedToolNamesFromItems(prefix),
+			),
 		];
 	}
 
@@ -625,12 +749,11 @@ export function approximateCompactionRequestTokens(params: {
 	input: ResponseItem[];
 	instructions: string;
 	tools?: unknown[];
-	includeTrigger: boolean;
 }): number {
 	return approximateResponseItemTokens(params.input) + approximateTokenCount({
 		instructions: params.instructions,
 		tools: params.tools,
-		...(params.includeTrigger ? { input: [{ type: "compaction_trigger" }] } : {}),
+		input: [{ type: "compaction_trigger" }],
 	});
 }
 
@@ -661,7 +784,7 @@ export function trimFunctionCallHistoryToFitContextWindow(
 	for (const group of retainedMessageGroups(result).reverse()) {
 		if (excess <= 0) break;
 		const rewritten = truncateFunctionOutput(group.source);
-		if (!rewritten) break;
+		if (!rewritten) continue;
 		const current = approximateTokens(group.source);
 		result[group.sourceIndex] = rewritten;
 		excess -= current - approximateTokens(rewritten);
@@ -846,7 +969,7 @@ export function latestRemoteCompactionSuffix(
 	const candidate = trimFunctionCallHistoryToFitContextWindow(source.slice(candidateStart), maxTokens, reservedTokens);
 	if (approximateResponseItemTokens(candidate) > budget) return [];
 	if (candidateStart === 0 && userStarts.length === 1 && JSON.stringify(candidate) === JSON.stringify(source)) return [];
-	if (candidateStart > 1 && (source[candidateStart - 1]?.type === "compaction" || source[candidateStart - 1]?.type === "context_compaction")) {
+	if (candidateStart > 0 && (source[candidateStart - 1]?.type === "compaction" || source[candidateStart - 1]?.type === "context_compaction")) {
 		const withCheckpoint = trimFunctionCallHistoryToFitContextWindow(source.slice(candidateStart - 1), maxTokens, reservedTokens);
 		if (approximateResponseItemTokens(withCheckpoint) <= budget) return withCheckpoint;
 	}
@@ -902,10 +1025,15 @@ export function buildReplacementHistory(
 	return [...retainRecentMessages(preCompactionInput), structuredClone(compactionItem)];
 }
 
-export function buildToolPayload(allTools: ToolInfo[], activeToolNames: string[]): unknown[] | undefined {
+export function buildToolPayload(
+	allTools: ToolInfo[],
+	activeToolNames: string[],
+	supportsStrictMode = true,
+	excludedToolNames?: ReadonlySet<string>,
+): unknown[] | undefined {
 	const active = new Set(activeToolNames);
-	const tools = allTools.filter((tool) => active.has(tool.name));
-	return tools.length > 0 ? tools.map((tool) => responseTool(tool)) : undefined;
+	const tools = allTools.filter((tool) => active.has(tool.name) && !excludedToolNames?.has(tool.name));
+	return tools.length > 0 ? tools.map((tool) => responseTool(tool, false, supportsStrictMode)) : undefined;
 }
 
 export function buildCompactionRequestBody(params: {
@@ -1054,10 +1182,6 @@ function markCompactionCode<T extends Error>(error: T, code: string): T {
 	return error;
 }
 
-export function isRetryableCompactionError(error: unknown): boolean {
-	return compactionRetry(error) === "explicit";
-}
-
 function shouldRetryCompaction(error: unknown): boolean {
 	const retry = compactionRetry(error);
 	return retry === "automatic" || retry === "explicit";
@@ -1065,6 +1189,64 @@ function shouldRetryCompaction(error: unknown): boolean {
 
 function normalizedErrorCode(code: string): string {
 	return code.trim().toLowerCase();
+}
+
+const CANONICAL_COMPACTION_ERROR_CODES = new Set([
+	...NON_RETRYABLE_FALLBACK_ERROR_CODES,
+	...RETRYABLE_COMPACTION_ERROR_CODES,
+	...SSE_MODEL_FALLBACK_ERROR_CODES,
+	"insufficient_quota",
+	"quota_exceeded",
+	"usage_not_included",
+	"invalid_api_key",
+	"authentication_error",
+	"unauthorized",
+	"forbidden",
+	"permission_denied",
+	"access_denied",
+	"auth_error",
+	"authorization_error",
+	"credential_error",
+	"expired_token",
+	"invalid_credential",
+	"invalid_token",
+	"token_expired",
+	"billing_error",
+	"billing_issue",
+	"billing_required",
+	"insufficient_funds",
+	"out_of_budget",
+	"policy_violation",
+	"misalignment_policy_violation",
+	"cyber_policy",
+	"invalid_image",
+	"invalid_image_request",
+	"content_filter",
+	"bio_policy",
+	"canceled",
+	"cancelled",
+	"aborted",
+	"connection_failed",
+	"response.failed",
+	"response.incomplete",
+]);
+
+export function compactionFailureClassification(error: unknown): string {
+	const code = compactionErrorCode(error);
+	if (code) {
+		const normalized = normalizedErrorCode(code);
+		if (CANONICAL_COMPACTION_ERROR_CODES.has(normalized)) return normalized;
+	}
+	if (typeof error === "object" && error !== null && "contextOverflowRecovery" in error) return "context_window_exceeded";
+	const message = error instanceof Error ? error.message : String(error);
+	const status = /\((\d{3})\):/.exec(message)?.[1];
+	if (status) return `http_${status}`;
+	if (/(?:auth|api[_ -]?key|token|credential)/i.test(message)) return "authentication";
+	if (/(?:policy|forbidden|permission|quota|usage[_ -]?limit|billing|out[_ -]?of[_ -]?budget|insufficient[_ -]?funds)/i.test(message)) return "policy_or_quota";
+	if (/(?:timeout|timed out)/i.test(message)) return "timeout";
+	if (/(?:network|websocket|connection|fetch)/i.test(message)) return "network";
+	if (/(?:context_length_exceeded|context_window_exceeded)/i.test(message)) return "context_window_exceeded";
+	return "compaction_failed";
 }
 
 function retryDelayFromMessage(message: string): number | undefined {
@@ -1087,17 +1269,18 @@ function isKnownCompactionErrorCode(code: string): boolean {
 		|| RETRYABLE_COMPACTION_ERROR_CODES.has(code);
 }
 
-function classifySseCompactionError(code: string, message: string, includeCode = false): Error {
-	const detail = includeCode && code
+function classifySseCompactionError(code: string, message: string): Error {
+	const detail = code
 		? `OpenAI Codex compaction failed (${code}): ${message}`
-		: message || `OpenAI Codex compaction failed (${code}).`;
+		: message || "OpenAI Codex compaction failed.";
 	const normalizedCode = normalizedErrorCode(code);
 	const machineDetails = `${normalizedCode} ${message}`;
+	const usageLimitMessage = USAGE_LIMIT_MESSAGE_PATTERN.test(machineDetails);
 	const tag = <T extends Error>(error: T): T => markCompactionCode(error, normalizedCode);
 	if (isFailClosedCompactionError(machineDetails)) {
 		return tag(markFallbackEligibility(markCompactionRetry(new Error(detail), "none"), false));
 	}
-	if (SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode) && !RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)) {
+	if (!usageLimitMessage && SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode) && !RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)) {
 		return tag(markFallbackEligibility(markCompactionRetry(withRetryDelay(new Error(detail), message), "none"), true));
 	}
 	if (!normalizedCode || !isKnownCompactionErrorCode(normalizedCode)) {
@@ -1109,7 +1292,7 @@ function classifySseCompactionError(code: string, message: string, includeCode =
 	) {
 		return tag(markFallbackEligibility(
 			markCompactionRetry(withRetryDelay(new Error(detail), message), "explicit"),
-			SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode),
+			!usageLimitMessage && SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode),
 		));
 	}
 	return tag(markFallbackEligibility(markCompactionRetry(withRetryDelay(new Error(detail), message), "none"), false));
@@ -1134,12 +1317,16 @@ function classifyHttpCompactionError(
 ): { error: Error & { retryWithCurrentModel: boolean }; retryable: boolean } {
 	const code = normalizedErrorCode(errorCodeFromResponseBody(body));
 	const machineDetails = `${code} ${body}`;
-	const knownMessage = /(?:context|invalid request|model|not found|overloaded|rate[_ -]?limit|usage[_ -]?limit)/i.test(body)
+	const knownMessage = /(?:context|invalid request|model|not found|overloaded|rate[_ -]?limit)/i.test(body)
+		|| USAGE_LIMIT_MESSAGE_PATTERN.test(body)
 		|| isFailClosedCompactionError(machineDetails)
 		|| RETRYABLE_COMPACTION_ERROR_PATTERN.test(body);
 	const malformedClientError = status === 400 && !code && !knownMessage;
 	const unknownCode = Boolean(code) && !isKnownCompactionErrorCode(code) && !isFailClosedCompactionError(machineDetails);
-	const fallback = !malformedClientError && (unknownCode || canFallbackForStatus(status, body));
+	const fallback = !malformedClientError
+		&& !unknownCode
+		&& !USAGE_LIMIT_MESSAGE_PATTERN.test(machineDetails)
+		&& canFallbackForStatus(status, body);
 	const terminal = malformedClientError
 		|| (unknownCode && !isRetryableStatus(status))
 		|| isFailClosedCompactionError(machineDetails)
@@ -1169,7 +1356,7 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 async function withCompactionTimeout<T>(
-	operation: Promise<T> | (() => Promise<T>),
+	operation: () => Promise<T>,
 	timeoutMs: number,
 	message: string,
 	onTimeout?: (error: Error) => void,
@@ -1186,7 +1373,7 @@ async function withCompactionTimeout<T>(
 		}, timeoutMs);
 	});
 	try {
-		return await Promise.race([typeof operation === "function" ? operation() : operation, timeout]);
+		return await Promise.race([operation(), timeout]);
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
 	}
@@ -1212,7 +1399,6 @@ async function parseSseResponse(
 	const decoder = new TextDecoder();
 	let buffer = "";
 	let completed = false;
-	let stopReading = false;
 	let usage: unknown;
 	const compactionItems: ResponseItem[] = [];
 	const onAbort = () => {
@@ -1232,9 +1418,26 @@ async function parseSseResponse(
 		try {
 			event = JSON.parse(data);
 		} catch {
-			return;
+			throw markFallbackEligibility(
+				markCompactionRetry(new Error("OpenAI Codex returned malformed compaction SSE data."), "none"),
+				false,
+			);
 		}
-		if (!isJsonObject(event)) return;
+		if (!isJsonObject(event)) {
+			throw markFallbackEligibility(
+				markCompactionRetry(new Error("OpenAI Codex returned a non-object compaction SSE data frame."), "none"),
+				false,
+			);
+		}
+		if (event.type === "response.output_item.done") {
+			if (!isResponseItem(event.item)) {
+				throw markFallbackEligibility(
+					markCompactionRetry(new Error("OpenAI Codex returned a malformed response.output_item.done item."), "none"),
+					false,
+				);
+			}
+			if (event.item.type === "compaction") compactionItems.push(event.item);
+		}
 		if (event.type === "error") {
 			const nested = isJsonObject(event.error) ? event.error : {};
 			const code = typeof event.code === "string"
@@ -1253,7 +1456,7 @@ async function parseSseResponse(
 					false,
 				);
 			}
-			throw classifySseCompactionError(code, message, true);
+			throw classifySseCompactionError(code, message);
 		}
 		if (event.type === "response.failed") {
 			const response = isJsonObject(event.response) ? event.response : {};
@@ -1266,7 +1469,7 @@ async function parseSseResponse(
 			const message = typeof failure.message === "string"
 				? failure.message
 				: "OpenAI Codex compaction ended with response.failed.";
-			throw classifySseCompactionError(code, message, true);
+			throw classifySseCompactionError(code, message);
 		}
 		if (event.type === "response.incomplete") {
 			const response = isJsonObject(event.response) ? event.response : {};
@@ -1303,20 +1506,16 @@ async function parseSseResponse(
 				: typeof nested.message === "string"
 					? nested.message
 					: "";
-			throw classifySseCompactionError(code, message, true);
-		}
-		if (event.type === "response.output_item.done" && isResponseItem(event.item) && event.item.type === "compaction") {
-			compactionItems.push(event.item);
+			throw classifySseCompactionError(code, message);
 		}
 		if (event.type === "response.completed") {
 			completed = true;
-			stopReading = true;
 			usage = isJsonObject(event.response) ? event.response.usage : undefined;
 		}
 	};
 
 	try {
-		while (!stopReading) {
+		while (!completed) {
 			const { done, value } = await withCompactionTimeout(
 				() => reader.read(),
 				idleTimeoutMs,
@@ -1325,14 +1524,14 @@ async function parseSseResponse(
 			buffer += decoder.decode(value, { stream: !done });
 			buffer = buffer.replace(/\r\n/g, "\n");
 			let boundary = buffer.indexOf("\n\n");
-			while (!stopReading && boundary >= 0) {
+			while (!completed && boundary >= 0) {
 				processBlock(buffer.slice(0, boundary));
 				buffer = buffer.slice(boundary + 2);
 				boundary = buffer.indexOf("\n\n");
 			}
 			if (done) break;
 		}
-		if (!stopReading && buffer.trim()) processBlock(buffer);
+		if (!completed && buffer.trim()) processBlock(buffer);
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
 		try {
@@ -1395,9 +1594,11 @@ async function runRemoteCompaction<T>(params: {
 	prefix: string;
 	idleTimeoutMs: number;
 	parse: (response: Response, idleTimeoutMs: number) => Promise<T>;
+	onTurnState?: (turnState: string) => void;
 }): Promise<T> {
 	const fetchImpl = params.fetchImpl ?? fetch;
 	let lastError: unknown;
+	let turnStateCaptured = params.headers.has("x-codex-turn-state");
 	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
 		const attemptController = new AbortController();
 		const relayAbort = () => attemptController.abort(params.signal?.reason);
@@ -1416,6 +1617,12 @@ async function runRemoteCompaction<T>(params: {
 					"OpenAI Codex compaction request timed out.",
 					(error) => attemptController.abort(error),
 				);
+				const responseTurnState = response.headers.get("x-codex-turn-state");
+				if (responseTurnState && !turnStateCaptured) {
+					params.headers.set("x-codex-turn-state", responseTurnState);
+					params.onTurnState?.(responseTurnState);
+					turnStateCaptured = true;
+				}
 				if (!response.ok) {
 					const body = await response.text().catch(() => "");
 					const classified = classifyHttpCompactionError(
@@ -1456,6 +1663,7 @@ export function callRemoteCompaction(params: {
 	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
+	onTurnState?: (turnState: string) => void;
 }): Promise<RemoteCompactionResult> {
 	return runRemoteCompaction({
 		...params,
@@ -1466,7 +1674,6 @@ export function callRemoteCompaction(params: {
 			return {
 				compactionItem: parsed.item,
 				usage: usageFromResponse(params.model, parsed.usage),
-				...(response.headers.get("x-codex-turn-state") ? { turnState: response.headers.get("x-codex-turn-state")! } : {}),
 			};
 		},
 	});

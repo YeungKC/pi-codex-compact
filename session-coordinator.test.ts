@@ -100,19 +100,205 @@ function createCoordinator(
 }
 
 describe("Codex session coordinator", () => {
-	test("does not replay a failed user before a later request", async () => {
+	test("does not persist failed request input while filtering its retry", async () => {
 		const currentModel = model("new");
-		const branch = [customEntry(details(modelKey(currentModel))), userEntry("failed", "failed-user")];
+		const secret = "sk-live-user-input-secret";
+		const branch = [customEntry(details(modelKey(currentModel))), userEntry(secret, "failed-user")];
 		const coordinator = createCoordinator(branch);
 		const ctx = context([currentModel]);
 		coordinator.recordFailedRequest(ctx, [
 			{ type: "compaction", encrypted_content: "opaque" },
-			userInput("failed"),
+			userInput(secret),
+		]);
+
+		const marker = branch.find((entry) => entry.type === "custom" && entry.customType === FAILED_REQUEST_KIND);
+		expect(marker).toMatchObject({ data: { kind: FAILED_REQUEST_KIND, entryId: "failed-user" } });
+		expect(marker).not.toHaveProperty("data.content");
+		expect(JSON.stringify(marker)).not.toContain(secret);
+
+		await expect(coordinator.prepareRequest(currentModel, ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput(secret),
+			userInput("new request"),
+		])).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("new request"),
+		]);
+	});
+
+	test("does not persist a failed marker for a tool/assistant continuation", () => {
+		const currentModel = model("new");
+		const branch = [
+			userEntry("prompt", "user"),
+			{
+				id: "assistant",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: currentModel.provider,
+					api: currentModel.api,
+					model: currentModel.id,
+					content: [{ type: "text", text: "answer" }],
+				},
+			} as never,
+		];
+		const coordinator = createCoordinator(branch);
+		coordinator.recordFailedRequest(context([currentModel]), [
+			userInput("prompt"),
+			{ type: "function_call_output", call_id: "call", output: "tool result" },
+			{ role: "assistant", content: [{ type: "output_text", text: "answer" }] },
+		]);
+
+		expect(branch.some((entry) => entry.type === "custom" && entry.customType === FAILED_REQUEST_KIND)).toBe(false);
+	});
+
+	test("filters all unresolved valid markers after the last successful assistant", async () => {
+		const currentModel = model("new");
+		const branch = [
+			userEntry("older", "older-user"),
+			{
+				id: "assistant",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: { role: "assistant", provider: currentModel.provider, api: currentModel.api, model: currentModel.id, stopReason: "stop", content: [{ type: "text", text: "answer" }] },
+			} as never,
+			userEntry("failed one", "failed-one"),
+			customEntry({ kind: FAILED_REQUEST_KIND, entryId: "failed-one" }, "marker-one", FAILED_REQUEST_KIND),
+			userEntry("failed two", "failed-two"),
+			customEntry({ kind: FAILED_REQUEST_KIND, entryId: "failed-two" }, "marker-two", FAILED_REQUEST_KIND),
+		];
+		const coordinator = createCoordinator(branch);
+		const input = await coordinator.prepareCompaction(currentModel, context([currentModel]));
+
+		expect(input.filter((item) => item.role === "user")).toEqual([userInput("older")]);
+	});
+
+	test("does not let a malformed later marker mask an earlier valid marker", async () => {
+		const currentModel = model("new");
+		const branch = [
+			userEntry("failed", "failed-user"),
+			customEntry({ kind: FAILED_REQUEST_KIND, entryId: "failed-user" }, "valid-marker", FAILED_REQUEST_KIND),
+			customEntry({ kind: FAILED_REQUEST_KIND, entryId: 42 }, "malformed-marker", FAILED_REQUEST_KIND),
+		];
+		const coordinator = createCoordinator(branch);
+		const input = await coordinator.prepareCompaction(currentModel, context([currentModel]));
+
+		expect(input.filter((item) => item.role === "user")).toEqual([]);
+	});
+
+	test("ignores a marker that points before the last successful assistant", async () => {
+		const currentModel = model("new");
+		const branch: SessionEntry[] = [
+			customEntry(details(modelKey(currentModel))),
+			userEntry("U", "user"),
+			{
+				id: "assistant",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: currentModel.provider,
+					api: currentModel.api,
+					model: currentModel.id,
+					stopReason: "stop",
+					content: [{ type: "text", text: "answer" }],
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					timestamp: Date.now(),
+				},
+			},
+			customEntry({ kind: FAILED_REQUEST_KIND, entryId: "user", content: [
+				{ type: "input_text", text: "U" },
+			] }, "marker", FAILED_REQUEST_KIND),
+			customEntry({ kind: FAILED_REQUEST_KIND, entryId: "future-user", content: [
+				{ type: "input_text", text: "future" },
+			] }, "future-marker", FAILED_REQUEST_KIND),
+			userEntry("future", "future-user"),
+		];
+		const coordinator = createCoordinator(branch);
+		const input = await coordinator.prepareCompaction(currentModel, context([currentModel]));
+
+		expect(input.filter((item) => item.role === "user")).toEqual([userInput("U"), userInput("future")]);
+		expect(input.find((item) => item.role === "assistant")).toMatchObject({ role: "assistant" });
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), input)).resolves.toEqual(input);
+	});
+
+	test.each([
+		["missing", { entryId: "post-user", content: [{ type: "input_text", text: "post" }] }],
+		["wrong", { kind: "other", entryId: "post-user", content: [{ type: "input_text", text: "post" }] }],
+	])("ignores a marker with %s data.kind", async (_name, markerData) => {
+		const currentModel = model("new");
+		const branch: SessionEntry[] = [
+			{
+				id: "assistant",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: currentModel.provider,
+					api: currentModel.api,
+					model: currentModel.id,
+					stopReason: "stop",
+					content: [{ type: "text", text: "answer" }],
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					timestamp: Date.now(),
+				},
+			},
+			userEntry("post", "post-user"),
+			customEntry(markerData, "marker", FAILED_REQUEST_KIND),
+		];
+		const coordinator = createCoordinator(branch);
+		const input = await coordinator.prepareCompaction(currentModel, context([currentModel]));
+
+		expect(input.map((item) => item.role)).toEqual(["assistant", "user"]);
+		expect(input.at(-1)).toEqual(userInput("post"));
+	});
+
+	test("keeps an older equal-content user when a retry reuses its original user", async () => {
+		const currentModel = model("new");
+		const branch = [
+			customEntry(details(modelKey(currentModel))),
+			userEntry("same", "older-user"),
+			userEntry("same", "failed-user"),
+		];
+		const coordinator = createCoordinator(branch);
+		const ctx = context([currentModel]);
+		coordinator.recordFailedRequest(ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
 		]);
 
 		await expect(coordinator.prepareRequest(currentModel, ctx, [
 			{ type: "compaction", encrypted_content: "opaque" },
-			userInput("failed"),
+			userInput("same"),
+			userInput("same"),
+		])).resolves.toEqual([
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("same"),
+			userInput("same"),
+		]);
+	});
+
+	test("keeps filtering legacy failed markers that still contain content", async () => {
+		const currentModel = model("new");
+		const branch = [
+			customEntry(details(modelKey(currentModel))),
+			customEntry({
+				kind: FAILED_REQUEST_KIND,
+				entryId: "missing-user",
+				content: [{ type: "input_text", text: "legacy failed" }],
+			}, "failed-request", FAILED_REQUEST_KIND),
+		];
+		const coordinator = createCoordinator(branch);
+		const ctx = context([currentModel]);
+
+		await expect(coordinator.prepareRequest(currentModel, ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("legacy failed"),
 			userInput("new request"),
 		])).resolves.toEqual([
 			{ type: "compaction", encrypted_content: "opaque" },
@@ -261,6 +447,39 @@ describe("Codex session coordinator", () => {
 			userInput("hello"),
 		]);
 		expect(compactedWith).toEqual([modelKey(oldModel), modelKey(currentModel)]);
+	});
+
+	test("keeps unknown credential transition failures out of current-model fallback", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		let calls = 0;
+		const coordinator = createCoordinator([], async () => {
+			calls++;
+			throw new Error("OpenAI Codex compaction failed (503): credential_backend_failure");
+		});
+
+		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")])).rejects.toThrow("credential_backend_failure");
+		expect(calls).toBe(1);
+	});
+
+	test("does not fall back for an unknown HTTP protocol transition failure", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		let calls = 0;
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			calls++;
+			if (selectedModel === oldModel) {
+				const error = new Error("OpenAI Codex compaction failed (500): future_protocol_code") as Error & { retryWithCurrentModel: boolean };
+				Object.defineProperty(error, "retryWithCurrentModel", { value: false });
+				throw error;
+			}
+			return details(modelKey(selectedModel), "unexpected-fallback");
+		});
+
+		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")])).rejects.toThrow("future_protocol_code");
+		expect(calls).toBe(1);
 	});
 
 	test("does not permanently block a transition after a non-fallback failure", async () => {

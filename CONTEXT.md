@@ -35,7 +35,7 @@ An original history item that remains separately visible in replacement history 
 Whether a model or configuration can continue from an existing native compaction item. Codex represents this with optional `comp_hash`; an absent hash is not evidence of incompatibility.
 
 **Context overflow recovery**:
-A lossy remote-only continuation for `context_length_exceeded`: the newest complete history suffix is remote-compacted, the current request is kept, and older history remains in the event log but is no longer model-visible. The bounded recovery runs automatically once because reducing the visible history is the only same-model continuation; if no complete suffix fits, the UI offers starting a new session or cancelling. It never bypasses authentication, policy, malformed-checkpoint, or protocol protection.
+A lossy remote-only continuation for `context_length_exceeded`: the newest complete history suffix is remote-compacted, the current request is kept, and older history remains in the event log but is no longer model-visible. The bounded recovery runs automatically once because reducing the visible history is the only same-model continuation. If it fails, the extension emits a safe Failure notice and cancels only the current operation; the session remains usable for a later manual retry. It never bypasses authentication, policy, malformed-checkpoint, or protocol protection.
 
 **Model-transition compaction**:
 Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
@@ -47,7 +47,7 @@ A native compaction entry from an older protocol or extension version. The exten
 A native compaction entry that fails the current V2 schema. It is ignored and the full branch is replayed; a later remote compaction can write a valid replacement instead of permanently blocking the session.
 
 **Failed request marker**:
-A non-model-visible session entry that identifies a user input blocked before provider execution. The next request excludes that stale entry from history while keeping a retry as the current input.
+A non-model-visible session entry that identifies a user input blocked before provider execution. The next request excludes that stale entry from history while keeping a retry as the current input. New markers persist only the referenced entry ID and safe diagnostic metadata (`phase`, canonical machine `code`, and `recoveryAttempted`); they contain neither raw request input nor raw error text. Older markers may contain legacy content, which is ignored when the referenced branch entry is available.
 
 **Remote-only scope**:
 The parity target covers Codex remote compaction, including manual, pre-turn, mid-turn, and model-transition request boundaries. Pi local text summaries and Codex local or fresh-context reset paths are outside this context. Configured auto-compaction limits are capped at Codex's 90% context-window limit.

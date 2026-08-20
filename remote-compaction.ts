@@ -7,6 +7,7 @@ import {
 	buildReplacementHistory,
 	buildToolPayload,
 	callRemoteCompaction,
+	loadedToolNamesFromItems,
 	modelKey,
 	approximateCompactionRequestTokens,
 	markContextOverflowRecovery,
@@ -72,7 +73,13 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 	const sessionId = params.ctx.sessionManager.getSessionId();
 	const baseUrl = auth.baseUrl ?? params.model.baseUrl;
 	const basePayload = compactionBasePayload(params);
-	const generatedTools = buildToolPayload(params.allTools, params.activeToolNames);
+	const supportsStrictMode = (params.model.compat as { supportsStrictMode?: boolean } | undefined)?.supportsStrictMode !== false;
+	const generatedTools = buildToolPayload(
+		params.allTools,
+		params.activeToolNames,
+		supportsStrictMode,
+		loadedToolNamesFromItems(params.input),
+	);
 	const tools = Array.isArray(basePayload.tools) ? basePayload.tools : generatedTools;
 	const instructions = typeof basePayload.instructions === "string"
 		? basePayload.instructions
@@ -82,7 +89,6 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		input: [],
 		instructions,
 		tools,
-		includeTrigger: true,
 	});
 	const input = trimFunctionCallHistoryToFitContextWindow(
 		params.input,
@@ -93,7 +99,6 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		input,
 		instructions,
 		tools,
-		includeTrigger: true,
 	}) > params.model.contextWindow) {
 		throw markContextOverflowRecovery(new Error(
 			`OpenAI Codex compaction input exceeds this model's ${params.model.contextWindow} token context window after tool-output trimming.`,
@@ -119,8 +124,8 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		body,
 		model: params.model,
 		signal: params.signal,
+		onTurnState: params.onTurnState,
 	});
-	if (remote.turnState) params.onTurnState?.(remote.turnState);
 	return {
 		details: {
 			kind: NATIVE_COMPACTION_KIND,

@@ -13,7 +13,7 @@ import {
 	mergeFeatureHeader,
 	approximateResponseItemTokens,
 	isContextWindowCompactionError,
-	isRetryableCompactionError,
+	compactionFailureClassification,
 	approximateTokenCount,
 	buildToolPayload,
 	stripInputFromPayload,
@@ -23,81 +23,63 @@ import {
 } from "./native-compaction.ts";
 
 const LOCAL_MARKER = "OpenAI Codex native compaction checkpoint.";
+const AUTHENTICATION_FAILURE_CODE_PATTERN = /^(?:authentication|authentication_error|auth_error|authorization_error|credential_error|invalid_api_key|invalid_credential|invalid_token|expired_token|token_expired|unauthorized|forbidden|permission_denied|access_denied)$/;
+const POLICY_OR_QUOTA_FAILURE_CODE_PATTERN = /^(?:policy_or_quota|policy_violation|insufficient_quota|quota_exceeded|usage_limit_(?:reached|exceeded)|usage_not_included|billing_(?:error|issue|required)|insufficient_funds|out_of_budget)$/;
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-type BlockedAction = "retry" | "new-session" | "cancel";
-type CompactionFailureAction = "context-overflow" | BlockedAction;
-type BlockedRequestContext = {
+type FailurePhase = "before_provider_request" | "session_before_compact";
+type FailureOutcome = "request_aborted" | "compaction_cancelled";
+type FailureNoticeContext = {
 	hasUI: boolean;
-	signal?: AbortSignal;
 	ui: {
-		select(title: string, options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined>;
 		notify(message: string, type?: "info" | "warning" | "error"): void;
 	};
 };
 
-async function chooseBlockedAction(
-	ctx: BlockedRequestContext,
-	error: unknown,
-	signal?: AbortSignal,
-): Promise<BlockedAction> {
-	const message = errorMessage(error);
-	const canRetry = isRetryableCompactionError(error);
-	if (!ctx.hasUI) {
-		console.warn(`OpenAI Codex request blocked: ${message}`);
-		return "cancel";
+function failureNextStep(code: string, recoveryAttempted: boolean): string {
+	if (code === "authentication" || AUTHENTICATION_FAILURE_CODE_PATTERN.test(code)) {
+		return "check Codex authentication and retry manually";
 	}
-	const options = canRetry
-		? ["Retry", "Start a new session", "Cancel"]
-		: ["Start a new session", "Cancel"];
-	let choice: string | undefined;
-	try {
-		choice = await ctx.ui.select("OpenAI Codex request blocked", options, { signal: signal ?? ctx.signal });
-	} catch {
-		return "cancel";
+	if (code === "policy_or_quota" || POLICY_OR_QUOTA_FAILURE_CODE_PATTERN.test(code)) {
+		return "check Codex plan, permissions, quota, and billing before retrying manually";
 	}
-	if (choice === "Retry") return "retry";
-	if (choice === "Start a new session") return "new-session";
-	return "cancel";
+	if (code === "context_window_exceeded" || recoveryAttempted) return "shorten the request or start a new session";
+	if (code === "network" || code === "timeout") return "check the connection and retry manually";
+	return "retry manually or start a new session";
 }
 
-async function chooseCompactionFailureAction(
-	ctx: BlockedRequestContext,
+function reportCompactionFailure(
+	ctx: FailureNoticeContext,
+	model: { id?: unknown } | undefined,
 	error: unknown,
-	recovery: "context-overflow" | undefined,
-	signal?: AbortSignal,
-): Promise<CompactionFailureAction> {
-	if (recovery === undefined && isContextWindowCompactionError(error)) return "context-overflow";
-	return chooseBlockedAction(ctx, error, signal);
-}
-
-function notifyBlocked(
-	ctx: BlockedRequestContext,
-	error: unknown,
-	action: BlockedAction = "cancel",
-): void {
-	if (!ctx.hasUI) return;
-	const message = errorMessage(error);
-	const nextStep = action === "new-session" ? " Start a new session to continue." : "";
-	ctx.ui.notify(`OpenAI Codex request blocked: ${message}.${nextStep}`, "error");
+	phase: FailurePhase,
+	recoveryAttempted: boolean,
+	outcome: FailureOutcome,
+): string {
+	const code = compactionFailureClassification(error);
+	const modelId = typeof model?.id === "string" && /^[a-zA-Z0-9_.:-]{1,64}$/.test(model.id) ? model.id : "unknown";
+	const notice = `OpenAI Codex failure: phase=${phase}; code=${code}; model=${modelId}; recoveryAttempted=${recoveryAttempted}; outcome=${outcome}; next=${failureNextStep(code, recoveryAttempted)}.`;
+	if (ctx.hasUI) ctx.ui.notify(notice, "error");
+	else console.error(notice);
+	return code;
 }
 
 export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	const basePayloadBySession = new Map<string, JsonObject>();
 	const turnStateBySession = new Map<string, string>();
+	let lifecycleGeneration = 0;
 	const rememberTurnState = (sessionId: string, state: string): void => {
 		if (!turnStateBySession.has(sessionId)) turnStateBySession.set(sessionId, state);
 	};
 	const createCheckpoint = (params: Pick<NativeCheckpointRequest, "ctx" | "model" | "input" | "basePayload" | "signal">) => {
+		const lifecycleGenerationAtStart = lifecycleGeneration;
 		const sessionId = params.ctx.sessionManager.getSessionId();
 		return createNativeCheckpoint({
 			...params,
 			basePayload: params.basePayload ?? basePayloadBySession.get(sessionId),
 			turnState: turnStateBySession.get(sessionId),
-			onTurnState: (state) => rememberTurnState(sessionId, state),
+			onTurnState: (state) => {
+				if (lifecycleGeneration === lifecycleGenerationAtStart) rememberTurnState(sessionId, state);
+			},
 			allTools: pi.getAllTools(),
 			activeToolNames: pi.getActiveTools(),
 		});
@@ -112,9 +94,10 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		shouldAutoCompact: ({ ctx, model, input, reason }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			// Pi exposes assistant usage but not Codex's window counters; estimate the stable prefix.
+			const supportsStrictMode = (model.compat as { supportsStrictMode?: boolean } | undefined)?.supportsStrictMode !== false;
 			const estimatedStablePrefixTokens = approximateTokenCount({
 				instructions: ctx.getSystemPrompt(),
-				tools: buildToolPayload(pi.getAllTools(), pi.getActiveTools()),
+				tools: buildToolPayload(pi.getAllTools(), pi.getActiveTools(), supportsStrictMode),
 			});
 			const activeContextTokens = approximateResponseItemTokens(input) + estimatedStablePrefixTokens;
 			const prefillTokens = config.autoCompactScope === "bodyAfterPrefix"
@@ -138,6 +121,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	});
 
 	const clearTransient = () => {
+		lifecycleGeneration++;
 		coordinator.clear();
 		basePayloadBySession.clear();
 		turnStateBySession.clear();
@@ -209,18 +193,25 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				return payload;
 			} catch (error) {
 				if (ctx.signal?.aborted) return undefined;
-				const action = await chooseCompactionFailureAction(ctx, error, recovery, ctx.signal);
-				if (action === "context-overflow") {
+				if (recovery === undefined && isContextWindowCompactionError(error)) {
 					recovery = "context-overflow";
 					continue;
 				}
-				if (action === "retry") {
-					recovery = undefined;
-					continue;
-				}
-				coordinator.recordFailedRequest(ctx, requestInput);
+				const recoveryAttempted = recovery !== undefined;
+				const code = reportCompactionFailure(
+					ctx,
+					model,
+					error,
+					"before_provider_request",
+					recoveryAttempted,
+					"request_aborted",
+				);
+				coordinator.recordFailedRequest(ctx, requestInput, {
+					phase: "before_provider_request",
+					code,
+					recoveryAttempted,
+				});
 				ctx.abort();
-				notifyBlocked(ctx, error, action);
 				// The abort signal stops Pi's provider call. A synthetic `input: null`
 				// would create a second protocol error.
 				return undefined;
@@ -229,6 +220,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
+		const lifecycleGenerationAtStart = lifecycleGeneration;
 		const model = ctx.model;
 		if (!model || !isOpenAICodexModel(model)) return undefined;
 		const branch = event.branchEntries as SessionEntry[];
@@ -253,6 +245,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 					recovery,
 					basePayloadBySession.get(sessionId),
 				);
+				if (lifecycleGeneration !== lifecycleGenerationAtStart) return { cancel: true };
 				native = await createCheckpoint({
 					ctx,
 					model,
@@ -260,24 +253,27 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 					basePayload: basePayloadBySession.get(sessionId),
 					signal: event.signal,
 				});
+				if (lifecycleGeneration !== lifecycleGenerationAtStart) return { cancel: true };
 				break;
 			} catch (error) {
-				if (event.signal.aborted) return { cancel: true };
-				const action = await chooseCompactionFailureAction(ctx, error, recovery, event.signal);
-				if (action === "context-overflow") {
+				if (lifecycleGeneration !== lifecycleGenerationAtStart || event.signal.aborted) return { cancel: true };
+				if (recovery === undefined && isContextWindowCompactionError(error)) {
 					recovery = "context-overflow";
 					continue;
 				}
-				if (action === "retry") {
-					recovery = undefined;
-					continue;
-				}
-				if (!event.signal.aborted) notifyBlocked(ctx, error, action);
+				reportCompactionFailure(
+					ctx,
+					model,
+					error,
+					"session_before_compact",
+					recovery !== undefined,
+					"compaction_cancelled",
+				);
 				return { cancel: true };
 			}
 		}
-		if (event.signal.aborted || !native || !input) return { cancel: true };
-		const requestUser = requestInput.findLast((item) => item.role === "user");
+		if (lifecycleGeneration !== lifecycleGenerationAtStart || event.signal.aborted || !native || !input) return { cancel: true };
+		const requestUser = input.findLast((item) => item.role === "user");
 		const knownUsers = [
 			...native.details.replacementHistory,
 			...(native.details.preservedInput ?? []),
