@@ -7,6 +7,8 @@ import {
 	findNativeCheckpoint,
 	modelKey,
 	FAILED_REQUEST_KIND,
+	NATIVE_COMPACTION_BYPASS_KIND,
+	NATIVE_COMPACTION_BYPASS_VERSION,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
 	type NativeCompactionDetails,
@@ -84,6 +86,7 @@ function createCoordinator(
 	createCheckpoint?: (selectedModel: Model<any>, input: ResponseItem[], basePayload?: Record<string, unknown>) => Promise<NativeCompactionDetails>,
 	shouldAutoCompact?: (input: ResponseItem[]) => boolean,
 	onCompaction?: (reason: RemoteCompactionReason) => void,
+	onAutomaticFailure?: () => void,
 ) {
 	return createSessionCoordinator({
 		getBranch: () => branch,
@@ -94,7 +97,9 @@ function createCoordinator(
 				: details(modelKey(selectedModel)),
 		}),
 		appendCheckpoint: (value) => branch.push(customEntry(value)),
+		appendCheckpointBypass: (value) => branch.push(customEntry(value, "bypass", NATIVE_COMPACTION_BYPASS_KIND)),
 		appendFailedRequest: (value) => branch.push(customEntry(value, "failed-request", FAILED_REQUEST_KIND)),
+		...(onAutomaticFailure ? { onAutomaticCompactionFailure: onAutomaticFailure } : {}),
 		shouldAutoCompact: shouldAutoCompact ? ({ input }) => shouldAutoCompact(input) : undefined,
 		runCompaction: onCompaction
 			? async (_ctx, reason, operation) => {
@@ -457,6 +462,51 @@ describe("Codex session coordinator", () => {
 		expect(operations).toEqual(["model-transition"]);
 	});
 
+	test("keeps the terminal current-model fallback error", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const compactedWith: string[] = [];
+		const coordinator = createCoordinator([], async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			if (selectedModel === oldModel) {
+				const error = new Error("context_length_exceeded") as Error & { retryWithCurrentModel: boolean };
+				Object.defineProperty(error, "retryWithCurrentModel", { value: true });
+				throw error;
+			}
+			const error = new Error("policy_violation") as Error & { retryWithCurrentModel: boolean };
+			Object.defineProperty(error, "retryWithCurrentModel", { value: false });
+			throw error;
+		});
+
+		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")])).rejects.toThrow("policy_violation");
+		expect(compactedWith).toEqual([modelKey(oldModel), modelKey(currentModel)]);
+	});
+
+	test("keeps the terminal fallback error during context recovery", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const branch = [
+			userEntry("history"),
+			customEntry({ ...details(modelKey(oldModel)), compHash: "2911" }),
+		];
+		const compactedWith: string[] = [];
+		const coordinator = createCoordinator(branch, async (selectedModel) => {
+			compactedWith.push(modelKey(selectedModel));
+			if (selectedModel === oldModel) {
+				const error = new Error("context_length_exceeded") as Error & { retryWithCurrentModel: boolean };
+				Object.defineProperty(error, "retryWithCurrentModel", { value: true });
+				throw error;
+			}
+			const error = new Error("policy_violation") as Error & { retryWithCurrentModel: boolean };
+			Object.defineProperty(error, "retryWithCurrentModel", { value: false });
+			throw error;
+		});
+
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("different")])).rejects.toThrow("policy_violation");
+		expect(compactedWith).toEqual([modelKey(oldModel), modelKey(currentModel)]);
+	});
+
 	test("keeps unknown credential transition failures out of current-model fallback", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
@@ -490,27 +540,168 @@ describe("Codex session coordinator", () => {
 		expect(calls).toBe(1);
 	});
 
-	test("does not permanently block a transition after a non-fallback failure", async () => {
+	test("continues without retrying a failed transition gate", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
 		let calls = 0;
-		const coordinator = createCoordinator([], async (selectedModel) => {
+		const coordinator = createCoordinator([], async () => {
 			calls++;
-			if (calls === 1) {
-				const error = new Error("policy_violation") as Error & { retryWithCurrentModel: boolean };
-				Object.defineProperty(error, "retryWithCurrentModel", { value: false });
-				throw error;
-			}
-			return details(modelKey(selectedModel), "retry-success");
+			const error = new Error("policy_violation") as Error & { retryWithCurrentModel: boolean };
+			Object.defineProperty(error, "retryWithCurrentModel", { value: false });
+			throw error;
 		});
 
 		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
 		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")])).rejects.toThrow("policy_violation");
-		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")])).resolves.toEqual([
-			{ type: "compaction", encrypted_content: "retry-success" },
-			userInput("hello"),
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")])).resolves.toBeUndefined();
+		expect(calls).toBe(1);
+	});
+
+	test("bypasses a terminal checkpoint transition on later requests", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const branch = [
+			userEntry("history", "history"),
+			customEntry({ ...details(modelKey(oldModel)), compHash: "2911" }),
+		];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			const error = new Error("policy_violation") as Error & { retryWithCurrentModel: boolean };
+			Object.defineProperty(error, "retryWithCurrentModel", { value: false });
+			throw error;
+		});
+		const ctx = context([oldModel, currentModel]);
+
+		await expect(coordinator.prepareRequest(currentModel, ctx, [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("next"),
+		])).rejects.toThrow("policy_violation");
+		const bypass = branch.find((entry) => entry.type === "custom" && entry.customType === NATIVE_COMPACTION_BYPASS_KIND);
+		expect(bypass).toMatchObject({
+			data: {
+				kind: NATIVE_COMPACTION_BYPASS_KIND,
+				version: NATIVE_COMPACTION_BYPASS_VERSION,
+				gateEntryId: "checkpoint",
+				targetModelKey: modelKey(currentModel),
+			},
+		});
+		expect(JSON.stringify(bypass)).not.toContain("policy_violation");
+		expect(findNativeCheckpoint(branch, modelKey(currentModel)).status).toBe("bypassed");
+		expect(findNativeCheckpoint(branch, modelKey(oldModel)).status).toBe("valid");
+
+		const resumed = createCoordinator(branch, async () => {
+			throw new Error("must not compact");
+		});
+		await expect(resumed.prepareRequest(currentModel, ctx, [userInput("history"), userInput("next")])).resolves.toEqual([
+			userInput("history"),
+			userInput("next"),
 		]);
-		expect(calls).toBe(2);
+		expect(calls).toBe(1);
+	});
+
+	test("keeps a bypass after its failed request user is filtered", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const branch = [
+			{
+				id: "old-assistant",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: oldModel.provider,
+					api: oldModel.api,
+					model: oldModel.id,
+					content: [{ type: "text", text: "old" }],
+				},
+			} as never,
+			{
+				id: "new-model",
+				parentId: "old-assistant",
+				timestamp: new Date().toISOString(),
+				type: "model_change",
+				provider: currentModel.provider,
+				modelId: currentModel.id,
+			} as never,
+			userEntry("failed", "failed-user"),
+			customEntry({
+				kind: NATIVE_COMPACTION_BYPASS_KIND,
+				version: NATIVE_COMPACTION_BYPASS_VERSION,
+				gateEntryId: "failed-user",
+				targetModelKey: modelKey(currentModel),
+			}, "bypass", NATIVE_COMPACTION_BYPASS_KIND),
+			customEntry({ kind: FAILED_REQUEST_KIND, entryId: "failed-user" }, "failed-marker", FAILED_REQUEST_KIND),
+		];
+		let calls = 0;
+		const coordinator = createCoordinator(branch, async () => {
+			calls++;
+			return details(modelKey(currentModel));
+		});
+
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("new")])).resolves.toEqual([userInput("new")]);
+		expect(calls).toBe(0);
+	});
+
+	test("keeps a checkpoint for bounded overflow recovery", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new");
+		const branch = [
+			userEntry("history", "history"),
+			customEntry({ ...details(modelKey(oldModel)), compHash: "2911" }),
+		];
+		const coordinator = createCoordinator(branch, async () => {
+			const error = new Error("context_length_exceeded") as Error & { retryWithCurrentModel: boolean };
+			Object.defineProperty(error, "retryWithCurrentModel", { value: false });
+			throw error;
+		});
+
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [
+			{ type: "compaction", encrypted_content: "opaque" },
+			userInput("next"),
+		])).rejects.toThrow("context_length_exceeded");
+		expect(branch.filter((entry) => entry.type === "custom" && entry.customType === NATIVE_COMPACTION_BYPASS_KIND)).toHaveLength(0);
+	});
+
+	test("does not replay an over-window bypassed branch", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new", "openai-codex", 1);
+		const branch = [
+			userEntry("history", "history"),
+			customEntry({ ...details(modelKey(oldModel)), compHash: "2911" }),
+			customEntry({
+				kind: NATIVE_COMPACTION_BYPASS_KIND,
+				version: NATIVE_COMPACTION_BYPASS_VERSION,
+				gateEntryId: "checkpoint",
+				targetModelKey: modelKey(currentModel),
+			}, "bypass", NATIVE_COMPACTION_BYPASS_KIND),
+		];
+		const coordinator = createCoordinator(branch);
+
+		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("history"), userInput("next")])).rejects.toThrow("complete branch cannot be replayed");
+	});
+
+	test("does not forward an over-window mismatched bypass request", async () => {
+		const oldModel = model("old");
+		const currentModel = model("new", "openai-codex", 10);
+		const branch = [
+			userEntry("history", "history"),
+			customEntry({ ...details(modelKey(oldModel)), compHash: "2911" }),
+			customEntry({
+				kind: NATIVE_COMPACTION_BYPASS_KIND,
+				version: NATIVE_COMPACTION_BYPASS_VERSION,
+				gateEntryId: "checkpoint",
+				targetModelKey: modelKey(currentModel),
+			}, "bypass", NATIVE_COMPACTION_BYPASS_KIND),
+		];
+		const coordinator = createCoordinator(branch);
+
+		await expect(coordinator.prepareRequest(
+			currentModel,
+			context([oldModel, currentModel]),
+			[userInput("different ".repeat(100))],
+		)).rejects.toThrow("raw request cannot be replayed");
 	});
 
 	test("replays a checkpoint when the current model has no comparable hash", async () => {
@@ -752,6 +943,25 @@ describe("Codex session coordinator", () => {
 		const input = await coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("history"), userInput("new")]);
 		expect(compactedInput).toEqual([userInput("history")]);
 		expect(input).toEqual([{ type: "compaction", encrypted_content: "automatic" }, userInput("new")]);
+	});
+
+	test("continues an in-window request after automatic compaction fails", async () => {
+		const currentModel = model("old");
+		const branch = [userEntry("history")];
+		let failures = 0;
+		const coordinator = createCoordinator(
+			branch,
+			async () => {
+				throw new Error("server_error");
+			},
+			() => true,
+			undefined,
+			() => failures++,
+		);
+
+		await expect(coordinator.prepareRequest(currentModel, context([currentModel]), [userInput("history"), userInput("new")])).resolves.toBeUndefined();
+		expect(failures).toBe(1);
+		expect(branch.filter((entry) => entry.type === "custom" && entry.customType === NATIVE_COMPACTION_BYPASS_KIND)).toHaveLength(0);
 	});
 
 	test("preserves a duplicate current user during automatic compaction", async () => {

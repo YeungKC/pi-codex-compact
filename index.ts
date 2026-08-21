@@ -17,7 +17,9 @@ import {
 	approximateTokenCount,
 	buildToolPayload,
 	stripInputFromPayload,
+	NATIVE_COMPACTION_BYPASS_KIND,
 	NATIVE_COMPACTION_KIND,
+	modelKey,
 	type JsonObject,
 	type ResponseItem,
 } from "./native-compaction.ts";
@@ -27,7 +29,7 @@ const AUTHENTICATION_FAILURE_CODE_PATTERN = /^(?:authentication|authentication_e
 const POLICY_OR_QUOTA_FAILURE_CODE_PATTERN = /^(?:policy_or_quota|policy_violation|insufficient_quota|quota_exceeded|usage_limit_(?:reached|exceeded)|usage_not_included|billing_(?:error|issue|required)|insufficient_funds|out_of_budget)$/;
 
 type FailurePhase = "before_provider_request" | "session_before_compact";
-type FailureOutcome = "request_aborted" | "compaction_cancelled";
+type FailureOutcome = "request_aborted" | "compaction_cancelled" | "compaction_skipped";
 type CompactionNoticeContext = {
 	hasUI: boolean;
 	ui: {
@@ -56,6 +58,12 @@ function remoteCompactionReasonLabel(reason: RemoteCompactionReason): string {
 	return reason;
 }
 
+function safely(operation: () => void): void {
+	try {
+		operation();
+	} catch {}
+}
+
 function reportCompactionFailure(
 	ctx: CompactionNoticeContext,
 	model: { id?: unknown } | undefined,
@@ -66,9 +74,12 @@ function reportCompactionFailure(
 ): string {
 	const code = compactionFailureClassification(error);
 	const modelId = typeof model?.id === "string" && /^[a-zA-Z0-9_.:-]{1,64}$/.test(model.id) ? model.id : "unknown";
-	const notice = `OpenAI Codex failure: phase=${phase}; code=${code}; model=${modelId}; recoveryAttempted=${recoveryAttempted}; outcome=${outcome}; next=${failureNextStep(code, recoveryAttempted)}.`;
-	if (ctx.hasUI) ctx.ui.notify(notice, "error");
-	else console.error(notice);
+	const next = outcome === "compaction_skipped"
+		? "request continues without compaction"
+		: failureNextStep(code, recoveryAttempted);
+	const notice = `OpenAI Codex failure: phase=${phase}; code=${code}; model=${modelId}; recoveryAttempted=${recoveryAttempted}; outcome=${outcome}; next=${next}.`;
+	if (ctx.hasUI) safely(() => ctx.ui.notify(notice, outcome === "compaction_skipped" ? "warning" : "error"));
+	else safely(() => console.error(notice));
 	return code;
 }
 
@@ -82,7 +93,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	};
 	const clearPendingOverflowPresentation = (ctx: CompactionNoticeContext): void => {
 		if (!pendingOverflowPresentationBySession.delete(ctx.sessionManager.getSessionId())) return;
-		if (ctx.hasUI) ctx.ui.setStatus("codex-compact", undefined);
+		if (ctx.hasUI) safely(() => ctx.ui.setStatus("codex-compact", undefined));
 	};
 	const presentRemoteCompaction = async <T>(
 		ctx: CompactionNoticeContext,
@@ -95,11 +106,11 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 			&& pendingOverflowPresentationBySession.has(sessionId);
 		if (!resumesOverflowRecovery) clearPendingOverflowPresentation(ctx);
 		const label = remoteCompactionReasonLabel(reason);
-		if (ctx.hasUI) ctx.ui.setStatus("codex-compact", `Compacting context with Codex (${label})…`);
+		if (ctx.hasUI) safely(() => ctx.ui.setStatus("codex-compact", `Compacting context with Codex (${label})…`));
 		let retainForOverflowRecovery = false;
 		try {
 			const result = await operation();
-			if (ctx.hasUI && completed(result)) ctx.ui.notify(`Codex context compacted (${label}).`, "info");
+			if (ctx.hasUI && completed(result)) safely(() => ctx.ui.notify(`Codex context compacted (${label}).`, "info"));
 			return result;
 		} catch (error) {
 			retainForOverflowRecovery = !resumesOverflowRecovery && isContextWindowCompactionError(error);
@@ -108,7 +119,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		} finally {
 			if (!retainForOverflowRecovery) {
 				pendingOverflowPresentationBySession.delete(sessionId);
-				if (ctx.hasUI) ctx.ui.setStatus("codex-compact", undefined);
+				if (ctx.hasUI) safely(() => ctx.ui.setStatus("codex-compact", undefined));
 			}
 		}
 	};
@@ -132,7 +143,18 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		getAllTools: () => pi.getAllTools(),
 		createCheckpoint,
 		appendCheckpoint: (details) => pi.appendEntry(NATIVE_COMPACTION_KIND, details),
+		appendCheckpointBypass: (bypass) => pi.appendEntry(NATIVE_COMPACTION_BYPASS_KIND, bypass),
 		appendFailedRequest: (details) => pi.appendEntry(FAILED_REQUEST_KIND, details),
+		onAutomaticCompactionFailure: (failureCtx, error) => {
+			reportCompactionFailure(
+				failureCtx as unknown as CompactionNoticeContext,
+				failureCtx.model,
+				error,
+				"before_provider_request",
+				false,
+				"compaction_skipped",
+			);
+		},
 		shouldAutoCompact: ({ ctx, model, input, reason }) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			// Pi exposes assistant usage but not Codex's window counters; estimate the stable prefix.
@@ -146,6 +168,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 				? estimateCompactionWindowPrefillTokens({
 						branch: ctx.sessionManager.getBranch() as SessionEntry[],
 						stablePrefixTokens: estimatedStablePrefixTokens,
+						targetModelKey: modelKey(model),
 					})
 				: undefined;
 			const limit = autoCompactTokenLimit(config, model.contextWindow);
@@ -167,7 +190,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 		lifecycleGeneration++;
 		coordinator.clear();
 		for (const ctx of pendingOverflowPresentationBySession.values()) {
-			if (ctx.hasUI) ctx.ui.setStatus("codex-compact", undefined);
+			if (ctx.hasUI) safely(() => ctx.ui.setStatus("codex-compact", undefined));
 		}
 		pendingOverflowPresentationBySession.clear();
 		basePayloadBySession.clear();
@@ -186,8 +209,8 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	pi.on("context", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
 		const branch = ctx.sessionManager.getBranch() as SessionEntry[];
-		const checkpoint = findNativeCheckpoint(branch);
-		if (checkpoint.status === "invalid") {
+		const checkpoint = findNativeCheckpoint(branch, modelKey(ctx.model));
+		if (checkpoint.status === "invalid" || checkpoint.status === "bypassed") {
 			return {
 				messages: branch.flatMap((entry) => entry.type === "compaction" ? [] : sessionEntryToContextMessages(entry)),
 			};
@@ -246,8 +269,12 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 					continue;
 				}
 				const recoveryAttempted = recovery !== undefined;
+				const code = compactionFailureClassification(error);
 				clearPendingOverflowPresentation(ctx);
-				const code = reportCompactionFailure(
+				try {
+					ctx.abort();
+				} catch {}
+				reportCompactionFailure(
 					ctx,
 					model,
 					error,
@@ -255,12 +282,13 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 					recoveryAttempted,
 					"request_aborted",
 				);
-				coordinator.recordFailedRequest(ctx, requestInput, {
-					phase: "before_provider_request",
-					code,
-					recoveryAttempted,
-				});
-				ctx.abort();
+				try {
+					coordinator.recordFailedRequest(ctx, requestInput, {
+						phase: "before_provider_request",
+						code,
+						recoveryAttempted,
+					});
+				} catch {}
 				// The abort signal stops Pi's provider call. A synthetic `input: null`
 				// would create a second protocol error.
 				return undefined;

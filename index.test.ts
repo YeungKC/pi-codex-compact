@@ -363,6 +363,54 @@ test("reports a safe manual compaction failure without UI", async () => {
 	expect(String(calls[0]?.[0])).not.toContain("Authorization Bearer secret");
 });
 
+test("cancels compaction when UI reporting throws", async () => {
+	const { handlers, ctx, notify, setStatus } = installExtension([], true);
+	setStatus.mockImplementation(() => { throw new Error("status failed"); });
+	notify.mockImplementation(() => { throw new Error("notify failed"); });
+	vi.stubGlobal("fetch", async () => new Response(
+		JSON.stringify({ error: { code: "manual_failure", message: "safe" } }),
+		{ status: 400 },
+	));
+	try {
+		await expect(handlers.get("session_before_compact")?.({
+			branchEntries: [],
+			preparation: { firstKeptEntryId: "", tokensBefore: 0 },
+			reason: "manual",
+			willRetry: false,
+			signal: new AbortController().signal,
+		}, ctx)).resolves.toEqual({ cancel: true });
+	} finally {
+		vi.unstubAllGlobals();
+	}
+});
+
+test("cancels the provider request when marker persistence throws", async () => {
+	const branch = [{
+		id: "current",
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		type: "message",
+		message: { role: "user", content: [{ type: "text", text: "prompt" }] },
+	}] as never;
+	const { handlers, ctx, model, appendEntry } = installExtension(branch, true);
+	model.id = "gpt-5.6-sol";
+	const previousModel = { ...model, id: "gpt-5.5" };
+	await handlers.get("model_select")?.({ model, previousModel }, ctx);
+	appendEntry.mockImplementation(() => { throw new Error("disk full"); });
+	vi.stubGlobal("fetch", async () => new Response(
+		JSON.stringify({ error: { code: "policy_violation", message: "safe" } }),
+		{ status: 400 },
+	));
+	try {
+		await expect(handlers.get("before_provider_request")?.({
+			payload: { input: [{ role: "user", content: [{ type: "input_text", text: "prompt" }] }] },
+		}, ctx)).resolves.toBeUndefined();
+	} finally {
+		vi.unstubAllGlobals();
+	}
+	expect(ctx.abort).toHaveBeenCalledTimes(1);
+});
+
 test("cancels a stale compaction without reporting success", async () => {
 	const { handlers, ctx, notify, setStatus } = installExtension([], true);
 	let resolveFetch!: (response: Response) => void;

@@ -9,8 +9,10 @@ import {
 import { calculateCost, type Message, type Model, type Usage } from "@earendil-works/pi-ai";
 
 export const NATIVE_COMPACTION_KIND = "openai-codex-native-compaction";
+export const NATIVE_COMPACTION_BYPASS_KIND = "openai-codex-native-compaction-bypass";
 export const FAILED_REQUEST_KIND = "openai-codex-failed-request";
 export const NATIVE_COMPACTION_VERSION = 2;
+export const NATIVE_COMPACTION_BYPASS_VERSION = 1;
 export const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
 
@@ -18,7 +20,7 @@ const MAX_REMOTE_RETRIES = 2;
 const V2_COMPACTION_IDLE_TIMEOUT_MS = 300_000;
 const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
-const FAIL_CLOSED_ERROR_PATTERN = /(?:credential|policy|auth(?:entication|orization)?|access[_ -]?denied|malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?(?:violation|denied|failure|failed)|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failure|failed|denied|error)|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing|protocol[_ -]?(?:failure|error))/i;
+const FAIL_CLOSED_ERROR_PATTERN = /(?:credential|policy|auth(?:entication|orization)?|access[_ -]?denied|malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|safety[_ -]?policy|policy[_ -]?(?:violation|denied|failure|failed)|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failure|failed|denied|error)|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing|protocol[_ -]?(?:failure|error))/i;
 const NON_RETRYABLE_FALLBACK_ERROR_CODES = new Set([
 	"context_length_exceeded",
 	"context_window_exceeded",
@@ -114,9 +116,17 @@ export type NativeCheckpoint = {
 	details: NativeCompactionDetails;
 };
 
+export type NativeCompactionBypass = {
+	kind: typeof NATIVE_COMPACTION_BYPASS_KIND;
+	version: typeof NATIVE_COMPACTION_BYPASS_VERSION;
+	gateEntryId: string;
+	targetModelKey: string;
+};
+
 export type CheckpointLookup =
 	| { status: "none" }
 	| { status: "invalid"; entryIndex: number; entryId: string }
+	| { status: "bypassed"; entryIndex: number; entryId: string; bypass: NativeCompactionBypass }
 	| { status: "valid"; checkpoint: NativeCheckpoint };
 
 export function isJsonObject(value: unknown): value is JsonObject {
@@ -262,10 +272,29 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	};
 }
 
-export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
+export function parseNativeCompactionBypass(value: unknown): NativeCompactionBypass | undefined {
+	if (!isJsonObject(value)) return undefined;
+	if (value.kind !== NATIVE_COMPACTION_BYPASS_KIND || value.version !== NATIVE_COMPACTION_BYPASS_VERSION) return undefined;
+	if (typeof value.gateEntryId !== "string" || !value.gateEntryId || typeof value.targetModelKey !== "string" || !value.targetModelKey) return undefined;
+	return {
+		kind: NATIVE_COMPACTION_BYPASS_KIND,
+		version: NATIVE_COMPACTION_BYPASS_VERSION,
+		gateEntryId: value.gateEntryId,
+		targetModelKey: value.targetModelKey,
+	};
+}
+
+export function findNativeCheckpoint(branch: SessionEntry[], targetModelKey?: string): CheckpointLookup {
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (!entry) continue;
+		if (entry.type === "custom" && entry.customType === NATIVE_COMPACTION_BYPASS_KIND) {
+			const bypass = parseNativeCompactionBypass(entry.data);
+			if (bypass && (targetModelKey === undefined || bypass.targetModelKey === targetModelKey)) {
+				return { status: "bypassed", entryIndex: index, entryId: entry.id, bypass };
+			}
+			continue;
+		}
 
 		let rawDetails: unknown;
 		if (entry.type === "compaction") {
@@ -320,8 +349,9 @@ function assistantInputTokens(entry: SessionEntry): number | undefined {
 export function estimateCompactionWindowPrefillTokens(params: {
 	branch: SessionEntry[];
 	stablePrefixTokens: number;
+	targetModelKey?: string;
 }): number | undefined {
-	const checkpoint = findNativeCheckpoint(params.branch);
+	const checkpoint = findNativeCheckpoint(params.branch, params.targetModelKey);
 	const checkpointIndex = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : -1;
 	const observed = params.branch.slice(checkpointIndex + 1).map(assistantInputTokens).find((value) => value !== undefined);
 	if (observed !== undefined) return observed;
@@ -596,8 +626,8 @@ export function piContextInputForBranch(params: {
 	model: Model<any>;
 	tools: ToolInfo[];
 }): ResponseItem[] {
-	const checkpoint = findNativeCheckpoint(params.branch);
-	if (checkpoint.status === "invalid") return fullInputForBranch(params);
+	const checkpoint = findNativeCheckpoint(params.branch, modelKey(params.model));
+	if (checkpoint.status === "invalid" || checkpoint.status === "bypassed") return fullInputForBranch(params);
 	const remoteCheckpoint = checkpoint.status === "valid";
 	const boundaryEnd = checkpoint.status === "valid" ? checkpoint.checkpoint.entryIndex : params.branch.length;
 	let firstKeptEntryId: string | undefined;
@@ -647,7 +677,7 @@ export function effectiveInputForBranch(params: {
 		}
 	}
 
-	const checkpoint = findNativeCheckpoint(branch);
+	const checkpoint = findNativeCheckpoint(branch, modelKey(params.model));
 	if (checkpoint.status === "valid") {
 		if (
 			!params.allowCheckpointModelMismatch
@@ -1257,7 +1287,7 @@ function classifySseCompactionError(code: string, message: string): Error {
 	const machineDetails = `${normalizedCode} ${message}`;
 	const usageLimitMessage = USAGE_LIMIT_MESSAGE_PATTERN.test(machineDetails);
 	const tag = <T extends Error>(error: T): T => markCompactionCode(error, normalizedCode);
-	if (isFailClosedCompactionError(machineDetails)) {
+	if (normalizedCode !== "content_filter" && isFailClosedCompactionError(machineDetails)) {
 		return tag(markFallbackEligibility(markCompactionRetry(new Error(detail), "none"), false));
 	}
 	if (!usageLimitMessage && SSE_MODEL_FALLBACK_ERROR_CODES.has(normalizedCode) && !RETRYABLE_COMPACTION_ERROR_CODES.has(normalizedCode)) {
@@ -1464,8 +1494,10 @@ async function parseSseResponse(
 				? details.message
 				: `OpenAI Codex compaction ended with response.incomplete (${reason}).`;
 			const normalizedReason = normalizedErrorCode(reason);
-			const explicitRetry = !isFailClosedCompactionError(`${reason} ${message}`)
-				&& !/invalid[_ -]?(?:prompt|request)|malformed|protocol/i.test(`${reason} ${message}`);
+			const explicitRetry = normalizedReason === "content_filter" || (
+				!isFailClosedCompactionError(`${reason} ${message}`)
+				&& !/invalid[_ -]?(?:prompt|request)|malformed|protocol/i.test(`${reason} ${message}`)
+			);
 			const retry = normalizedReason === "context_length_exceeded" || normalizedReason === "context_window_exceeded"
 				? "automatic"
 				: explicitRetry ? "explicit" : "automatic";

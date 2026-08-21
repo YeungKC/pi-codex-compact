@@ -17,7 +17,7 @@ vi.mock("node:timers/promises", () => ({
 }));
 
 import { createNativeCheckpoint } from "./remote-compaction.ts";
-import { approximateResponseItemTokens, isContextWindowCompactionError, compactionFailureClassification, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildReplacementHistory, buildToolPayload, callRemoteCompaction, effectiveInputForBranch, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
+import { approximateResponseItemTokens, isContextWindowCompactionError, compactionFailureClassification, estimateCompactionWindowPrefillTokens, buildCodexHeaders, buildCompactionRequestBody, buildReplacementHistory, buildToolPayload, callRemoteCompaction, effectiveInputForBranch, findNativeCheckpoint, fullInputForBranch, NATIVE_COMPACTION_BYPASS_KIND, NATIVE_COMPACTION_BYPASS_VERSION, NATIVE_COMPACTION_KIND, NATIVE_COMPACTION_VERSION, parseNativeCompactionDetails, piContextInputForBranch, retainRecentMessages, latestRemoteCompactionSuffix, trimFunctionCallHistoryToFitContextWindow } from "./native-compaction.ts";
 
 afterEach(() => vi.useRealTimers());
 
@@ -337,6 +337,20 @@ describe("Codex compaction history", () => {
 		const error = await failure;
 		expect(error).toMatchObject({ retryWithCurrentModel: expectedFallback });
 		expect(calls).toBe(expectedCalls);
+	});
+
+	test("retries a response.failed content filter stream", async () => {
+		vi.useFakeTimers();
+		let calls = 0;
+		const failure = callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => {
+				calls++;
+				return sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"content_filter\",\"message\":\"blocked by policy\"}}}\n\ndata: [DONE]\n\n");
+			},
+		})).catch((error) => error);
+		await vi.runAllTimersAsync();
+		expect(await failure).toMatchObject({ retryWithCurrentModel: false });
+		expect(calls).toBe(3);
 	});
 
 	test("does not treat a protocol incomplete response as context overflow", async () => {
@@ -1449,6 +1463,40 @@ describe("Codex compaction history", () => {
 		for (const strategy of [undefined, "v2"]) {
 			expect(parseNativeCompactionDetails({ ...checkpoint, ...(strategy ? { strategy } : {}) })?.compHash).toBe("3000");
 		}
+	});
+
+	test("scopes a checkpoint bypass to its target model", () => {
+		const timestamp = new Date().toISOString();
+		const branch = [
+			{
+				id: "checkpoint",
+				parentId: null,
+				timestamp,
+				type: "custom",
+				customType: NATIVE_COMPACTION_KIND,
+				data: {
+					kind: NATIVE_COMPACTION_KIND,
+					version: NATIVE_COMPACTION_VERSION,
+					modelKey: "openai-codex:openai-codex-responses:old",
+					replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+				},
+			},
+			{
+				id: "bypass",
+				parentId: "checkpoint",
+				timestamp,
+				type: "custom",
+				customType: NATIVE_COMPACTION_BYPASS_KIND,
+				data: {
+					kind: NATIVE_COMPACTION_BYPASS_KIND,
+					version: NATIVE_COMPACTION_BYPASS_VERSION,
+					gateEntryId: "checkpoint",
+					targetModelKey: "openai-codex:openai-codex-responses:new",
+				},
+			},
+		] as never;
+		expect(findNativeCheckpoint(branch, "openai-codex:openai-codex-responses:new").status).toBe("bypassed");
+		expect(findNativeCheckpoint(branch, "openai-codex:openai-codex-responses:old").status).toBe("valid");
 	});
 
 	test("ignores a version-one checkpoint", () => {

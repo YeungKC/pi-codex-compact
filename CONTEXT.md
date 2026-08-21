@@ -43,6 +43,9 @@ A lossy remote-only continuation for `context_length_exceeded`: the newest compl
 **Model-transition compaction**:
 Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
 
+**Checkpoint bypass**:
+A non-model-visible record that retires one failed V2 continuation gate for its target model. Later requests replay the raw branch rather than that opaque checkpoint; a newer valid V2 checkpoint supersedes the bypass.
+
 **Unsupported checkpoint**:
 A native compaction entry from an older protocol or extension version. The extension ignores it and replays Pi's normal branch. A later V2 compaction can write a current replacement; it never calls a legacy endpoint or blocks the session permanently.
 
