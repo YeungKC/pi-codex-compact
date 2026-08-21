@@ -23,14 +23,15 @@ function checkpointEntry(): SessionEntry {
 	} as unknown as SessionEntry;
 }
 
-function installExtension(branch: SessionEntry[] = [], hasUI = false) {
+function installExtension(branch: SessionEntry[] = [], hasUI = false, contextWindow = 100_000) {
 	const handlers = new Map<string, Handler>();
 	const notify = vi.fn();
+	const setStatus = vi.fn();
 	const model = {
 		provider: "openai-codex",
 		api: "openai-codex-responses",
 		id: "gpt",
-		contextWindow: 100_000,
+		contextWindow,
 		reasoning: true,
 		compat: {},
 	};
@@ -42,7 +43,7 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false) {
 		cwd: process.cwd(),
 		isProjectTrusted: () => true,
 		hasUI,
-		ui: { notify },
+		ui: { notify, setStatus },
 		abort: vi.fn(),
 		signal: new AbortController().signal,
 		model,
@@ -66,7 +67,7 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false) {
 		getActiveTools: () => [],
 		appendEntry,
 	} as never);
-	return { handlers, ctx, model, notify, appendEntry };
+	return { handlers, ctx, model, notify, setStatus, appendEntry };
 }
 
 test("removes unsupported prompt cache retention from Codex requests", async () => {
@@ -109,6 +110,48 @@ test("returns sanitized input after filtering a stale failed marker", async () =
 	expect(result).toEqual({ input: [{ role: "user", content: [{ type: "input_text", text: "retry" }] }] });
 	expect(JSON.stringify(result)).not.toContain(secret);
 	expect(ctx.abort).not.toHaveBeenCalled();
+});
+
+test("keeps one presentation through request-side overflow recovery", async () => {
+	const branch = [{
+		id: "history",
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		type: "message",
+		message: { role: "user", content: [{ type: "text", text: "branch" }] },
+	} as never, checkpointEntry()];
+	const { handlers, ctx, notify, setStatus } = installExtension(branch, true);
+	const fetchMock = vi.fn()
+		.mockResolvedValueOnce(new Response(
+			JSON.stringify({ error: { code: "context_length_exceeded", message: "retry with a shorter history" } }),
+			{ status: 400 },
+		))
+		.mockResolvedValueOnce(new Response([
+			'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+			'data: {"type":"response.completed","response":{"id":"response"}}',
+		].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } }));
+	vi.stubGlobal("fetch", fetchMock);
+	try {
+		await handlers.get("before_provider_request")?.({
+			payload: {
+				input: [
+					{ role: "user", content: [{ type: "input_text", text: "older" }] },
+					{ role: "user", content: [{ type: "input_text", text: "old" }] },
+					{ role: "user", content: [{ type: "input_text", text: "current" }] },
+				],
+			},
+		}, ctx);
+	} finally {
+		vi.unstubAllGlobals();
+	}
+
+	expect(fetchMock).toHaveBeenCalledTimes(2);
+	expect(setStatus.mock.calls).toEqual([
+		["codex-compact", "Compacting context with Codex (context recovery)…"],
+		["codex-compact", "Compacting context with Codex (context overflow recovery)…"],
+		["codex-compact", undefined],
+	]);
+	expect(notify).toHaveBeenCalledWith("Codex context compacted (context overflow recovery).", "info");
 });
 
 test("filters Pi compaction summaries after a valid V2 checkpoint", () => {
@@ -263,7 +306,7 @@ test("writes the same safe failure notice without UI", async () => {
 });
 
 test("reports a terminal manual compaction failure without choices", async () => {
-	const { handlers, ctx, notify } = installExtension([], true);
+	const { handlers, ctx, notify, setStatus } = installExtension([], true);
 	vi.stubGlobal("fetch", async () => new Response(
 		JSON.stringify({ error: { code: "manual_failure", message: "do-not-display-this-body" } }),
 		{ status: 400 },
@@ -279,6 +322,11 @@ test("reports a terminal manual compaction failure without choices", async () =>
 	} finally {
 		vi.unstubAllGlobals();
 	}
+	expect(setStatus.mock.calls).toEqual([
+		["codex-compact", "Compacting context with Codex (manual)…"],
+		["codex-compact", undefined],
+	]);
+	expect(notify).not.toHaveBeenCalledWith("Codex context compacted (manual).", "info");
 	expect(notify).toHaveBeenCalledWith(
 		expect.stringMatching(/^OpenAI Codex failure: phase=session_before_compact; code=http_400; model=gpt; recoveryAttempted=false; outcome=compaction_cancelled; next=.+$/),
 		"error",
@@ -315,8 +363,8 @@ test("reports a safe manual compaction failure without UI", async () => {
 	expect(String(calls[0]?.[0])).not.toContain("Authorization Bearer secret");
 });
 
-test("cancels a stale compaction after the session tree changes", async () => {
-	const { handlers, ctx } = installExtension();
+test("cancels a stale compaction without reporting success", async () => {
+	const { handlers, ctx, notify, setStatus } = installExtension([], true);
 	let resolveFetch!: (response: Response) => void;
 	let markFetchStarted!: () => void;
 	const fetchStarted = new Promise<void>((resolve) => {
@@ -349,6 +397,11 @@ test("cancels a stale compaction after the session tree changes", async () => {
 			},
 		}));
 		await expect(compaction).resolves.toEqual({ cancel: true });
+		expect(setStatus.mock.calls).toEqual([
+			["codex-compact", "Compacting context with Codex (manual)…"],
+			["codex-compact", undefined],
+		]);
+		expect(notify).not.toHaveBeenCalledWith("Codex context compacted (manual).", "info");
 		const headers: Record<string, string | null> = {};
 		handlers.get("before_provider_headers")?.({ headers }, ctx);
 		expect(headers["x-codex-turn-state"]).toBeUndefined();
@@ -437,8 +490,8 @@ test.each([
 	expect(notice).toContain(`next=${nextStep}.`);
 });
 
-test("reuses the last request settings and turn state for manual compaction", async () => {
-	const { handlers, ctx, model } = installExtension();
+test("presents manual remote compaction", async () => {
+	const { handlers, ctx, model, notify, setStatus } = installExtension([], true);
 	await handlers.get("before_provider_request")?.({
 		payload: {
 			model: model.id,
@@ -469,6 +522,11 @@ test("reuses the last request settings and turn state for manual compaction", as
 			signal: new AbortController().signal,
 		}, ctx);
 
+		expect(setStatus.mock.calls).toEqual([
+			["codex-compact", "Compacting context with Codex (manual)…"],
+			["codex-compact", undefined],
+		]);
+		expect(notify).toHaveBeenCalledWith("Codex context compacted (manual).", "info");
 		expect(requestBody).toMatchObject({
 			instructions: "request instructions",
 			reasoning: { effort: "xhigh", summary: "detailed" },

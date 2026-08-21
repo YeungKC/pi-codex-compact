@@ -27,6 +27,8 @@ export type ModelSelectLike = {
 	previousModel?: Model<any>;
 };
 
+export type RemoteCompactionReason = "manual" | "automatic" | "model-transition" | "context-overflow-recovery" | "context-recovery";
+
 export type CheckpointFactory = (params: {
 	ctx: ExtensionContext;
 	model: Model<any>;
@@ -47,6 +49,11 @@ export type SessionCoordinatorDeps = {
 		input: ResponseItem[];
 		reason?: "automatic" | "downshift";
 	}) => boolean;
+	runCompaction?: <T>(
+		ctx: ExtensionContext,
+		reason: RemoteCompactionReason,
+		operation: () => Promise<T>,
+	) => Promise<T>;
 };
 
 type PendingTransition = {
@@ -372,6 +379,11 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			return branchWithoutFailedRequests(branch, activeFailedRequests(branch));
 		}
 	};
+	const runRemoteCompaction = <T>(
+		ctx: ExtensionContext,
+		reason: RemoteCompactionReason,
+		operation: () => Promise<T>,
+	): Promise<T> => deps.runCompaction?.(ctx, reason, operation) ?? operation();
 	const pendingBySession = new Map<string, PendingTransition>();
 	const transitionBySession = new Map<string, Promise<void>>();
 	const automaticCompactionBySession = new Map<string, Promise<void>>();
@@ -480,40 +492,42 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 		signal?: AbortSignal,
 	): Promise<ResponseItem[]> => {
 		if (!requestInput) throw contextOverflowRecoveryError(model);
-		const sessionId = ctx.sessionManager.getSessionId();
-		const branch = deps.getBranch(ctx);
-		const checkpoint = findNativeCheckpoint(branch);
-		const pending = pendingBySession.get(sessionId);
-		const checkpointModel = checkpoint.status === "valid"
-			? resolveModel(ctx, checkpoint.checkpoint.details.modelKey)
-			: undefined;
-		const compactionModel = pending?.previousModel
-			?? (checkpointModel && isOpenAICodexModel(checkpointModel) ? checkpointModel : model);
-		const lastUserIndex = requestInput.findLastIndex((item) => item.role === "user");
-		const historyInput = lastUserIndex >= 0 ? requestInput.slice(0, lastUserIndex) : requestInput;
-		const reservedTokens = compactionRequestReservedTokens(ctx, basePayload, deps.getAllTools());
-		const input = latestRemoteCompactionSuffix(historyInput, compactionModel.contextWindow, reservedTokens);
-		if (input.length === 0) throw contextOverflowRecoveryError(compactionModel);
-		const leafId = conversationLeafId(branch);
-		const startGeneration = generation;
-		const native = await deps.createCheckpoint({ ctx, model: compactionModel, input, basePayload, signal: signal ?? ctx.signal });
-		ensureNotAborted(signal ?? ctx.signal);
-		if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
-			throw new Error("The session changed while Codex context overflow recovery was running.");
-		}
-		const preservedInput = lastUserIndex >= 0 ? requestInput.slice(lastUserIndex) : [];
-		const details = rebindCheckpoint(
-			appendPreservedInput(native.details, preservedInput),
-			modelKey(model),
-			compactionHash(model),
-		);
+		return runRemoteCompaction(ctx, "context-overflow-recovery", async () => {
+			const sessionId = ctx.sessionManager.getSessionId();
+			const branch = deps.getBranch(ctx);
+			const checkpoint = findNativeCheckpoint(branch);
+			const pending = pendingBySession.get(sessionId);
+			const checkpointModel = checkpoint.status === "valid"
+				? resolveModel(ctx, checkpoint.checkpoint.details.modelKey)
+				: undefined;
+			const compactionModel = pending?.previousModel
+				?? (checkpointModel && isOpenAICodexModel(checkpointModel) ? checkpointModel : model);
+			const lastUserIndex = requestInput.findLastIndex((item) => item.role === "user");
+			const historyInput = lastUserIndex >= 0 ? requestInput.slice(0, lastUserIndex) : requestInput;
+			const reservedTokens = compactionRequestReservedTokens(ctx, basePayload, deps.getAllTools());
+			const input = latestRemoteCompactionSuffix(historyInput, compactionModel.contextWindow, reservedTokens);
+			if (input.length === 0) throw contextOverflowRecoveryError(compactionModel);
+			const leafId = conversationLeafId(branch);
+			const startGeneration = generation;
+			const native = await deps.createCheckpoint({ ctx, model: compactionModel, input, basePayload, signal: signal ?? ctx.signal });
+			ensureNotAborted(signal ?? ctx.signal);
+			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
+				throw new Error("The session changed while Codex context overflow recovery was running.");
+			}
+			const preservedInput = lastUserIndex >= 0 ? requestInput.slice(lastUserIndex) : [];
+			const details = rebindCheckpoint(
+				appendPreservedInput(native.details, preservedInput),
+				modelKey(model),
+				compactionHash(model),
+			);
 
-		deps.appendCheckpoint(details);
-		pendingBySession.delete(ctx.sessionManager.getSessionId());
-		return [
-			...details.replacementHistory,
-			...(details.preservedInput ?? []),
-		];
+			deps.appendCheckpoint(details);
+			pendingBySession.delete(ctx.sessionManager.getSessionId());
+			return [
+				...details.replacementHistory,
+				...(details.preservedInput ?? []),
+			];
+		});
 	};
 
 	const recoverCurrentModel = async (
@@ -550,35 +564,37 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			});
 			if (deps.shouldAutoCompact?.({ ctx, model, input, reason: "downshift" }) !== true) return;
 		}
-		const startGeneration = generation;
-		const transition = previousModel
-			? runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration, requestInput, excludeLastAssistantError, operationSignal)
-			: (async () => {
-					const branch = deps.getBranch(ctx);
-					const leafId = conversationLeafId(branch);
-					const native = await deps.createCheckpoint({
-						ctx,
-						model,
-						input: effectiveInputForBranch({
-							branch: branchBeforeCurrentUser(branch, requestInput),
-							model,
-							tools: deps.getAllTools(),
-							allowCheckpointModelMismatch: true,
-							excludeLastAssistantError,
-						}),
-						basePayload,
-						signal: operationSignal,
-					});
-					ensureNotAborted(operationSignal);
-					if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
-						throw new Error("The session changed while Codex model-transition compaction was running.");
-					}
-					deps.appendCheckpoint(rebindCheckpoint(
-						preserveCurrentUser(native.details, branch, requestInput),
-						modelKey(model),
-						currentHash,
-					));
-				})();
+		const transition = runRemoteCompaction(ctx, "model-transition", async () => {
+			const startGeneration = generation;
+			if (previousModel) {
+				await runTransition(sessionId, ctx, previousModel, modelKey(model), model, basePayload, startGeneration, requestInput, excludeLastAssistantError, operationSignal);
+				return;
+			}
+			const branch = deps.getBranch(ctx);
+			const leafId = conversationLeafId(branch);
+			const native = await deps.createCheckpoint({
+				ctx,
+				model,
+				input: effectiveInputForBranch({
+					branch: branchBeforeCurrentUser(branch, requestInput),
+					model,
+					tools: deps.getAllTools(),
+					allowCheckpointModelMismatch: true,
+					excludeLastAssistantError,
+				}),
+				basePayload,
+				signal: operationSignal,
+			});
+			ensureNotAborted(operationSignal);
+			if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
+				throw new Error("The session changed while Codex model-transition compaction was running.");
+			}
+			deps.appendCheckpoint(rebindCheckpoint(
+				preserveCurrentUser(native.details, branch, requestInput),
+				modelKey(model),
+				currentHash,
+			));
+		});
 		transitionBySession.set(sessionId, transition);
 		try {
 			await transition;
@@ -705,37 +721,39 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 			);
 		} catch (error) {
 			if (!pending && checkpoint.status !== "valid") return requestInputWasSanitized ? requestInput : undefined;
-			const compactionInput = withoutLastUser(requestInput!);
-			const createCheckpointFor = (selectedModel: Model<any>) => deps.createCheckpoint({
-				ctx,
-				model: selectedModel,
-				input: compactionInput,
-				basePayload,
-				signal: ctx.signal,
-			});
-			let native: Awaited<ReturnType<CheckpointFactory>>;
-			try {
-				native = await createCheckpointFor(historyModel);
-			} catch (firstError) {
-				if (
-					(modelKey(model) === modelKey(historyModel) && compactionHash(model) === compactionHash(historyModel))
-					|| !shouldRetryWithCurrentModel(firstError)
-				) throw firstError;
+			return runRemoteCompaction(ctx, "context-recovery", async () => {
+				const compactionInput = withoutLastUser(requestInput!);
+				const createCheckpointFor = (selectedModel: Model<any>) => deps.createCheckpoint({
+					ctx,
+					model: selectedModel,
+					input: compactionInput,
+					basePayload,
+					signal: ctx.signal,
+				});
+				let native: Awaited<ReturnType<CheckpointFactory>>;
 				try {
-					native = await createCheckpointFor(model);
-				} catch {
-					throw firstError;
+					native = await createCheckpointFor(historyModel);
+				} catch (firstError) {
+					if (
+						(modelKey(model) === modelKey(historyModel) && compactionHash(model) === compactionHash(historyModel))
+						|| !shouldRetryWithCurrentModel(firstError)
+					) throw firstError;
+					try {
+						native = await createCheckpointFor(model);
+					} catch {
+						throw firstError;
+					}
 				}
-			}
-			ensureNotAborted(ctx.signal);
-			const details = rebindCheckpoint(
-				preserveRequestUser(native.details, requestInput!),
-				modelKey(model),
-				compactionHash(model),
-			);
-			deps.appendCheckpoint(details);
-			pendingBySession.delete(sessionId);
-			return [...details.replacementHistory, ...(details.preservedInput ?? [])];
+				ensureNotAborted(ctx.signal);
+				const details = rebindCheckpoint(
+					preserveRequestUser(native.details, requestInput!),
+					modelKey(model),
+					compactionHash(model),
+				);
+				deps.appendCheckpoint(details);
+				pendingBySession.delete(sessionId);
+				return [...details.replacementHistory, ...(details.preservedInput ?? [])];
+			});
 		}
 
 
@@ -751,7 +769,9 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				pendingBySession.delete(sessionId);
 			} else {
 				const startGeneration = generation;
-				const transition = runTransition(sessionId, ctx, pending.previousModel, pending.targetModelKey, model, basePayload, startGeneration, requestInput);
+				const transition = runRemoteCompaction(ctx, "model-transition", () =>
+					runTransition(sessionId, ctx, pending.previousModel, pending.targetModelKey, model, basePayload, startGeneration, requestInput),
+				);
 				transitionBySession.set(sessionId, transition);
 				try {
 					await transition;
@@ -795,13 +815,14 @@ export function createSessionCoordinator(deps: SessionCoordinatorDeps) {
 				) {
 					const startGeneration = generation;
 					const leafId = conversationLeafId(branch);
-					const automaticCompaction = deps.createCheckpoint({
-						ctx,
-						model,
-						input: currentHistory,
-						basePayload,
-						signal: ctx.signal,
-					}).then((native) => {
+					const automaticCompaction = runRemoteCompaction(ctx, "automatic", async () => {
+						const native = await deps.createCheckpoint({
+							ctx,
+							model,
+							input: currentHistory,
+							basePayload,
+							signal: ctx.signal,
+						});
 						ensureNotAborted(ctx.signal);
 						if (generation !== startGeneration || conversationLeafId(deps.getBranch(ctx)) !== leafId) {
 							throw new Error("The session changed while Codex automatic compaction was running.");

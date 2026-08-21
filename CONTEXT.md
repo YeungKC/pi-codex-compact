@@ -7,6 +7,9 @@ This context defines the domain boundary for `pi-codex-compact`: keep Pi's remot
 **Remote compaction**:
 Codex server-side compaction of model-visible history into an opaque continuation state. This is the behavior the extension matches.
 
+**Remote compaction operation**:
+One user-visible attempt to install remote continuation state. Its transport retries and fallback attempts are one operation; separate model-transition and automatic compactions are separate operations.
+
 **Compaction trigger**:
 A transient final request item that asks the remote Codex service to compact the supplied history. It is a request signal, not retained history.
 

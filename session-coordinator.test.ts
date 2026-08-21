@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
-import { createSessionCoordinator } from "./session-coordinator.ts";
+import { createSessionCoordinator, type RemoteCompactionReason } from "./session-coordinator.ts";
 import {
 	effectiveInputForBranch,
 	findNativeCheckpoint,
@@ -83,6 +83,7 @@ function createCoordinator(
 	branch: SessionEntry[] = [],
 	createCheckpoint?: (selectedModel: Model<any>, input: ResponseItem[], basePayload?: Record<string, unknown>) => Promise<NativeCompactionDetails>,
 	shouldAutoCompact?: (input: ResponseItem[]) => boolean,
+	onCompaction?: (reason: RemoteCompactionReason) => void,
 ) {
 	return createSessionCoordinator({
 		getBranch: () => branch,
@@ -95,6 +96,12 @@ function createCoordinator(
 		appendCheckpoint: (value) => branch.push(customEntry(value)),
 		appendFailedRequest: (value) => branch.push(customEntry(value, "failed-request", FAILED_REQUEST_KIND)),
 		shouldAutoCompact: shouldAutoCompact ? ({ input }) => shouldAutoCompact(input) : undefined,
+		runCompaction: onCompaction
+			? async (_ctx, reason, operation) => {
+				onCompaction(reason);
+				return operation();
+			}
+			: undefined,
 	});
 }
 
@@ -430,6 +437,7 @@ describe("Codex session coordinator", () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
 		const compactedWith: string[] = [];
+		const operations: RemoteCompactionReason[] = [];
 		const coordinator = createCoordinator([], async (selectedModel) => {
 			compactedWith.push(modelKey(selectedModel));
 			if (selectedModel === oldModel) {
@@ -438,7 +446,7 @@ describe("Codex session coordinator", () => {
 				throw error;
 			}
 			return details(modelKey(selectedModel), "fallback");
-		});
+		}, undefined, (reason) => operations.push(reason));
 
 		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
 		await expect(coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("hello")])).resolves.toEqual([
@@ -446,6 +454,7 @@ describe("Codex session coordinator", () => {
 			userInput("hello"),
 		]);
 		expect(compactedWith).toEqual([modelKey(oldModel), modelKey(currentModel)]);
+		expect(operations).toEqual(["model-transition"]);
 	});
 
 	test("keeps unknown credential transition failures out of current-model fallback", async () => {
@@ -525,10 +534,11 @@ describe("Codex session coordinator", () => {
 		const newText = "new ".repeat(5);
 		const branch = [userEntry(oldText), userEntry(newText)];
 		let compactedInput: ResponseItem[] | undefined;
+		const operations: RemoteCompactionReason[] = [];
 		const coordinator = createCoordinator(branch, async (_selectedModel, input) => {
 			compactedInput = input;
 			return details(modelKey(currentModel), "recovered");
-		});
+		}, undefined, (reason) => operations.push(reason));
 		const toolOutput = { type: "function_call_output", call_id: "call", output: "tool result" };
 		const request = [userInput(oldText), userInput(newText), userInput("current"), toolOutput];
 
@@ -545,6 +555,7 @@ describe("Codex session coordinator", () => {
 			toolOutput,
 		]);
 		expect(compactedInput).toEqual([userInput(newText)]);
+		expect(operations).toEqual(["context-overflow-recovery"]);
 		expect(effectiveInputForBranch({ branch, model: currentModel, tools: [] })).toEqual([
 			{ type: "compaction", encrypted_content: "recovered" },
 			userInput("current"),
@@ -763,11 +774,12 @@ describe("Codex session coordinator", () => {
 		expect(input?.filter((item) => item.role === "user")).toEqual([oldUser, userInput("same")]);
 	});
 
-	test("does not duplicate a user across transition and automatic compaction", async () => {
+	test("presents separate transition and automatic compactions", async () => {
 		const oldModel = model("old");
 		const currentModel = model("new");
 		const branch = [userEntry("current")];
 		let calls = 0;
+		const operations: RemoteCompactionReason[] = [];
 		const coordinator = createCoordinator(
 			branch,
 			async (selectedModel, input) => {
@@ -785,12 +797,14 @@ describe("Codex session coordinator", () => {
 				};
 			},
 			() => true,
+			(reason) => operations.push(reason),
 		);
 
 		await coordinator.selectModel({ model: currentModel, previousModel: oldModel }, context([oldModel, currentModel]));
 		const input = await coordinator.prepareRequest(currentModel, context([oldModel, currentModel]), [userInput("current")]);
 
 		expect(calls).toBe(2);
+		expect(operations).toEqual(["model-transition", "automatic"]);
 		expect(input?.filter((item) => item.role === "user")).toEqual([userInput("current")]);
 	});
 
