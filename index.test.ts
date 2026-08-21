@@ -17,7 +17,6 @@ function checkpointEntry(): SessionEntry {
 		data: {
 			kind: NATIVE_COMPACTION_KIND,
 			version: 2,
-			strategy: "v2",
 			modelKey: "openai-codex:openai-codex-responses:gpt",
 			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
 		},

@@ -14,12 +14,20 @@ import {
 	markFallbackEligibility,
 	NATIVE_COMPACTION_KIND,
 	NATIVE_COMPACTION_VERSION,
-	resolveCodexResponsesUrl,
 	trimFunctionCallHistoryToFitContextWindow,
 	type JsonObject,
 	type NativeCompactionDetails,
 	type ResponseItem,
 } from "./native-compaction.ts";
+
+const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+
+function resolveCodexResponsesUrl(baseUrl?: string): string {
+	const normalized = (baseUrl?.trim() || DEFAULT_CODEX_BASE_URL).replace(/\/+$/, "");
+	if (normalized.endsWith("/codex/responses")) return normalized;
+	if (normalized.endsWith("/codex")) return `${normalized}/responses`;
+	return `${normalized}/codex/responses`;
+}
 
 export type NativeCheckpointRequest = {
 	ctx: ExtensionContext;
@@ -33,13 +41,8 @@ export type NativeCheckpointRequest = {
 	activeToolNames: string[];
 };
 
-export type NativeCheckpointResult = {
-	details: NativeCompactionDetails;
-	usage?: Awaited<ReturnType<typeof callRemoteCompaction>>["usage"];
-};
-
 function compactionBasePayload(params: NativeCheckpointRequest): JsonObject {
-	const base = params.basePayload ? structuredClone(params.basePayload) : {};
+	const base = { ...params.basePayload };
 	const activeModel = params.ctx.model;
 	const payloadModel = typeof base.model === "string" ? base.model : undefined;
 	if (
@@ -61,7 +64,10 @@ function compactionBasePayload(params: NativeCheckpointRequest): JsonObject {
 }
 
 /** Owns the V2 remote protocol seam. The lifecycle adapter supplies session facts. */
-export async function createNativeCheckpoint(params: NativeCheckpointRequest): Promise<NativeCheckpointResult> {
+export async function createNativeCheckpoint(params: NativeCheckpointRequest): Promise<{
+	details: NativeCompactionDetails;
+	usage?: Awaited<ReturnType<typeof callRemoteCompaction>>["usage"];
+}> {
 	const auth = await params.ctx.modelRegistry.getApiKeyAndHeaders(params.model);
 	if (!auth.ok || !auth.apiKey) {
 		const error = markFallbackEligibility(
@@ -130,7 +136,6 @@ export async function createNativeCheckpoint(params: NativeCheckpointRequest): P
 		details: {
 			kind: NATIVE_COMPACTION_KIND,
 			version: NATIVE_COMPACTION_VERSION,
-			strategy: "v2",
 			modelKey: modelKey(params.model),
 			...(compactionHash(params.model) ? { compHash: compactionHash(params.model) } : {}),
 			replacementHistory: buildReplacementHistory(input, remote.compactionItem),

@@ -96,6 +96,14 @@ describe("Codex compaction history", () => {
 	test("reserves the stable prefix before sending remote compaction", async () => {
 		let requestUrl: string | undefined;
 		let requestBody: Record<string, unknown> | undefined;
+		const basePayload = {
+			model: "previous",
+			reasoning: { effort: "low" },
+			service_tier: "priority",
+			text: { verbosity: "high" },
+			temperature: 0,
+		};
+		const originalBasePayload = structuredClone(basePayload);
 		vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
 			requestUrl = url;
 			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -105,7 +113,7 @@ describe("Codex compaction history", () => {
 			].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } });
 		});
 		try {
-			await createNativeCheckpoint({
+			const checkpoint = await createNativeCheckpoint({
 				ctx: {
 					getSystemPrompt: () => "i".repeat(400),
 					thinkingLevel: "high",
@@ -121,10 +129,14 @@ describe("Codex compaction history", () => {
 				} as never,
 				model: { id: "gpt", provider: "openai-codex", api: "openai-codex-responses", contextWindow: 160 } as never,
 				input: [{ type: "function_call_output", call_id: "1", output: "x".repeat(400) }],
+				basePayload,
 				allTools: [],
 				activeToolNames: [],
 			});
 			expect(requestUrl).toBe("https://auth.example/backend-api/codex/responses");
+			expect(basePayload).toEqual(originalBasePayload);
+			expect(checkpoint.details).not.toHaveProperty("strategy");
+			expect(parseNativeCompactionDetails(checkpoint.details)).toBeDefined();
 			expect(requestBody?.reasoning).toEqual({ effort: "high", summary: "auto" });
 			expect(requestBody?.input).toEqual(expect.arrayContaining([
 				expect.objectContaining({ type: "compaction_trigger" }),
@@ -1345,14 +1357,17 @@ describe("Codex compaction history", () => {
 	});
 
 	test("keeps the newest complete user turn for overflow recovery", () => {
-		const result = latestRemoteCompactionSuffix([
+		const items = [
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },
 			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "old answer" }] },
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "new" }] },
 			{ type: "function_call", call_id: "call", name: "shell", arguments: "{}" },
 			{ type: "function_call_output", call_id: "call", output: "new result" },
-		], 1_000);
+		];
+		const original = structuredClone(items);
+		const result = latestRemoteCompactionSuffix(items, 1_000);
 
+		expect(items).toEqual(original);
 		expect(result).toEqual([
 			{ type: "message", role: "user", content: [{ type: "input_text", text: "new" }] },
 			{ type: "function_call", call_id: "call", name: "shell", arguments: "{}" },
@@ -1423,14 +1438,17 @@ describe("Codex compaction history", () => {
 		expect(() => buildReplacementHistory([], { type: "message", role: "assistant", content: [] })).toThrow();
 	});
 
-	test("accepts a persisted compaction hash", () => {
-		expect(parseNativeCompactionDetails({
+	test("accepts persisted V2 checkpoints with or without strategy", () => {
+		const checkpoint = {
 			kind: "openai-codex-native-compaction",
 			version: NATIVE_COMPACTION_VERSION,
 			modelKey: "openai-codex:openai-codex-responses:test",
 			compHash: "3000",
 			replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
-		})?.compHash).toBe("3000");
+		};
+		for (const strategy of [undefined, "v2"]) {
+			expect(parseNativeCompactionDetails({ ...checkpoint, ...(strategy ? { strategy } : {}) })?.compHash).toBe("3000");
+		}
 	});
 
 	test("ignores a version-one checkpoint", () => {
@@ -1492,10 +1510,10 @@ describe("Codex compaction history", () => {
 				customType: NATIVE_COMPACTION_KIND,
 				data: {
 					kind: NATIVE_COMPACTION_KIND,
-					version: 1,
+					version: NATIVE_COMPACTION_VERSION,
 					strategy: "token-budget",
 					modelKey: "openai-codex:openai-codex-responses:test",
-					replacementHistory: [],
+					replacementHistory: [{ type: "compaction", encrypted_content: "local" }],
 				},
 			},
 		] as never).status).toBe("none");

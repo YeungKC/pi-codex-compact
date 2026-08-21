@@ -134,9 +134,7 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	};
 	pi.on("turn_start", clearTurnState);
 	pi.on("turn_end", clearTurnState);
-	pi.on("model_select", async (event, ctx) => {
-		await coordinator.selectModel(event, ctx);
-	});
+	pi.on("model_select", (event, ctx) => coordinator.selectModel(event, ctx));
 
 	pi.on("context", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return undefined;
@@ -250,7 +248,6 @@ export default function codexCompactionExtension(pi: ExtensionAPI): void {
 					ctx,
 					model,
 					input,
-					basePayload: basePayloadBySession.get(sessionId),
 					signal: event.signal,
 				});
 				if (lifecycleGeneration !== lifecycleGenerationAtStart) return { cancel: true };

@@ -12,12 +12,11 @@ export const NATIVE_COMPACTION_KIND = "openai-codex-native-compaction";
 export const FAILED_REQUEST_KIND = "openai-codex-failed-request";
 export const NATIVE_COMPACTION_VERSION = 2;
 export const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
-export const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
+const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
 
-const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const MAX_REMOTE_RETRIES = 2;
 const V2_COMPACTION_IDLE_TIMEOUT_MS = 300_000;
-export const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
+const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 10_000;
 
 const FAIL_CLOSED_ERROR_PATTERN = /(?:credential|policy|auth(?:entication|orization)?|access[_ -]?denied|malformed|misalignment[_ -]?policy|cyber[_ -]?policy|invalid[_ -]?image|content[ _-]?(?:filter|policy)|safety[_ -]?policy|policy[_ -]?(?:violation|denied|failure|failed)|unauthorized|forbidden|permission|api[_ -]?key|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failure|failed|denied|error)|(?:invalid|expired|bearer|refresh)[_ -]?token|cancel(?:led|ed|lation)?|aborted|insufficient[_ -]?quota|quota[_ -]?exceeded|usage[_ -]?not[_ -]?included|available[_ -]?balance|insufficient[_ -]?funds|out[_ -]?of[_ -]?budget|billing|protocol[_ -]?(?:failure|error))/i;
 const NON_RETRYABLE_FALLBACK_ERROR_CODES = new Set([
@@ -103,7 +102,6 @@ export type FailedRequestDetails = {
 export interface NativeCompactionDetails {
 	kind: typeof NATIVE_COMPACTION_KIND;
 	version: typeof NATIVE_COMPACTION_VERSION;
-	strategy: "v2";
 	modelKey: string;
 	compHash?: string;
 	preservedInput?: ResponseItem[];
@@ -120,11 +118,6 @@ export type CheckpointLookup =
 	| { status: "none" }
 	| { status: "invalid"; entryIndex: number; entryId: string }
 	| { status: "valid"; checkpoint: NativeCheckpoint };
-
-export type RemoteCompactionResult = {
-	compactionItem: ResponseItem;
-	usage?: Usage;
-};
 
 export function isJsonObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -262,7 +255,6 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	return {
 		kind: NATIVE_COMPACTION_KIND,
 		version: NATIVE_COMPACTION_VERSION,
-		strategy: "v2",
 		modelKey: value.modelKey,
 		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
 		...(preservedInput ? { preservedInput: preservedInput.map((item) => structuredClone(item)) } : {}),
@@ -410,7 +402,7 @@ function toolResultOutput(message: JsonObject, model: Model<any>): unknown {
 	];
 }
 
-function responseTool(tool: ToolInfo, deferLoading = false, supportsStrictMode = true): JsonObject {
+function responseTool(tool: ToolInfo, deferLoading: boolean, supportsStrictMode: boolean): JsonObject {
 	return {
 		type: "function",
 		name: tool.name,
@@ -792,17 +784,13 @@ export function trimFunctionCallHistoryToFitContextWindow(
 	return result;
 }
 
-function truncateTextPrefix(text: string, maxCharacters: number): string {
-	return text.slice(0, Math.max(0, maxCharacters));
-}
-
 function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | undefined {
 	if ((item.type !== "message" && item.type !== undefined) || maxTokens <= 0) return undefined;
 	const copy = structuredClone(item);
 	let remainingCharacters = maxTokens * 4;
 
 	if (typeof copy.content === "string") {
-		copy.content = truncateTextPrefix(copy.content, remainingCharacters);
+		copy.content = copy.content.slice(0, Math.max(0, remainingCharacters));
 		return copy.content ? copy : undefined;
 	}
 	if (!Array.isArray(copy.content)) return copy;
@@ -810,7 +798,7 @@ function truncateMessage(item: ResponseItem, maxTokens: number): ResponseItem | 
 	const truncatedContent = copy.content.flatMap((part) => {
 		if (!isJsonObject(part) || typeof part.text !== "string") return [part];
 		if (remainingCharacters <= 0) return [];
-		const text = truncateTextPrefix(part.text, remainingCharacters);
+		const text = part.text.slice(0, Math.max(0, remainingCharacters));
 		remainingCharacters -= text.length;
 		return text ? [{ ...part, text }] : [];
 	});
@@ -961,16 +949,15 @@ export function latestRemoteCompactionSuffix(
 	maxTokens: number,
 	reservedTokens = 0,
 ): ResponseItem[] {
-	const source = items.map((item) => structuredClone(item));
 	const budget = Math.max(0, maxTokens - reservedTokens);
-	const userStarts = source.flatMap((item, index) => item.role === "user" ? [index] : []);
+	const userStarts = items.flatMap((item, index) => item.role === "user" ? [index] : []);
 	if (userStarts.length === 0) return [];
 	const candidateStart = userStarts.at(-1)!;
-	const candidate = trimFunctionCallHistoryToFitContextWindow(source.slice(candidateStart), maxTokens, reservedTokens);
+	const candidate = trimFunctionCallHistoryToFitContextWindow(items.slice(candidateStart), maxTokens, reservedTokens);
 	if (approximateResponseItemTokens(candidate) > budget) return [];
-	if (candidateStart === 0 && userStarts.length === 1 && JSON.stringify(candidate) === JSON.stringify(source)) return [];
-	if (candidateStart > 0 && (source[candidateStart - 1]?.type === "compaction" || source[candidateStart - 1]?.type === "context_compaction")) {
-		const withCheckpoint = trimFunctionCallHistoryToFitContextWindow(source.slice(candidateStart - 1), maxTokens, reservedTokens);
+	if (candidateStart === 0 && userStarts.length === 1 && JSON.stringify(candidate) === JSON.stringify(items)) return [];
+	if (candidateStart > 0 && (items[candidateStart - 1]?.type === "compaction" || items[candidateStart - 1]?.type === "context_compaction")) {
+		const withCheckpoint = trimFunctionCallHistoryToFitContextWindow(items.slice(candidateStart - 1), maxTokens, reservedTokens);
 		if (approximateResponseItemTokens(withCheckpoint) <= budget) return withCheckpoint;
 	}
 	return candidate;
@@ -1068,14 +1055,7 @@ export function buildCompactionRequestBody(params: {
 	return body;
 }
 
-export function resolveCodexResponsesUrl(baseUrl?: string): string {
-	const normalized = (baseUrl?.trim() || DEFAULT_CODEX_BASE_URL).replace(/\/+$/, "");
-	if (normalized.endsWith("/codex/responses")) return normalized;
-	if (normalized.endsWith("/codex")) return `${normalized}/responses`;
-	return `${normalized}/codex/responses`;
-}
-
-export function extractCodexAccountId(token: string): string {
+function extractCodexAccountId(token: string): string {
 	try {
 		const parts = token.split(".");
 		if (parts.length !== 3) throw new Error("Invalid token");
@@ -1612,17 +1592,15 @@ function usageFromResponse(
 	return usage;
 }
 
-async function runRemoteCompaction<T>(params: {
+export async function callRemoteCompaction(params: {
 	url: string;
 	headers: Headers;
 	body: JsonObject;
+	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
-	prefix: string;
-	idleTimeoutMs: number;
-	parse: (response: Response, idleTimeoutMs: number) => Promise<T>;
 	onTurnState?: (turnState: string) => void;
-}): Promise<T> {
+}) {
 	const fetchImpl = params.fetchImpl ?? fetch;
 	let lastError: unknown;
 	let turnStateCaptured = params.headers.has("x-codex-turn-state");
@@ -1640,7 +1618,7 @@ async function runRemoteCompaction<T>(params: {
 						body: JSON.stringify(params.body),
 						signal: attemptController.signal,
 					}),
-					params.idleTimeoutMs,
+					V2_COMPACTION_IDLE_TIMEOUT_MS,
 					"OpenAI Codex compaction request timed out.",
 					(error) => attemptController.abort(error),
 				);
@@ -1655,14 +1633,23 @@ async function runRemoteCompaction<T>(params: {
 					const classified = classifyHttpCompactionError(
 						response.status,
 						body || response.statusText,
-						params.prefix,
+						"OpenAI Codex compaction failed",
 					);
 					if (!classified.retryable || attempt === MAX_REMOTE_RETRIES) throw classified.error;
 					lastError = classified.error;
 					await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
 					continue;
 				}
-				return await params.parse(response, params.idleTimeoutMs);
+				const parsed = await parseSseResponse(response, params.signal, V2_COMPACTION_IDLE_TIMEOUT_MS);
+				return {
+					compactionItem: parsed.item,
+					usage: usageFromResponse(
+						params.model,
+						parsed.usage,
+						typeof params.body.service_tier === "string" ? params.body.service_tier : undefined,
+						parsed.serviceTier,
+					),
+				};
 			} finally {
 				params.signal?.removeEventListener("abort", relayAbort);
 				attemptController.abort();
@@ -1680,35 +1667,7 @@ async function runRemoteCompaction<T>(params: {
 			await delay(retryAfterMs ?? 1000 * 2 ** attempt, params.signal);
 		}
 	}
-	throw lastError instanceof Error ? lastError : new Error(params.prefix);
-}
-
-export function callRemoteCompaction(params: {
-	url: string;
-	headers: Headers;
-	body: JsonObject;
-	model: Model<any>;
-	signal?: AbortSignal;
-	fetchImpl?: typeof fetch;
-	onTurnState?: (turnState: string) => void;
-}): Promise<RemoteCompactionResult> {
-	return runRemoteCompaction({
-		...params,
-		prefix: "OpenAI Codex compaction failed",
-		idleTimeoutMs: V2_COMPACTION_IDLE_TIMEOUT_MS,
-		parse: async (response, idleTimeoutMs) => {
-			const parsed = await parseSseResponse(response, params.signal, idleTimeoutMs);
-			return {
-				compactionItem: parsed.item,
-				usage: usageFromResponse(
-					params.model,
-					parsed.usage,
-					typeof params.body.service_tier === "string" ? params.body.service_tier : undefined,
-					parsed.serviceTier,
-				),
-			};
-		},
-	});
+	throw lastError instanceof Error ? lastError : new Error("OpenAI Codex compaction failed");
 }
 
 export function stripInputFromPayload(payload: JsonObject): JsonObject {

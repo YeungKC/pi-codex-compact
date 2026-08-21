@@ -49,7 +49,6 @@ function details(key: string, encrypted = "opaque"): NativeCompactionDetails {
 	return {
 		kind: NATIVE_COMPACTION_KIND,
 		version: NATIVE_COMPACTION_VERSION,
-		strategy: "v2",
 		modelKey: key,
 		replacementHistory: [{ type: "compaction", encrypted_content: encrypted }],
 	};
