@@ -65,9 +65,15 @@ function installExtension(branch: SessionEntry[] = [], hasUI = false) {
 		getAllTools: () => [],
 		getActiveTools: () => [],
 		appendEntry,
-	} as never);
+	} as never, "/tmp/pi-codex-compact-test");
 	return { handlers, ctx, model, notify, appendEntry };
 }
+
+test("does not register in its own source checkout", () => {
+	const on = vi.fn();
+	codexCompactionExtension({ on } as never);
+	expect(on).not.toHaveBeenCalled();
+});
 
 test("removes unsupported prompt cache retention from Codex requests", async () => {
 	const { handlers, ctx } = installExtension();
