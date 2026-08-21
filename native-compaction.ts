@@ -287,7 +287,7 @@ export function findNativeCheckpoint(branch: SessionEntry[]): CheckpointLookup {
 			continue;
 		}
 
-		if (isJsonObject(rawDetails) && rawDetails.strategy === "token-budget") continue;
+		if (isJsonObject(rawDetails) && rawDetails.strategy === "token-budget") return { status: "none" };
 		if (isJsonObject(rawDetails) && (rawDetails.version === 1 || rawDetails.strategy === "v1")) {
 			return { status: "none" };
 		}
@@ -784,7 +784,7 @@ export function trimFunctionCallHistoryToFitContextWindow(
 	for (const group of retainedMessageGroups(result).reverse()) {
 		if (excess <= 0) break;
 		const rewritten = truncateFunctionOutput(group.source);
-		if (!rewritten) continue;
+		if (!rewritten) break;
 		const current = approximateTokens(group.source);
 		result[group.sourceIndex] = rewritten;
 		excess -= current - approximateTokens(rewritten);
@@ -1383,7 +1383,7 @@ async function parseSseResponse(
 	response: Response,
 	signal?: AbortSignal,
 	idleTimeoutMs = V2_COMPACTION_IDLE_TIMEOUT_MS,
-): Promise<{ item: ResponseItem; usage?: unknown }> {
+): Promise<{ item: ResponseItem; usage?: unknown; serviceTier?: string }> {
 	if (!response.body) {
 		throw markFallbackEligibility(
 			markCompactionRetry(new Error("OpenAI Codex returned an empty compaction stream."), "explicit"),
@@ -1400,6 +1400,7 @@ async function parseSseResponse(
 	let buffer = "";
 	let completed = false;
 	let usage: unknown;
+	let serviceTier: string | undefined;
 	const compactionItems: ResponseItem[] = [];
 	const onAbort = () => {
 		void reader.cancel().catch(() => {});
@@ -1509,8 +1510,16 @@ async function parseSseResponse(
 			throw classifySseCompactionError(code, message);
 		}
 		if (event.type === "response.completed") {
+			const response = isJsonObject(event.response) ? event.response : undefined;
+			if (typeof response?.id !== "string") {
+				throw markFallbackEligibility(
+					markCompactionRetry(new Error("OpenAI Codex returned a malformed response.completed response."), "none"),
+					false,
+				);
+			}
 			completed = true;
-			usage = isJsonObject(event.response) ? event.response.usage : undefined;
+			usage = response.usage;
+			if (typeof response.service_tier === "string") serviceTier = response.service_tier;
 		}
 	};
 
@@ -1563,10 +1572,22 @@ async function parseSseResponse(
 			"none",
 		);
 	}
-	return { item, usage };
+	return { item, usage, serviceTier };
 }
 
-function usageFromResponse(model: Model<any>, value: unknown): Usage | undefined {
+function serviceTierMultiplier(model: Model<any>, requestTier: string | undefined, responseTier: string | undefined): number {
+	const tier = responseTier === "default" ? requestTier : responseTier ?? requestTier;
+	if (tier === "flex") return 0.5;
+	if (tier === "priority") return model.id === "gpt-5.5" ? 2.5 : 2;
+	return 1;
+}
+
+function usageFromResponse(
+	model: Model<any>,
+	value: unknown,
+	requestTier: string | undefined,
+	responseTier: string | undefined,
+): Usage | undefined {
 	if (!isJsonObject(value)) return undefined;
 	const inputTokens = typeof value.input_tokens === "number" ? value.input_tokens : 0;
 	const outputTokens = typeof value.output_tokens === "number" ? value.output_tokens : 0;
@@ -1582,6 +1603,12 @@ function usageFromResponse(model: Model<any>, value: unknown): Usage | undefined
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	calculateCost(model, usage);
+	const multiplier = serviceTierMultiplier(model, requestTier, responseTier);
+	usage.cost.input *= multiplier;
+	usage.cost.output *= multiplier;
+	usage.cost.cacheRead *= multiplier;
+	usage.cost.cacheWrite *= multiplier;
+	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage;
 }
 
@@ -1673,7 +1700,12 @@ export function callRemoteCompaction(params: {
 			const parsed = await parseSseResponse(response, params.signal, idleTimeoutMs);
 			return {
 				compactionItem: parsed.item,
-				usage: usageFromResponse(params.model, parsed.usage),
+				usage: usageFromResponse(
+					params.model,
+					parsed.usage,
+					typeof params.body.service_tier === "string" ? params.body.service_tier : undefined,
+					parsed.serviceTier,
+				),
 			};
 		},
 	});

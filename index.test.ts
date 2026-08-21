@@ -342,7 +342,7 @@ test("cancels a stale compaction after the session tree changes", async () => {
 		handlers.get("session_tree")?.({}, ctx);
 		resolveFetch(new Response([
 			'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
-			'data: {"type":"response.completed"}',
+			'data: {"type":"response.completed","response":{"id":"response"}}',
 		].join("\n\n") + "\n\n", {
 			headers: {
 				"content-type": "text/event-stream",
@@ -380,7 +380,7 @@ test("does not preserve an active failed user during manual compaction", async (
 	const { handlers, ctx } = installExtension(branch);
 	vi.stubGlobal("fetch", async () => new Response([
 		'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
-		'data: {"type":"response.completed"}',
+		'data: {"type":"response.completed","response":{"id":"response"}}',
 	].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } }));
 	try {
 		const result = await handlers.get("session_before_compact")?.({
@@ -456,7 +456,7 @@ test("reuses the last request settings and turn state for manual compaction", as
 		requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
 		return new Response([
 			'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
-			'data: {"type":"response.completed"}',
+			'data: {"type":"response.completed","response":{"id":"response"}}',
 		].join("\n\n") + "\n\n", {
 			headers: { "content-type": "text/event-stream", "x-codex-turn-state": "compact-state" },
 		});

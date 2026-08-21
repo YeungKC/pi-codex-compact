@@ -101,7 +101,7 @@ describe("Codex compaction history", () => {
 			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			return new Response([
 				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
-				'data: {"type":"response.completed"}',
+				'data: {"type":"response.completed","response":{"id":"response"}}',
 			].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } });
 		});
 		try {
@@ -142,7 +142,7 @@ describe("Codex compaction history", () => {
 			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			return new Response([
 				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
-				'data: {"type":"response.completed"}',
+				'data: {"type":"response.completed","response":{"id":"response"}}',
 			].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } });
 		});
 		const deferredTools = [
@@ -276,7 +276,10 @@ describe("Codex compaction history", () => {
 						{ headers: { ...sseHeaders, "x-codex-turn-state": "sticky-after-headers" } },
 					);
 				}
-				return sse('data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}\n\ndata: {"type":"response.completed"}\n\n');
+				return sse([
+					'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+					'data: {"type":"response.completed","response":{"id":"response"}}',
+				].join("\n\n") + "\n\n");
 			},
 		}));
 		await vi.runAllTimersAsync();
@@ -553,10 +556,88 @@ describe("Codex compaction history", () => {
 				'data: {"type":"future.event","payload":"ignored"}',
 				"data: [DONE]",
 				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
-				'data: {"type":"response.completed"}',
+				'data: {"type":"response.completed","response":{"id":"response"}}',
 			].join("\n\n") + "\n\n"),
 		}));
 		expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "opaque" });
+	});
+
+	test("rejects a completed SSE response without an id", async () => {
+		const failure = await captureFailure(callRemoteCompaction(remoteRequest({
+			fetchImpl: async () => new Response([
+				'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+				'data: {"type":"response.completed","response":{}}',
+			].join("\n\n") + "\n\n", { headers: sseHeaders }),
+		})));
+		expect(failure).toMatchObject({
+			message: "OpenAI Codex returned a malformed response.completed response.",
+			retryWithCurrentModel: false,
+		});
+	});
+
+	test.each([
+		{
+			name: "missing response tier falls back to request flex",
+			modelId: "gpt",
+			requestTier: "flex",
+			responseTier: undefined,
+			expectedCost: { input: 30, output: 10, cacheRead: 15, cacheWrite: 5, total: 60 },
+		},
+		{
+			name: "response default keeps request priority for gpt-5.5",
+			modelId: "gpt-5.5",
+			requestTier: "priority",
+			responseTier: "default",
+			expectedCost: { input: 150, output: 50, cacheRead: 75, cacheWrite: 25, total: 300 },
+		},
+		{
+			name: "explicit response flex overrides request priority",
+			modelId: "gpt-5.5",
+			requestTier: "priority",
+			responseTier: "flex",
+			expectedCost: { input: 30, output: 10, cacheRead: 15, cacheWrite: 5, total: 60 },
+		},
+		{
+			name: "missing request and response tiers stay standard",
+			modelId: "gpt",
+			requestTier: undefined,
+			responseTier: undefined,
+			expectedCost: { input: 60, output: 20, cacheRead: 30, cacheWrite: 10, total: 120 },
+		},
+		{
+			name: "explicit response priority uses the 2x multiplier for gpt",
+			modelId: "gpt",
+			requestTier: undefined,
+			responseTier: "priority",
+			expectedCost: { input: 120, output: 40, cacheRead: 60, cacheWrite: 20, total: 240 },
+		},
+	] as const)("applies service tier cost rules: $name", async ({ modelId, requestTier, responseTier, expectedCost }) => {
+		const usage = {
+			input_tokens: 100,
+			output_tokens: 20,
+			total_tokens: 120,
+			input_tokens_details: { cached_tokens: 30, cache_write_tokens: 10 },
+		};
+		const body = [
+			`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "compaction", encrypted_content: "opaque" } })}`,
+			`data: ${JSON.stringify({
+				type: "response.completed",
+				response: { id: "response", usage, ...(responseTier === undefined ? {} : { service_tier: responseTier }) },
+			})}`,
+		].join("\n\n") + "\n\n";
+		const result = await callRemoteCompaction(remoteRequest({
+			model: {
+				id: modelId,
+				provider: "openai-codex",
+				api: "openai-codex-responses",
+				cost: { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 1_000_000 },
+			} as never,
+			body: requestTier === undefined ? {} : { service_tier: requestTier },
+			fetchImpl: async () => sse(body),
+		}));
+
+		expect(result.usage).toMatchObject({ input: 60, output: 20, cacheRead: 30, cacheWrite: 10, totalTokens: 120 });
+		expect(result.usage?.cost).toEqual(expectedCost);
 	});
 
 	test("preserves nested SSE error details", async () => {
@@ -645,7 +726,7 @@ describe("Codex compaction history", () => {
 					start(controller) {
 						controller.enqueue(new TextEncoder().encode([
 							'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
-							'data: {"type":"response.completed"}',
+							'data: {"type":"response.completed","response":{"id":"response"}}',
 						].join("\n\n") + "\n\n"));
 					},
 					cancel() {
@@ -1288,14 +1369,11 @@ describe("Codex compaction history", () => {
 		expect(result[1]?.output).toBe("Output exceeded the available model context and was truncated");
 	});
 
-	test("continues past a non-truncatable newest message", () => {
+	test("does not rewrite older output past a non-truncatable newest message", () => {
+		const oldOutput = { type: "function_call_output", call_id: "old", output: "old".repeat(200) };
 		const newestMessage = { type: "message", role: "assistant", content: [{ type: "output_text", text: "keep" }] };
-		const result = trimFunctionCallHistoryToFitContextWindow([
-			{ type: "function_call_output", call_id: "old", output: "old".repeat(200) },
-			newestMessage,
-		], 20);
-		expect(result[0]?.output).toBe("Output exceeded the available model context and was truncated");
-		expect(result[1]).toEqual(newestMessage);
+		const result = trimFunctionCallHistoryToFitContextWindow([oldOutput, newestMessage], 20);
+		expect(result).toEqual([oldOutput, newestMessage]);
 	});
 
 	test("keeps machine-readable auth and policy errors out of model fallback", async () => {
@@ -1387,6 +1465,40 @@ describe("Codex compaction history", () => {
 				replacementHistory: [],
 			},
 		}] as never).status).toBe("none");
+	});
+
+	test("does not replay a V2 checkpoint before a newer token-budget checkpoint", () => {
+		const timestamp = new Date().toISOString();
+		expect(findNativeCheckpoint([
+			{
+				id: "v2",
+				parentId: null,
+				timestamp,
+				type: "custom",
+				customType: NATIVE_COMPACTION_KIND,
+				data: {
+					kind: NATIVE_COMPACTION_KIND,
+					version: NATIVE_COMPACTION_VERSION,
+					strategy: "v2",
+					modelKey: "openai-codex:openai-codex-responses:test",
+					replacementHistory: [{ type: "compaction", encrypted_content: "old" }],
+				},
+			},
+			{
+				id: "local",
+				parentId: "v2",
+				timestamp,
+				type: "custom",
+				customType: NATIVE_COMPACTION_KIND,
+				data: {
+					kind: NATIVE_COMPACTION_KIND,
+					version: 1,
+					strategy: "token-budget",
+					modelKey: "openai-codex:openai-codex-responses:test",
+					replacementHistory: [],
+				},
+			},
+		] as never).status).toBe("none");
 	});
 
 	test("rejects the removed token-budget strategy in a current checkpoint", () => {
