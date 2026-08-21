@@ -1,5 +1,3 @@
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
 import { sessionEntryToContextMessages, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { shouldAutoCompact } from "./scheduler.ts";
 import { autoCompactTokenLimit, loadConfig } from "./config.ts";
@@ -25,12 +23,6 @@ import {
 } from "./native-compaction.ts";
 
 const LOCAL_MARKER = "OpenAI Codex native compaction checkpoint.";
-const SOURCE_ROOT = dirname(fileURLToPath(import.meta.url));
-
-function isSourceCheckout(cwd: string): boolean {
-	const path = relative(SOURCE_ROOT, resolve(cwd));
-	return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
-}
 const AUTHENTICATION_FAILURE_CODE_PATTERN = /^(?:authentication|authentication_error|auth_error|authorization_error|credential_error|invalid_api_key|invalid_credential|invalid_token|expired_token|token_expired|unauthorized|forbidden|permission_denied|access_denied)$/;
 const POLICY_OR_QUOTA_FAILURE_CODE_PATTERN = /^(?:policy_or_quota|policy_violation|insufficient_quota|quota_exceeded|usage_limit_(?:reached|exceeded)|usage_not_included|billing_(?:error|issue|required)|insufficient_funds|out_of_budget)$/;
 
@@ -71,8 +63,7 @@ function reportCompactionFailure(
 	return code;
 }
 
-export default function codexCompactionExtension(pi: ExtensionAPI, cwd = process.cwd()): void {
-	if (isSourceCheckout(cwd)) return;
+export default function codexCompactionExtension(pi: ExtensionAPI): void {
 	const basePayloadBySession = new Map<string, JsonObject>();
 	const turnStateBySession = new Map<string, string>();
 	let lifecycleGeneration = 0;
