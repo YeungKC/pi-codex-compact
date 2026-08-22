@@ -1,42 +1,61 @@
 # Codex Compaction
 
-Provides Pi integration for OpenAI Codex remote context checkpoints while preserving Pi's session and branch model.
-
-The `remote-compaction` module owns V1/V2 protocol adapters and returns one native checkpoint shape. The `session-coordinator` module owns lifecycle state for deferred model transitions, pre-request automatic compaction, and failure gates; `index.ts` is the Pi lifecycle adapter.
+This context defines the domain boundary for `pi-codex-compact`: keep Pi's remote Codex compaction behavior aligned with Codex `main@711a5f8b3a6e`. Local compaction paths are outside this context.
 
 ## Language
 
-**Native checkpoint**:
-An opaque Codex `compaction` response item that carries resumable model state. It is not a human-readable summary.
+**Remote compaction**:
+Codex server-side compaction of model-visible history into an opaque continuation state. This is the behavior the extension matches.
+
+**Remote compaction operation**:
+One user-visible attempt to install remote continuation state. Its transport retries and fallback attempts are one operation; separate model-transition and automatic compactions are separate operations.
+
+**Compaction trigger**:
+A transient final request item that asks the remote Codex service to compact the supplied history. It is a request signal, not retained history.
+
+**Turn state**:
+A server response header used for sticky routing during one active Codex turn. The extension sends it on later requests and remote compaction in that turn, then clears it at turn boundaries. Pi exposes this header for HTTP responses and remote compaction; its WebSocket response metadata is not exposed to extensions.
+
+**Request settings**:
+The last Codex provider payload settings that Pi exposes. Manual compaction reuses its instructions, tools, reasoning, service tier, and text settings because Pi's compaction event does not carry the provider payload.
+
+**Native compaction item**:
+The opaque `compaction` item returned by remote compaction. It is model state for continuation, not a human-readable summary.
 
 **Replacement history**:
-The bounded set of recent model-visible message items followed by one native checkpoint.
+The model-visible history installed after remote compaction: the native compaction item plus the history items Codex retains separately.
 
-**Branch tail**:
-Session entries created after the active native checkpoint and replayed together with that checkpoint.
+**Compaction window**:
+The active period that starts when replacement history becomes live and ends at the next remote compaction. Body-after-prefix usage counts growth within this window.
 
-**Model transition compaction**:
-Compaction performed at the first request after a Codex model change, before that request is sent. Selecting a model alone does not compact. If both models expose compaction hashes and they match, the transition is skipped; if either hash is unavailable, the extension fails closed and does not guess a transition.
+**Auto-compaction scope**:
+`Total` counts active context. `BodyAfterPrefix` counts context growth after the current window's prefix; when no prefix baseline exists, its scoped usage is zero while the full context-window limit still applies.
 
-**Remote compaction**:
-Codex server-side compaction requested through the Responses API with a `compaction_trigger` item.
+**Retained item**:
+An original history item that remains separately visible in replacement history after remote compaction. V2 applies Codex's item filters and retained-message budget; this excludes standalone developer/system items and keeps only eligible user and agent messages, plus an immediately attached generated image-resize notice.
 
-**Compaction capability**:
-The local Codex-compatible routing value `Unsupported`, `V1`, or `V2` that selects the compression implementation without probing the server.
+**Compaction compatibility**:
+Whether a model or configuration can continue from an existing native compaction item. Codex represents this with optional `comp_hash`; an absent hash is not evidence of incompatibility.
+
+**Context overflow recovery**:
+A lossy remote-only continuation for `context_length_exceeded`: the newest complete history suffix is remote-compacted, the current request is kept, and older history remains in the event log but is no longer model-visible. The bounded recovery runs automatically once because reducing the visible history is the only same-model continuation. If it fails, the extension emits a safe Failure notice and cancels only the current operation; the session remains usable for a later manual retry. It never bypasses authentication, policy, malformed-checkpoint, or protocol protection.
+
+**Model-transition compaction**:
+Remote compaction performed before a request when two known Codex `comp_hash` values differ. Missing hash values skip this transition check.
+
+**Checkpoint bypass**:
+A non-model-visible record that retires one failed V2 continuation gate for its target model. Later requests replay the raw branch rather than that opaque checkpoint; a newer valid V2 checkpoint supersedes the bypass.
+
+**Unsupported checkpoint**:
+A native compaction entry from an older protocol or extension version. The extension ignores it and replays Pi's normal branch. A later V2 compaction can write a current replacement; it never calls a legacy endpoint or blocks the session permanently.
+
+**Malformed checkpoint**:
+A native compaction entry that fails the current V2 schema. It is ignored and the full branch is replayed; a later remote compaction can write a valid replacement instead of permanently blocking the session.
+
+**Failed request marker**:
+A non-model-visible session entry that identifies a user input blocked before provider execution. The next request excludes that stale entry from history while keeping a retry as the current input. New markers persist only the referenced entry ID and safe diagnostic metadata (`phase`, canonical machine `code`, and `recoveryAttempted`); they contain neither raw request input nor raw error text. Older markers may contain legacy content, which is ignored when the referenced branch entry is available.
 
 **Remote-only scope**:
-This extension targets Codex remote compaction paths; local text summarization and Codex token-budget fresh-context resets are intentionally delegated to Pi or Codex core and are not part of the parity target.
+The parity target covers Codex remote compaction, including manual, pre-turn, mid-turn, and model-transition request boundaries. Pi local text summaries and Codex local or fresh-context reset paths are outside this context. Configured auto-compaction limits are capped at Codex's 90% context-window limit.
 
-**Model-transition boundary**:
-Pi exposes the selected and previous models, and its `before_provider_request` hook is awaited before the provider request. The extension records a pending Codex-to-Codex transition at selection time, then calls remote compaction with the previous model at the first request and persists a custom native checkpoint whose continuation model is the newly selected model. The current request's new input is appended after that checkpoint. The transition is fail-closed until the checkpoint is ready. The previous model is tried first; for eligible model/request failures, the current model is used as Codex's fallback, while authentication, policy, cancellation, malformed, and unknown protocol failures remain fail-closed. Pi's custom entry is not promised to be identical to a built-in CompactionEntry. The current request's non-input payload fields are reused for the checkpoint request.
-
-**Fork request boundary**:
-A fork may transform inherited Pi messages before the provider request, so its persisted branch need not reproduce the request prefix exactly. When a native checkpoint or pending transition requires compaction, the `before_provider_request` payload is authoritative: the extension compacts that exact input with the transition history model, persists a checkpoint for the selected model, and preserves the last user item if the replacement history omitted it. An ordinary mismatch without compaction state still passes through unchanged.
-
-**Automatic compaction boundary**:
-The awaited `before_provider_request` hook runs automatic remote compaction before the provider request. The extension estimates history plus a JSON-size approximation of the stable system/tool prefix, derives a 90% context-window limit when no explicit limit is configured, and applies best-effort image/tool weights. This avoids aborting a completed turn, but it is not Codex's internal tokenizer or mid-turn continuation seam.
-
-**Body-after-prefix boundary**:
-Pi does not expose Codex's canonical post-compaction prefix token baseline. The extension must not treat the first post-compaction aggregate usage as that baseline. When no reliable baseline exists, BodyAfterPrefix uses Total conservatively.
-
-_Avoid_: local summary as an extension feature, text summary, server capability probing, subscription compaction
+_Avoid_: local summary, prose checkpoint, trigger as history, permanent fail-closed session

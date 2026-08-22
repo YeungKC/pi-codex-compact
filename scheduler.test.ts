@@ -1,63 +1,38 @@
 import { describe, expect, test } from "vitest";
 import { shouldAutoCompact } from "./scheduler.ts";
 
+const cases = [
+	["configured total scope", { activeContextTokens: 100, prefillTokens: 0, contextWindow: 200 }, 100, "total", true],
+	["body-after-prefix baseline", { activeContextTokens: 150, prefillTokens: 100, contextWindow: 200 }, 49, "bodyAfterPrefix", true],
+	["body-after-prefix ignores total", { activeContextTokens: 850, prefillTokens: 200, contextWindow: 1_000 }, 700, "bodyAfterPrefix", false],
+	["missing prefix baseline starts at zero", { activeContextTokens: 100, contextWindow: 200 }, 99, "bodyAfterPrefix", false],
+	["configured 90-percent limit", { activeContextTokens: 180, prefillTokens: 0, contextWindow: 200 }, 180, "total", true],
+	["body-after-prefix counts prefix once", { activeContextTokens: 1_050, prefillTokens: 200, contextWindow: 1_000 }, 800, "bodyAfterPrefix", true],
+	["body-after-prefix respects hard cap", { activeContextTokens: 1_001, prefillTokens: 200, contextWindow: 1_000 }, 2_000, "bodyAfterPrefix", true],
+	["missing prefix baseline still respects hard cap", { activeContextTokens: 200, contextWindow: 200 }, 2_000, "bodyAfterPrefix", true],
+	["total scope respects hard cap", { activeContextTokens: 200, prefillTokens: 0, contextWindow: 200 }, 180, "total", true],
+] as const;
+
 describe("Codex-style token scheduler", () => {
-	test("uses the configured total scope", () => {
+	test.each(cases)("%s", (_name, status, limit, scope, expected) => {
+		expect(shouldAutoCompact({ status, limit, scope })).toBe(expected);
+	});
+
+	test("downshift uses Codex's strict total limit and body cap", () => {
+		const status = { activeContextTokens: 900, prefillTokens: 200, contextWindow: 1_000 };
+		expect(shouldAutoCompact({ status, limit: 900, scope: "total", reason: "downshift" })).toBe(false);
 		expect(shouldAutoCompact({
-			status: { activeContextTokens: 100, contextWindow: 200 },
-			limit: 100,
+			status: { ...status, activeContextTokens: 901 },
+			limit: 900,
 			scope: "total",
+			reason: "downshift",
 		})).toBe(true);
-	});
-
-	test("subtracts the prefill baseline for body-after-prefix scope", () => {
+		expect(shouldAutoCompact({ status, limit: 500, scope: "bodyAfterPrefix", reason: "downshift" })).toBe(false);
 		expect(shouldAutoCompact({
-			status: { activeContextTokens: 150, prefillTokens: 100, contextWindow: 200 },
-			limit: 49,
+			status: { ...status, activeContextTokens: 1_000 },
+			limit: 500,
 			scope: "bodyAfterPrefix",
-		})).toBe(true);
-	});
-
-	test("does not use total tokens as the body-after-prefix scope", () => {
-		expect(shouldAutoCompact({
-			status: { activeContextTokens: 850, prefillTokens: 200, contextWindow: 1_000 },
-			limit: 700,
-			scope: "bodyAfterPrefix",
-		})).toBe(false);
-	});
-
-	test("falls back to total scope when no prefix baseline is reliable", () => {
-		expect(shouldAutoCompact({
-			status: { activeContextTokens: 100, contextWindow: 200 },
-			limit: 99,
-			scope: "bodyAfterPrefix",
-		})).toBe(true);
-	});
-
-	test("derives the omitted limit from 90 percent of the context window", () => {
-		expect(shouldAutoCompact({
-			status: { activeContextTokens: 180, contextWindow: 200 },
-			scope: "total",
-		})).toBe(true);
-	});
-
-	test("counts prefix tokens once for body-after-prefix and the hard cap", () => {
-		expect(shouldAutoCompact({
-			status: { activeContextTokens: 1_050, prefillTokens: 200, contextWindow: 1_000 },
-			limit: 800,
-			scope: "bodyAfterPrefix",
-		})).toBe(true);
-		expect(shouldAutoCompact({
-			status: { activeContextTokens: 1_001, prefillTokens: 200, contextWindow: 1_000 },
-			limit: 2_000,
-			scope: "bodyAfterPrefix",
-		})).toBe(true);
-	});
-
-	test("always respects the full context hard cap", () => {
-		expect(shouldAutoCompact({
-			status: { activeContextTokens: 200, contextWindow: 200 },
-			scope: "total",
+			reason: "downshift",
 		})).toBe(true);
 	});
 });

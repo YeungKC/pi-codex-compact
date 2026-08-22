@@ -9,14 +9,11 @@ importers:
   .:
     dependencies:
       '@earendil-works/pi-ai':
-        specifier: '>=0.80.10'
+        specifier: '>=0.84.2'
         version: 0.84.2(ws@8.21.3)
       '@earendil-works/pi-coding-agent':
-        specifier: '>=0.80.10'
+        specifier: '>=0.84.2'
         version: 0.84.2(ws@8.21.3)
-      '@earendil-works/pi-tui':
-        specifier: '>=0.80.10'
-        version: 0.84.2
     devDependencies:
       vitest:
         specifier: ^4.1.10
